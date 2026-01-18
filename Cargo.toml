@@ -1,0 +1,49 @@
+[package]
+name = "atl-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "Apache-2.0"
+description = "CLI tool for verifying ATL Protocol receipts against source files"
+repository = "https://github.com/evidentum/atl-cli"
+keywords = ["transparency-log", "verification", "cli", "merkle-tree"]
+categories = ["command-line-utilities", "cryptography"]
+
+[[bin]]
+name = "atl-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Core - always required
+atl-core = { path = "../atl-core" }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+hex = "0.4"
+
+# File hashing
+sha2 = "0.10"
+
+# Output formatting
+colored = "2"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
+# Online verification (optional)
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
+tokio = { version = "1", features = ["rt", "macros"], optional = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"
+
+[features]
+default = []
+online = ["reqwest", "tokio"]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
