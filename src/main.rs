@@ -26,8 +26,7 @@ mod net;
 mod output;
 mod verify;
 
-use cli::Args;
-use error::{CliError, ExitCode};
+use error::ExitCode;
 
 fn main() {
     let result = run();

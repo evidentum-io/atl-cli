@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0"
@@ -28,6 +28,7 @@ sha2 = "0.10"
 # Output formatting
 colored = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+atty = "0.2"
 
 # Online verification (optional)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
