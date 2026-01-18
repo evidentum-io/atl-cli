@@ -7,5 +7,6 @@ use crate::error::CliError;
 
 /// Execute the verify command
 pub fn execute(_verify_args: &VerifyArgs, _args: &Args) -> Result<(), CliError> {
-    Err(CliError::NotImplemented)
+    // Implementation pending: VERIFY-1
+    unimplemented!("verify command not yet implemented")
 }

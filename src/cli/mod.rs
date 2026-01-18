@@ -21,7 +21,9 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    Args::try_parse_from(iter).map_err(|_| CliError::NotImplemented)
+    Args::try_parse_from(iter).map_err(|e| {
+        CliError::InvalidReceiptFormat(format!("Failed to parse CLI arguments: {e}"))
+    })
 }
 
 #[cfg(test)]
