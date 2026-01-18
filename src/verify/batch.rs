@@ -17,6 +17,7 @@ pub enum BatchItemResult {
     /// Error during verification
     Error {
         source: PathBuf,
+        #[allow(dead_code)]
         receipt: Option<PathBuf>,
         error: CliError,
     },
@@ -78,6 +79,7 @@ impl BatchVerificationResult {
 /// - Directories cannot be read
 /// - No files found in source directory
 /// - No receipts found in receipt directory
+#[allow(clippy::type_complexity)]
 pub fn match_files_to_receipts(
     source_dir: &Path,
     receipt_dir: &Path,
@@ -245,7 +247,6 @@ pub fn verify_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use tempfile::TempDir;
 
     #[test]

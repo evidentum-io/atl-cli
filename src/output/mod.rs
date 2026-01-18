@@ -12,20 +12,34 @@ use crate::verify::single::SingleVerificationResult;
 ///
 /// Output format determined by Args (human-readable or JSON)
 pub fn print_single_result(
-    _result: &SingleVerificationResult,
-    _args: &Args,
+    result: &SingleVerificationResult,
+    args: &Args,
 ) -> CliResult<()> {
-    // Implementation pending: OUTPUT-1
-    Ok(())
+    if args.is_quiet() {
+        return Ok(());
+    }
+
+    if args.use_json() {
+        json::print_single_result(result)
+    } else {
+        human::print_single_result(result, args.use_color())
+    }
 }
 
 /// Print batch verification result
 ///
 /// Output format determined by Args (human-readable or JSON)
 pub fn print_batch_result(
-    _result: &BatchVerificationResult,
-    _args: &Args,
+    result: &BatchVerificationResult,
+    args: &Args,
 ) -> CliResult<()> {
-    // Implementation pending: OUTPUT-1
-    Ok(())
+    if args.is_quiet() {
+        return Ok(());
+    }
+
+    if args.use_json() {
+        json::print_batch_result(result)
+    } else {
+        human::print_batch_result(result, args.use_color())
+    }
 }

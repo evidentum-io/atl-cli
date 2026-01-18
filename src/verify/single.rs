@@ -5,7 +5,7 @@ use std::path::Path;
 use atl_core::{verify_receipt_anchor_only, Receipt, VerificationResult};
 
 use crate::error::{CliError, CliResult};
-use crate::verify::file::{compare_hash, format_hash, hash_file, MAX_RECEIPT_SIZE};
+use crate::verify::file::{compare_hash, hash_file, MAX_RECEIPT_SIZE};
 
 /// Result of single file verification
 #[derive(Debug, Clone)]

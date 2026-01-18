@@ -2,7 +2,7 @@
 
 use atl_core::{verify_cross_receipts, CrossReceiptVerificationResult};
 
-use crate::error::{CliError, CliResult};
+use crate::error::CliResult;
 use crate::verify::single::SingleVerificationResult;
 
 /// Result of log consistency verification
@@ -17,6 +17,7 @@ pub struct ConsistencyResult {
     /// Number of receipts checked
     pub receipt_count: usize,
     /// Cross-receipt verification results
+    #[allow(dead_code)]
     pub cross_results: Vec<CrossReceiptVerificationResult>,
     /// Specific errors
     pub errors: Vec<String>,
