@@ -103,7 +103,8 @@ impl SingleVerificationResult {
         // and super_consistency_valid=false - this is expected, not a failure
         if self.receipt.super_proof.is_some() {
             // If super_proof exists, it must be valid
-            if !self.core_result.super_inclusion_valid || !self.core_result.super_consistency_valid {
+            if !self.core_result.super_inclusion_valid || !self.core_result.super_consistency_valid
+            {
                 return false;
             }
         }

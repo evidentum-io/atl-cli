@@ -2,7 +2,6 @@
 
 use colored::Colorize;
 
-use crate::cli::VerificationMode;
 use crate::error::CliResult;
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
 use crate::verify::consistency::ConsistencyResult;
@@ -10,23 +9,10 @@ use crate::verify::online::{AnchorDetails, OnlineVerificationResult};
 use crate::verify::single::SingleVerificationResult;
 
 /// Print single file result
-pub fn print_single_result(
-    result: &SingleVerificationResult,
-    use_color: bool,
-    mode: VerificationMode,
-) -> CliResult<()> {
+pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -> CliResult<()> {
     println!("Verification Result");
     println!("===================");
     println!();
-
-    // Mode indicator
-    println!(
-        "Mode: {}",
-        match mode {
-            VerificationMode::Online => "ONLINE",
-            VerificationMode::Offline => "OFFLINE",
-        }
-    );
 
     // File info
     println!("File: {}", result.source_path.display());
@@ -88,7 +74,9 @@ pub fn print_single_result(
         print!("  Anchor Status: ");
         print_status_pending("UNANCHORED", use_color);
         println!();
-        println!("Note: This receipt is cryptographically valid but lacks external timestamp anchors.");
+        println!(
+            "Note: This receipt is cryptographically valid but lacks external timestamp anchors."
+        );
         println!("      Request an upgraded receipt with TSA or Bitcoin anchoring for independent verification.");
     }
 
@@ -114,22 +102,10 @@ pub fn print_single_result(
 }
 
 /// Print batch result
-pub fn print_batch_result(
-    result: &BatchVerificationResult,
-    use_color: bool,
-    mode: VerificationMode,
-) -> CliResult<()> {
+pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> CliResult<()> {
     println!("Batch Verification Summary");
     println!("==========================");
     println!();
-
-    println!(
-        "Mode: {}",
-        match mode {
-            VerificationMode::Online => "ONLINE",
-            VerificationMode::Offline => "OFFLINE",
-        }
-    );
 
     // Summary
     let total =
@@ -306,9 +282,6 @@ pub fn print_single_online_result(
     println!("===================");
     println!();
 
-    // Mode indicator
-    println!("Mode: ONLINE");
-
     // File info
     println!("File: {}", result.offline.source_path.display());
     println!("Receipt: {}", result.offline.receipt_path.display());
@@ -409,17 +382,19 @@ fn format_anchor_type(anchor_type: &str) -> &str {
 fn format_timestamp_nanos(nanos: u64) -> String {
     use chrono::{TimeZone, Utc};
     let secs = i64::try_from(nanos / 1_000_000_000).unwrap_or(i64::MAX);
-    Utc.timestamp_opt(secs, 0)
-        .single()
-        .map_or_else(|| format!("{nanos} ns"), |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    Utc.timestamp_opt(secs, 0).single().map_or_else(
+        || format!("{nanos} ns"),
+        |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    )
 }
 
 fn format_timestamp_secs(secs: u64) -> String {
     use chrono::{TimeZone, Utc};
     let secs_i64 = i64::try_from(secs).unwrap_or(i64::MAX);
-    Utc.timestamp_opt(secs_i64, 0)
-        .single()
-        .map_or_else(|| format!("{secs} s"), |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    Utc.timestamp_opt(secs_i64, 0).single().map_or_else(
+        || format!("{secs} s"),
+        |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -457,8 +432,6 @@ mod tests {
 
     #[test]
     fn test_print_single_result_valid_with_color() {
-        use crate::cli::VerificationMode;
-
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -468,13 +441,11 @@ mod tests {
             core_result: create_test_verification_result(true),
         };
 
-        assert!(print_single_result(&result, true, VerificationMode::Offline).is_ok());
+        assert!(print_single_result(&result, true).is_ok());
     }
 
     #[test]
     fn test_print_single_result_valid_no_color() {
-        use crate::cli::VerificationMode;
-
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -484,13 +455,11 @@ mod tests {
             core_result: create_test_verification_result(true),
         };
 
-        assert!(print_single_result(&result, false, VerificationMode::Offline).is_ok());
+        assert!(print_single_result(&result, false).is_ok());
     }
 
     #[test]
     fn test_print_single_result_invalid() {
-        use crate::cli::VerificationMode;
-
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -500,13 +469,11 @@ mod tests {
             core_result: create_test_verification_result(false),
         };
 
-        assert!(print_single_result(&result, true, VerificationMode::Offline).is_ok());
+        assert!(print_single_result(&result, true).is_ok());
     }
 
     #[test]
     fn test_print_single_result_hash_mismatch() {
-        use crate::cli::VerificationMode;
-
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -516,13 +483,11 @@ mod tests {
             core_result: create_test_verification_result(true),
         };
 
-        assert!(print_single_result(&result, false, VerificationMode::Offline).is_ok());
+        assert!(print_single_result(&result, false).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_color() {
-        use crate::cli::VerificationMode;
-
         let result = BatchVerificationResult {
             valid_count: 2,
             invalid_count: 0,
@@ -532,13 +497,11 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
+        assert!(print_batch_result(&result, true).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_no_color() {
-        use crate::cli::VerificationMode;
-
         let result = BatchVerificationResult {
             valid_count: 2,
             invalid_count: 0,
@@ -548,13 +511,11 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, false, VerificationMode::Offline).is_ok());
+        assert!(print_batch_result(&result, false).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_failures() {
-        use crate::cli::VerificationMode;
-
         let result = BatchVerificationResult {
             valid_count: 1,
             invalid_count: 1,
@@ -564,12 +525,11 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
+        assert!(print_batch_result(&result, true).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_consistency_valid() {
-        use crate::cli::VerificationMode;
         use crate::verify::consistency::ConsistencyResult;
 
         let result = BatchVerificationResult {
@@ -588,12 +548,11 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
+        assert!(print_batch_result(&result, true).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_consistency_failed() {
-        use crate::cli::VerificationMode;
         use crate::verify::consistency::ConsistencyResult;
 
         let result = BatchVerificationResult {
@@ -612,12 +571,11 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, false, VerificationMode::Offline).is_ok());
+        assert!(print_batch_result(&result, false).is_ok());
     }
 
     #[test]
     fn test_print_batch_all_item_types() {
-        use crate::cli::VerificationMode;
         use crate::error::CliError;
 
         let items = vec![
@@ -655,8 +613,8 @@ mod tests {
             items,
         };
 
-        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
-        assert!(print_batch_result(&result, false, VerificationMode::Offline).is_ok());
+        assert!(print_batch_result(&result, true).is_ok());
+        assert!(print_batch_result(&result, false).is_ok());
     }
 
     #[test]
@@ -665,7 +623,7 @@ mod tests {
         let formatted = format_hash(&hash);
         assert!(formatted.starts_with("sha256:"));
         assert!(!formatted.ends_with("...")); // No truncation
-        assert_eq!(formatted.len(), 7 + 64);  // "sha256:" + 64 hex chars
+        assert_eq!(formatted.len(), 7 + 64); // "sha256:" + 64 hex chars
     }
 
     #[test]

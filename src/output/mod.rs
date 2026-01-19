@@ -24,17 +24,14 @@ pub fn print_single_result(
     if args.use_json() {
         json::print_single_result(result, mode)
     } else {
-        human::print_single_result(result, args.use_color(), mode)
+        human::print_single_result(result, args.use_color())
     }
 }
 
 /// Print single file result with online verification
 ///
 /// Output format determined by Args (human-readable or JSON)
-pub fn print_single_online_result(
-    result: &OnlineVerificationResult,
-    args: &Args,
-) -> CliResult<()> {
+pub fn print_single_online_result(result: &OnlineVerificationResult, args: &Args) -> CliResult<()> {
     if args.is_quiet() {
         return Ok(());
     }
@@ -61,6 +58,6 @@ pub fn print_batch_result(
     if args.use_json() {
         json::print_batch_result(result, mode)
     } else {
-        human::print_batch_result(result, args.use_color(), mode)
+        human::print_batch_result(result, args.use_color())
     }
 }
