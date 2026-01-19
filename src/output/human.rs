@@ -353,12 +353,58 @@ pub fn print_single_online_result(
                 AnchorDetails::Bitcoin {
                     block_height,
                     block_timestamp_secs,
+                    target_hash,
+                    operation_count,
+                    computed_root,
+                    block_merkle_root,
+                    merkle_match,
                 } => {
-                    println!("      Block Height: {}", block_height);
-                    println!(
-                        "      Block Time: {}",
-                        format_timestamp_secs(*block_timestamp_secs)
-                    );
+                    println!();
+                    println!("      Verification Chain:");
+                    println!("        Target Hash:       {}", target_hash);
+                    println!("              ↓ OTS proof ({} operations)", operation_count);
+                    println!("        Computed Root:     {}", computed_root);
+
+                    match (block_merkle_root, merkle_match) {
+                        (Some(block_root), Some(true)) => {
+                            // Online mode, match
+                            if use_color {
+                                println!("              {} (verified)", "✓".green());
+                            } else {
+                                println!("              ✓ (verified)");
+                            }
+                            println!("        Block Merkle Root: {}", block_root);
+                        }
+                        (Some(block_root), Some(false)) => {
+                            // Online mode, mismatch
+                            if use_color {
+                                println!("              {} (mismatch)", "✗".red().bold());
+                            } else {
+                                println!("              ✗ (mismatch)");
+                            }
+                            println!("        Block Merkle Root: {}", block_root);
+                        }
+                        (None, None) => {
+                            // Offline mode or API error
+                            if use_color {
+                                println!("              {} (not verified)", "?".yellow());
+                            } else {
+                                println!("              ? (not verified)");
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    println!("              ↓");
+                    if *block_timestamp_secs > 0 {
+                        println!(
+                            "        Block #{} @ {}",
+                            block_height,
+                            format_timestamp_secs(*block_timestamp_secs)
+                        );
+                    } else {
+                        println!("        Block #{}", block_height);
+                    }
                 }
                 AnchorDetails::Unknown => {}
             }

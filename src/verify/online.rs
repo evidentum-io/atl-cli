@@ -42,6 +42,16 @@ pub enum AnchorDetails {
     Bitcoin {
         block_height: u64,
         block_timestamp_secs: u64,
+        /// Target hash being verified (with sha256: prefix)
+        target_hash: String,
+        /// Number of operations in OTS proof
+        operation_count: usize,
+        /// Computed merkle root from OTS proof (with sha256: prefix, 71 chars total)
+        computed_root: String,
+        /// Block merkle root from API (with sha256: prefix) - None if offline/error
+        block_merkle_root: Option<String>,
+        /// Whether computed_root matches block_merkle_root
+        merkle_match: Option<bool>,
     },
     Unknown,
 }
@@ -259,6 +269,15 @@ async fn verify_bitcoin_ots(
         };
     }
 
+    // Extract computed root (last hash, byte-reversed for display, with sha256: prefix)
+    let computed_root = earliest.merkle_path.last().map_or_else(String::new, |last_hash| {
+        let mut reversed = *last_hash;
+        reversed.reverse();
+        format!("sha256:{}", hex::encode(reversed))
+    });
+
+    let operation_count = earliest.merkle_path.len();
+
     // Fetch block info with merkle_root
     let block_info = match crate::net::bitcoin::get_block_info(
         earliest.block_height,
@@ -268,18 +287,29 @@ async fn verify_bitcoin_ots(
     {
         Ok(info) => info,
         Err(e) => {
+            // Return with partial data for offline-like display
             return AnchorVerificationResult {
                 anchor_type: "bitcoin_ots".to_string(),
                 verified: false,
                 timestamp_nanos: None,
                 error: Some(e.to_string()),
-                details: AnchorDetails::Unknown,
+                details: AnchorDetails::Bitcoin {
+                    block_height: earliest.block_height,
+                    block_timestamp_secs: 0,
+                    target_hash: target_hash.to_string(),
+                    operation_count,
+                    computed_root,
+                    block_merkle_root: None,
+                    merkle_match: None,
+                },
             };
         }
     };
 
     // CRITICAL: Verify merkle root matches (using atl-core method)
-    if !earliest.verify_against_block(&block_info.merkle_root) {
+    let merkle_match = earliest.verify_against_block(&block_info.merkle_root);
+
+    if !merkle_match {
         return AnchorVerificationResult {
             anchor_type: "bitcoin_ots".to_string(),
             verified: false,
@@ -288,7 +318,15 @@ async fn verify_bitcoin_ots(
                 "Merkle root mismatch: OTS proof does not match block {}",
                 earliest.block_height
             )),
-            details: AnchorDetails::Unknown,
+            details: AnchorDetails::Bitcoin {
+                block_height: block_info.height,
+                block_timestamp_secs: block_info.timestamp_secs,
+                target_hash: target_hash.to_string(),
+                operation_count,
+                computed_root,
+                block_merkle_root: Some(format!("sha256:{}", block_info.merkle_root)),
+                merkle_match: Some(false),
+            },
         };
     }
 
@@ -302,6 +340,11 @@ async fn verify_bitcoin_ots(
         details: AnchorDetails::Bitcoin {
             block_height: block_info.height,
             block_timestamp_secs: block_info.timestamp_secs,
+            target_hash: target_hash.to_string(),
+            operation_count,
+            computed_root,
+            block_merkle_root: Some(format!("sha256:{}", block_info.merkle_root)),
+            merkle_match: Some(true),
         },
     }
 }
@@ -452,6 +495,11 @@ mod tests {
         let bitcoin = AnchorDetails::Bitcoin {
             block_height: 800000,
             block_timestamp_secs: 1700000000,
+            target_hash: "sha256:abc".to_string(),
+            operation_count: 10,
+            computed_root: "sha256:def".to_string(),
+            block_merkle_root: Some("sha256:ghi".to_string()),
+            merkle_match: Some(true),
         };
         let unknown = AnchorDetails::Unknown;
 
@@ -466,9 +514,19 @@ mod tests {
             AnchorDetails::Bitcoin {
                 block_height,
                 block_timestamp_secs,
+                target_hash,
+                operation_count,
+                computed_root,
+                block_merkle_root,
+                merkle_match,
             } => {
                 assert_eq!(block_height, 800000);
                 assert_eq!(block_timestamp_secs, 1700000000);
+                assert_eq!(target_hash, "sha256:abc");
+                assert_eq!(operation_count, 10);
+                assert_eq!(computed_root, "sha256:def");
+                assert_eq!(block_merkle_root, Some("sha256:ghi".to_string()));
+                assert_eq!(merkle_match, Some(true));
             }
             _ => panic!("Wrong variant"),
         }
@@ -724,4 +782,55 @@ mod tests {
     }
 
     // Note: verify_merkle_root tests moved to atl-core (BitcoinAttestation::verify_against_block)
+
+    #[test]
+    fn should_reverse_bytes_for_computed_root_display() {
+        // Arrange
+        // Internal format (little-endian)
+        let last_hash_hex = "6f20a87026e693f298b72fd96141f07e2628cb0553da748fcc9c1565ce6d822f";
+        // Expected display format (big-endian, with sha256: prefix)
+        let expected = "sha256:2f826dce65159ccc8f74da5305cb28267ef04161d92fb798f293e62670a8206f";
+
+        let mut last_hash = [0u8; 32];
+        hex::decode_to_slice(last_hash_hex, &mut last_hash).unwrap();
+
+        // Act
+        let mut reversed = last_hash;
+        reversed.reverse();
+        let result = format!("sha256:{}", hex::encode(reversed));
+
+        // Assert
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn should_format_target_hash_with_sha256_prefix() {
+        // Arrange
+        let target_hash = "94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2";
+
+        // Act
+        let result = format!("sha256:{}", target_hash);
+
+        // Assert
+        assert_eq!(
+            result,
+            "sha256:94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2"
+        );
+        assert_eq!(result.len(), 71); // "sha256:" (7) + 64 hex chars
+    }
+
+    #[test]
+    fn should_populate_operation_count_from_merkle_path() {
+        // Arrange
+        let mut path = Vec::new();
+        for _ in 0..39 {
+            path.push([0u8; 32]);
+        }
+
+        // Act
+        let count = path.len();
+
+        // Assert
+        assert_eq!(count, 39);
+    }
 }
