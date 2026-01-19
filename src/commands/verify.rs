@@ -1,9 +1,10 @@
 //! Verify command implementation
 
-use crate::cli::{Args, VerifyArgs};
+use crate::cli::{Args, VerificationMode, VerifyArgs};
 use crate::error::{CliError, CliResult};
 use crate::output;
 use crate::verify::batch::verify_batch;
+use crate::verify::online::{verify_single_online, OnlineConfig};
 use crate::verify::single::verify_single;
 
 /// Execute the verify command
@@ -34,23 +35,45 @@ fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
     let has_anchors = !result.receipt.anchors.is_empty();
     let mode = verify_args.determine_mode_for_receipt(has_anchors)?;
 
-    // Output result WITH mode
-    output::print_single_result(&result, args, mode)?;
+    // If online mode and has anchors, perform online verification
+    if mode == VerificationMode::Online && has_anchors {
+        let config = OnlineConfig::default();
 
-    // Return error if verification failed
-    if !result.is_valid() {
-        if !result.file_hash_valid {
-            return Err(CliError::file_hash_mismatch(
-                &verify_args.source,
-                &result.file_hash,
-                &result.receipt.entry.payload_hash,
+        // Create tokio runtime for async verification
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| CliError::NetworkError(format!("Failed to create runtime: {e}")))?;
+
+        let online_result = rt.block_on(verify_single_online(result, &config))?;
+
+        // Output online result
+        output::print_single_online_result(&online_result, args)?;
+
+        // Return error if verification failed
+        if !online_result.is_valid() {
+            return Err(CliError::VerificationFailed(
+                "Online anchor verification failed".into(),
             ));
         }
-        // Convert core errors to CLI errors
-        if let Some(err) = result.core_result.errors.first() {
-            return Err(err.clone().into());
+    } else {
+        // Offline mode or no anchors - existing behavior
+        output::print_single_result(&result, args, mode)?;
+
+        if !result.is_valid() {
+            if !result.file_hash_valid {
+                return Err(CliError::file_hash_mismatch(
+                    &verify_args.source,
+                    &result.file_hash,
+                    &result.receipt.entry.payload_hash,
+                ));
+            }
+            // Convert core errors to CLI errors
+            if let Some(err) = result.core_result.errors.first() {
+                return Err(err.clone().into());
+            }
+            return Err(CliError::VerificationFailed("unknown".into()));
         }
-        return Err(CliError::VerificationFailed("unknown".into()));
     }
 
     Ok(())

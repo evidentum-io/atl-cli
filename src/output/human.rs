@@ -6,6 +6,7 @@ use crate::cli::VerificationMode;
 use crate::error::CliResult;
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
 use crate::verify::consistency::ConsistencyResult;
+use crate::verify::online::{AnchorDetails, OnlineVerificationResult};
 use crate::verify::single::SingleVerificationResult;
 
 /// Print single file result
@@ -294,6 +295,131 @@ fn print_count(count: usize, is_good: bool, use_color: bool) {
 
 fn format_hash(hash: &[u8; 32]) -> String {
     format!("sha256:{}", hex::encode(hash))
+}
+
+/// Print single file result with online anchor verification
+pub fn print_single_online_result(
+    result: &OnlineVerificationResult,
+    use_color: bool,
+) -> CliResult<()> {
+    println!("Verification Result");
+    println!("===================");
+    println!();
+
+    // Mode indicator
+    println!("Mode: ONLINE");
+
+    // File info
+    println!("File: {}", result.offline.source_path.display());
+    println!("Receipt: {}", result.offline.receipt_path.display());
+
+    // Status
+    print!("Status: ");
+    if result.is_valid() {
+        print_status("VALID", true, use_color);
+    } else if result.offline.is_lite_valid() {
+        print_status_pending("PENDING (unanchored)", use_color);
+    } else {
+        print_status("INVALID", false, use_color);
+    }
+
+    // File hash comparison
+    println!("File Hash:");
+    println!("  Computed: {}", format_hash(&result.offline.file_hash));
+    println!("  Expected: {}", &result.offline.receipt.entry.payload_hash);
+    print!("  Match: ");
+    if result.offline.file_hash_valid {
+        print_status("YES", true, use_color);
+    } else {
+        print_status("NO", false, use_color);
+    }
+    println!();
+
+    // If hash doesn't match, show explanation and stop
+    if !result.offline.file_hash_valid {
+        println!();
+        println!("The file content does not match the receipt.");
+        println!("The file may have been modified since the receipt was issued.");
+        return Ok(());
+    }
+
+    // Receipt verification details
+    println!();
+    println!("Receipt Verification:");
+    println!("  Entry ID: {}", result.offline.receipt.entry.id);
+
+    // Inclusion proof
+    print!("  Inclusion Proof: ");
+    let proofs_valid = result.offline.core_result.inclusion_valid;
+    if proofs_valid {
+        print_status("VALID", true, use_color);
+    } else {
+        print_status("INVALID", false, use_color);
+    }
+
+    // Anchor verification results
+    if !result.anchor_results.is_empty() {
+        println!();
+        println!("Anchor Verification:");
+        for (i, anchor) in result.anchor_results.iter().enumerate() {
+            println!("  [{}] {}", i + 1, format_anchor_type(&anchor.anchor_type));
+            print!("      Status: ");
+            if anchor.verified {
+                print_status("VALID", true, use_color);
+            } else {
+                print_status("FAILED", false, use_color);
+            }
+
+            if let Some(error) = &anchor.error {
+                println!("      Error: {error}");
+            }
+
+            match &anchor.details {
+                AnchorDetails::Rfc3161 { .. } => {
+                    if let Some(ts) = anchor.timestamp_nanos {
+                        println!("      Timestamp: {}", format_timestamp_nanos(ts));
+                    }
+                }
+                AnchorDetails::Bitcoin {
+                    block_height,
+                    block_timestamp_secs,
+                } => {
+                    println!("      Block Height: {}", block_height);
+                    println!(
+                        "      Block Time: {}",
+                        format_timestamp_secs(*block_timestamp_secs)
+                    );
+                }
+                AnchorDetails::Unknown => {}
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn format_anchor_type(anchor_type: &str) -> &str {
+    match anchor_type {
+        "rfc3161" => "RFC 3161 (TSA)",
+        "bitcoin_ots" => "Bitcoin OTS",
+        _ => anchor_type,
+    }
+}
+
+fn format_timestamp_nanos(nanos: u64) -> String {
+    use chrono::{TimeZone, Utc};
+    let secs = i64::try_from(nanos / 1_000_000_000).unwrap_or(i64::MAX);
+    Utc.timestamp_opt(secs, 0)
+        .single()
+        .map_or_else(|| format!("{nanos} ns"), |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+}
+
+fn format_timestamp_secs(secs: u64) -> String {
+    use chrono::{TimeZone, Utc};
+    let secs_i64 = i64::try_from(secs).unwrap_or(i64::MAX);
+    Utc.timestamp_opt(secs_i64, 0)
+        .single()
+        .map_or_else(|| format!("{secs} s"), |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 #[cfg(test)]

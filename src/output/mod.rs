@@ -6,6 +6,7 @@ pub mod json;
 use crate::cli::{Args, VerificationMode};
 use crate::error::CliResult;
 use crate::verify::batch::BatchVerificationResult;
+use crate::verify::online::OnlineVerificationResult;
 use crate::verify::single::SingleVerificationResult;
 
 /// Print single file verification result
@@ -24,6 +25,24 @@ pub fn print_single_result(
         json::print_single_result(result, mode)
     } else {
         human::print_single_result(result, args.use_color(), mode)
+    }
+}
+
+/// Print single file result with online verification
+///
+/// Output format determined by Args (human-readable or JSON)
+pub fn print_single_online_result(
+    result: &OnlineVerificationResult,
+    args: &Args,
+) -> CliResult<()> {
+    if args.is_quiet() {
+        return Ok(());
+    }
+
+    if args.use_json() {
+        json::print_single_online_result(result)
+    } else {
+        human::print_single_online_result(result, args.use_color())
     }
 }
 

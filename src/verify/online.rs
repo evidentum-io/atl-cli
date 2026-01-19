@@ -25,7 +25,6 @@ impl Default for OnlineConfig {
 
 /// Result of online anchor verification
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct AnchorVerificationResult {
     pub anchor_type: String,
     pub verified: bool,
@@ -35,9 +34,9 @@ pub struct AnchorVerificationResult {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AnchorDetails {
     Rfc3161 {
+        #[allow(dead_code)]
         algorithm_oid: String,
     },
     Bitcoin {
@@ -49,24 +48,22 @@ pub enum AnchorDetails {
 
 /// Extended verification result with online checks
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct OnlineVerificationResult {
     pub offline: SingleVerificationResult,
     pub anchor_results: Vec<AnchorVerificationResult>,
     pub all_anchors_verified: bool,
+    #[allow(dead_code)]
     pub mode: VerificationMode,
 }
 
 impl OnlineVerificationResult {
     #[must_use]
-    #[allow(dead_code)]
     pub fn is_valid(&self) -> bool {
         self.offline.is_valid() && self.all_anchors_verified
     }
 }
 
 /// Verify RFC 3161 anchor using atl-core
-#[allow(dead_code)]
 fn verify_rfc3161(
     target: &str,
     target_hash: &str,
@@ -149,7 +146,6 @@ fn verify_rfc3161(
 }
 
 /// Verify Bitcoin/OTS anchor using atl-core + Bitcoin API
-#[allow(dead_code)]
 async fn verify_bitcoin_ots(
     target: &str,
     target_hash: &str,
@@ -172,17 +168,14 @@ async fn verify_bitcoin_ots(
     }
 
     // Validate super_root exists
-    let expected_super_root = match super_root {
-        Some(sr) => sr,
-        None => {
-            return AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some("Receipt has no super_proof".to_string()),
-                details: AnchorDetails::Unknown,
-            }
-        }
+    let Some(expected_super_root) = super_root else {
+        return AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verified: false,
+            timestamp_nanos: None,
+            error: Some("Receipt has no super_proof".to_string()),
+            details: AnchorDetails::Unknown,
+        };
     };
 
     // Validate target_hash matches super_root
@@ -218,7 +211,7 @@ async fn verify_bitcoin_ots(
                 anchor_type: "bitcoin_ots".to_string(),
                 verified: false,
                 timestamp_nanos: None,
-                error: Some(format!("Invalid hex: {}", e)),
+                error: Some(format!("Invalid hex: {e}")),
                 details: AnchorDetails::Unknown,
             }
         }
@@ -232,7 +225,7 @@ async fn verify_bitcoin_ots(
                 anchor_type: "bitcoin_ots".to_string(),
                 verified: false,
                 timestamp_nanos: None,
-                error: Some(format!("OTS verification failed: {}", e)),
+                error: Some(format!("OTS verification failed: {e}")),
                 details: AnchorDetails::Unknown,
             }
         }
@@ -283,7 +276,6 @@ async fn verify_bitcoin_ots(
 }
 
 /// Verify anchors online for single file
-#[allow(dead_code)]
 pub async fn verify_single_online(
     result: SingleVerificationResult,
     config: &OnlineConfig,

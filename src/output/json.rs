@@ -5,6 +5,7 @@ use serde::Serialize;
 use crate::cli::VerificationMode;
 use crate::error::CliResult;
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
+use crate::verify::online::{AnchorDetails, OnlineVerificationResult};
 use crate::verify::single::SingleVerificationResult;
 
 #[derive(Serialize)]
@@ -294,6 +295,87 @@ pub fn print_batch_result(
         } else {
             vec![]
         },
+    };
+
+    let json = serde_json::to_string_pretty(&output)?;
+    println!("{json}");
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct AnchorResultJson {
+    #[serde(rename = "type")]
+    anchor_type: String,
+    verified: bool,
+    timestamp_nanos: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_height: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AnchorVerificationJson {
+    all_verified: bool,
+    results: Vec<AnchorResultJson>,
+}
+
+#[derive(Serialize)]
+struct SingleOnlineResultJson {
+    status: &'static str,
+    mode: &'static str,
+    file: String,
+    receipt: String,
+    file_hash_valid: bool,
+    computed_hash: String,
+    expected_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    anchor_verification: Option<AnchorVerificationJson>,
+}
+
+pub fn print_single_online_result(result: &OnlineVerificationResult) -> CliResult<()> {
+    let status = if result.is_valid() {
+        "valid"
+    } else if result.offline.is_lite_valid() {
+        "pending"
+    } else {
+        "invalid"
+    };
+
+    let anchor_verification = if !result.anchor_results.is_empty() {
+        Some(AnchorVerificationJson {
+            all_verified: result.all_anchors_verified,
+            results: result
+                .anchor_results
+                .iter()
+                .map(|a| {
+                    let block_height = match &a.details {
+                        AnchorDetails::Bitcoin { block_height, .. } => Some(*block_height),
+                        _ => None,
+                    };
+                    AnchorResultJson {
+                        anchor_type: a.anchor_type.clone(),
+                        verified: a.verified,
+                        timestamp_nanos: a.timestamp_nanos,
+                        block_height,
+                        error: a.error.clone(),
+                    }
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
+
+    let output = SingleOnlineResultJson {
+        status,
+        mode: "online",
+        file: result.offline.source_path.display().to_string(),
+        receipt: result.offline.receipt_path.display().to_string(),
+        file_hash_valid: result.offline.file_hash_valid,
+        computed_hash: format!("sha256:{}", hex::encode(result.offline.file_hash)),
+        expected_hash: result.offline.receipt.entry.payload_hash.clone(),
+        anchor_verification,
     };
 
     let json = serde_json::to_string_pretty(&output)?;

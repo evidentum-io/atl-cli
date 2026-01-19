@@ -38,7 +38,7 @@ fn run() -> ExitCode {
     let args = match cli::parse() {
         Ok(args) => args,
         Err(e) => {
-            eprintln!("Error: {}", e);
+            eprintln!("Error: {e}");
             return ExitCode::Error;
         }
     };
@@ -48,7 +48,7 @@ fn run() -> ExitCode {
         Ok(()) => ExitCode::Valid,
         Err(e) => {
             if !args.quiet {
-                eprintln!("{}", e);
+                eprintln!("{e}");
             }
             e.exit_code()
         }
