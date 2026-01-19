@@ -49,7 +49,6 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     }
 
     // Receipt verification details
-    println!();
     println!("Receipt Verification:");
     println!("  Entry ID: {}", result.receipt.entry.id);
 
@@ -317,7 +316,6 @@ pub fn print_single_online_result(
     }
 
     // Receipt verification details
-    println!();
     println!("Receipt Verification:");
     println!("  Entry ID: {}", result.offline.receipt.entry.id);
 
@@ -332,7 +330,6 @@ pub fn print_single_online_result(
 
     // Anchor verification results
     if !result.anchor_results.is_empty() {
-        println!();
         println!("Anchor Verification:");
         for (i, anchor) in result.anchor_results.iter().enumerate() {
             println!("  [{}] {}", i + 1, format_anchor_type(&anchor.anchor_type));
