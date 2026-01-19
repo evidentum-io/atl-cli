@@ -26,11 +26,13 @@ pub fn execute(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
 
 /// Execute single file verification
 fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
-    // Determine mode BEFORE verification
-    let mode = verify_args.determine_mode()?;
-
-    // Perform verification
+    // Perform verification FIRST (loads receipt, hashes file)
     let result = verify_single(&verify_args.source, &verify_args.receipt)?;
+
+    // Determine mode AFTER we know if receipt has anchors
+    // This avoids unnecessary network check for lite receipts
+    let has_anchors = !result.receipt.anchors.is_empty();
+    let mode = verify_args.determine_mode_for_receipt(has_anchors)?;
 
     // Output result WITH mode
     output::print_single_result(&result, args, mode)?;
@@ -56,11 +58,18 @@ fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
 
 /// Execute batch verification
 fn execute_batch(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
-    // Determine mode BEFORE verification
-    let mode = verify_args.determine_mode()?;
-
-    // Perform batch verification
+    // Perform batch verification FIRST
     let result = verify_batch(&verify_args.source, &verify_args.receipt)?;
+
+    // Check if ANY receipt has anchors
+    let has_any_anchors = result.items.iter().any(|item| {
+        match item {
+            crate::verify::batch::BatchItemResult::Valid(r)
+            | crate::verify::batch::BatchItemResult::Invalid(r) => !r.receipt.anchors.is_empty(),
+            _ => false,
+        }
+    });
+    let mode = verify_args.determine_mode_for_receipt(has_any_anchors)?;
 
     // Output result WITH mode
     output::print_batch_result(&result, args, mode)?;
