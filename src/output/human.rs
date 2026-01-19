@@ -40,7 +40,6 @@ pub fn print_single_result(
     } else {
         print_status("INVALID", false, use_color);
     }
-    println!();
 
     // File hash comparison
     println!("File Hash:");
@@ -87,7 +86,6 @@ pub fn print_single_result(
     if result.is_lite_valid() {
         print!("  Anchor Status: ");
         print_status_pending("UNANCHORED", use_color);
-        println!();
         println!();
         println!("Note: This receipt is cryptographically valid but lacks external timestamp anchors.");
         println!("      Request an upgraded receipt with TSA or Bitcoin anchoring for independent verification.");
