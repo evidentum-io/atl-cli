@@ -235,7 +235,7 @@ fn print_count(count: usize, is_good: bool, use_color: bool) {
 }
 
 fn format_hash(hash: &[u8; 32]) -> String {
-    format!("sha256:{}...", hex::encode(&hash[..16]))
+    format!("sha256:{}", hex::encode(hash))
 }
 
 #[cfg(test)]
@@ -463,7 +463,8 @@ mod tests {
         let hash = [0xab; 32];
         let formatted = format_hash(&hash);
         assert!(formatted.starts_with("sha256:"));
-        assert!(formatted.ends_with("..."));
+        assert!(!formatted.ends_with("...")); // No truncation
+        assert_eq!(formatted.len(), 7 + 64);  // "sha256:" + 64 hex chars
     }
 
     #[test]
