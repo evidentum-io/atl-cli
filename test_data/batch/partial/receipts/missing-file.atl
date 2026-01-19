@@ -1,0 +1,32 @@
+{
+  "anchors": [],
+  "entry": {
+    "id": "550e8400-e29b-41d4-a716-446655440000",
+    "metadata": {},
+    "metadata_hash": "sha256:44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    "payload_hash": "sha256:a5431ec881de484255d0c06782e87daec332139e40d5cb8a714887f25ecd353c"
+  },
+  "proof": {
+    "checkpoint": {
+      "key_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "origin": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "root_hash": "sha256:edd36675f37738da4dbfd8dd3b74161847787b5374143453a24509c9b09353d6",
+      "signature": "base64:AAAA...",
+      "timestamp": 1767225600000000000,
+      "tree_size": 1
+    },
+    "inclusion_path": [],
+    "leaf_index": 0,
+    "root_hash": "sha256:edd36675f37738da4dbfd8dd3b74161847787b5374143453a24509c9b09353d6",
+    "tree_size": 1
+  },
+  "spec_version": "2.0.0",
+  "super_proof": {
+    "consistency_to_origin": [],
+    "data_tree_index": 2,
+    "genesis_super_root": "sha256:aabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccddaabbccdd",
+    "inclusion": [],
+    "super_root": "sha256:edd36675f37738da4dbfd8dd3b74161847787b5374143453a24509c9b09353d6",
+    "super_tree_size": 3
+  }
+}

@@ -26,8 +26,7 @@ mod net;
 mod output;
 mod verify;
 
-use cli::Args;
-use error::{CliError, ExitCode};
+use error::ExitCode;
 
 fn main() {
     let result = run();
@@ -53,5 +52,17 @@ fn run() -> ExitCode {
             }
             e.exit_code()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exit_code_values() {
+        assert_eq!(ExitCode::Valid.code(), 0);
+        assert_eq!(ExitCode::Invalid.code(), 1);
+        assert_eq!(ExitCode::Error.code(), 2);
     }
 }
