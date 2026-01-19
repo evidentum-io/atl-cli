@@ -29,10 +29,12 @@ impl SingleVerificationResult {
     ///
     /// Verification is valid if:
     /// - File hash matches payload_hash
-    /// - Core cryptographic proofs are valid (inclusion, super_proof)
+    /// - Core cryptographic proofs are valid (inclusion, super_proof if present)
     ///
     /// Note: `NoTrustAnchor` error is NOT considered a failure for Receipt-Lite.
     /// This allows verification of receipts without external anchors (offline mode).
+    ///
+    /// When `super_proof` is None, super proof checks are skipped (nothing to verify).
     #[must_use]
     pub fn is_valid(&self) -> bool {
         use atl_core::VerificationError;
@@ -55,9 +57,21 @@ impl SingleVerificationResult {
             )
         {
             // NoTrustAnchor alone is OK - Receipt-Lite verification passed
-            return self.core_result.inclusion_valid
-                && self.core_result.super_inclusion_valid
-                && self.core_result.super_consistency_valid;
+            // Check basic inclusion proof
+            if !self.core_result.inclusion_valid {
+                return false;
+            }
+
+            // Super proof checks depend on whether super_proof exists
+            // When super_proof is None, atl-core returns super_inclusion_valid=false
+            // and super_consistency_valid=false - this is expected, not a failure
+            if self.receipt.super_proof.is_some() {
+                return self.core_result.super_inclusion_valid
+                    && self.core_result.super_consistency_valid;
+            }
+
+            // No super_proof = skip super checks
+            return true;
         }
 
         false
@@ -67,7 +81,9 @@ impl SingleVerificationResult {
     ///
     /// Returns true if:
     /// - File hash matches
-    /// - All cryptographic proofs are valid
+    /// - Basic inclusion proof is valid
+    /// - If super_proof exists: super proofs are valid
+    /// - If super_proof is None: super proof checks are skipped
     /// - The only "error" is NoTrustAnchor (no external anchors)
     #[must_use]
     pub fn is_lite_valid(&self) -> bool {
@@ -77,14 +93,21 @@ impl SingleVerificationResult {
             return false;
         }
 
-        // Check if proofs are valid
-        let proofs_valid = self.core_result.inclusion_valid
-            && self.core_result.super_inclusion_valid
-            && self.core_result.super_consistency_valid;
-
-        if !proofs_valid {
+        // Basic inclusion proof MUST be valid
+        if !self.core_result.inclusion_valid {
             return false;
         }
+
+        // Super proof checks depend on whether super_proof exists
+        // When super_proof is None, atl-core returns super_inclusion_valid=false
+        // and super_consistency_valid=false - this is expected, not a failure
+        if self.receipt.super_proof.is_some() {
+            // If super_proof exists, it must be valid
+            if !self.core_result.super_inclusion_valid || !self.core_result.super_consistency_valid {
+                return false;
+            }
+        }
+        // If super_proof is None, we skip these checks entirely
 
         // Check if the only "error" is NoTrustAnchor
         self.core_result.errors.len() == 1

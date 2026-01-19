@@ -67,12 +67,17 @@ pub fn print_single_result(
     println!("Receipt Verification:");
     println!("  Entry ID: {}", result.receipt.entry.id);
 
-    // Inclusion proof - show as VALID for lite receipts
+    // Inclusion proof - account for super_proof being None
     print!("  Inclusion Proof: ");
-    if result.core_result.inclusion_valid
-        && result.core_result.super_inclusion_valid
-        && result.core_result.super_consistency_valid
-    {
+    let proofs_valid = if result.receipt.super_proof.is_some() {
+        result.core_result.inclusion_valid
+            && result.core_result.super_inclusion_valid
+            && result.core_result.super_consistency_valid
+    } else {
+        // No super_proof = only check basic inclusion
+        result.core_result.inclusion_valid
+    };
+    if proofs_valid {
         print_status("VALID", true, use_color);
     } else {
         print_status("INVALID", false, use_color);
