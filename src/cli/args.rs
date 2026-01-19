@@ -179,29 +179,48 @@ impl VerifyArgs {
         self.source.is_dir()
     }
 
-    /// Determine verification mode from args
+    /// Determine verification mode from args and connectivity
     ///
     /// Priority:
     /// 1. --offline flag -> Offline
     /// 2. --online flag -> Online (or error if no internet)
     /// 3. No flag -> auto-detect (Online if internet available)
     #[allow(dead_code)]
-    pub fn determine_mode(&self, has_internet: bool) -> Result<VerificationMode, ModeError> {
+    pub fn determine_mode(&self) -> crate::error::CliResult<VerificationMode> {
         if self.offline {
-            Ok(VerificationMode::Offline)
-        } else if self.online {
-            if has_internet {
-                Ok(VerificationMode::Online)
-            } else {
-                Err(ModeError::NoInternetForOnlineMode)
+            return Ok(VerificationMode::Offline);
+        }
+
+        if self.online {
+            #[cfg(feature = "online")]
+            {
+                if crate::net::detect::has_internet_blocking() {
+                    return Ok(VerificationMode::Online);
+                } else {
+                    return Err(crate::error::CliError::NoInternetConnection);
+                }
             }
-        } else {
-            // Auto-detect
-            if has_internet {
+            #[cfg(not(feature = "online"))]
+            {
+                return Err(crate::error::CliError::NetworkError(
+                    "online feature not enabled".to_string(),
+                ));
+            }
+        }
+
+        // Auto-detect mode
+        #[cfg(feature = "online")]
+        {
+            if crate::net::detect::has_internet_blocking() {
                 Ok(VerificationMode::Online)
             } else {
                 Ok(VerificationMode::Offline)
             }
+        }
+
+        #[cfg(not(feature = "online"))]
+        {
+            Ok(VerificationMode::Offline)
         }
     }
 
@@ -246,25 +265,6 @@ impl VerifyArgs {
     }
 }
 
-/// Errors related to mode determination
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum ModeError {
-    /// --online flag used but no internet available
-    NoInternetForOnlineMode,
-}
-
-impl std::fmt::Display for ModeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoInternetForOnlineMode => {
-                write!(f, "--online flag requires internet connectivity")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ModeError {}
 
 #[cfg(test)]
 mod tests {
@@ -279,28 +279,13 @@ mod tests {
             online: false,
             verbose: false,
         };
-        assert_eq!(args.determine_mode(true), Ok(VerificationMode::Offline));
-        assert_eq!(args.determine_mode(false), Ok(VerificationMode::Offline));
+        let mode = args.determine_mode().unwrap();
+        assert_eq!(mode, VerificationMode::Offline);
     }
 
     #[test]
-    fn test_determine_mode_online_flag() {
-        let args = VerifyArgs {
-            source: PathBuf::from("test.pdf"),
-            receipt: PathBuf::from("test.pdf.atl"),
-            offline: false,
-            online: true,
-            verbose: false,
-        };
-        assert_eq!(args.determine_mode(true), Ok(VerificationMode::Online));
-        assert_eq!(
-            args.determine_mode(false),
-            Err(ModeError::NoInternetForOnlineMode)
-        );
-    }
-
-    #[test]
-    fn test_determine_mode_auto() {
+    #[cfg(not(feature = "online"))]
+    fn test_determine_mode_auto_without_feature() {
         let args = VerifyArgs {
             source: PathBuf::from("test.pdf"),
             receipt: PathBuf::from("test.pdf.atl"),
@@ -308,7 +293,7 @@ mod tests {
             online: false,
             verbose: false,
         };
-        assert_eq!(args.determine_mode(true), Ok(VerificationMode::Online));
-        assert_eq!(args.determine_mode(false), Ok(VerificationMode::Offline));
+        let mode = args.determine_mode().unwrap();
+        assert_eq!(mode, VerificationMode::Offline);
     }
 }

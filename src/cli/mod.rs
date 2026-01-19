@@ -4,7 +4,7 @@ pub mod args;
 
 pub use args::{Args, Command, InspectArgs, VerifyArgs};
 #[allow(unused_imports)]
-pub use args::{ModeError, VerificationMode};
+pub use args::VerificationMode;
 
 use crate::error::CliError;
 use clap::Parser;
