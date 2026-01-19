@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.6.0"
+version = "0.6.1"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0"
@@ -46,7 +46,7 @@ predicates = "3"
 tempfile = "3"
 
 [features]
-default = []
+default = ["online"]
 online = ["reqwest", "tokio", "futures", "once_cell"]
 
 [profile.release]
