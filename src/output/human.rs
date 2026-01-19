@@ -31,9 +31,11 @@ pub fn print_single_result(
     println!("File: {}", result.source_path.display());
     println!("Receipt: {}", result.receipt_path.display());
 
-    // Status
+    // Status - handle lite receipt case (check lite first!)
     print!("Status: ");
-    if result.is_valid() {
+    if result.is_lite_valid() {
+        print_status_pending("PENDING (unanchored)", use_color);
+    } else if result.is_valid() {
         print_status("VALID", true, use_color);
     } else {
         print_status("INVALID", false, use_color);
@@ -64,18 +66,42 @@ pub fn print_single_result(
     println!();
     println!("Receipt Verification:");
     println!("  Entry ID: {}", result.receipt.entry.id);
+
+    // Inclusion proof - show as VALID for lite receipts
     print!("  Inclusion Proof: ");
-    if result.core_result.is_valid {
+    if result.core_result.inclusion_valid
+        && result.core_result.super_inclusion_valid
+        && result.core_result.super_consistency_valid
+    {
         print_status("VALID", true, use_color);
     } else {
         print_status("INVALID", false, use_color);
     }
 
-    // Errors
-    if !result.core_result.errors.is_empty() {
+    // Anchor status for lite receipts
+    if result.is_lite_valid() {
+        print!("  Anchor Status: ");
+        print_status_pending("UNANCHORED", use_color);
+        println!();
+        println!();
+        println!("Note: This receipt is cryptographically valid but lacks external timestamp anchors.");
+        println!("      Request an upgraded receipt with TSA or Bitcoin anchoring for independent verification.");
+    }
+
+    // Errors (excluding NoTrustAnchor for lite receipts)
+    let errors: Vec<_> = result
+        .core_result
+        .errors
+        .iter()
+        .filter(|e| {
+            !matches!(e, atl_core::VerificationError::NoTrustAnchor) || !result.is_lite_valid()
+        })
+        .collect();
+
+    if !errors.is_empty() {
         println!();
         println!("Errors:");
-        for err in &result.core_result.errors {
+        for err in errors {
             println!("  - {err:?}");
         }
     }
@@ -238,6 +264,14 @@ fn print_status(text: &str, is_success: bool, use_color: bool) {
         } else {
             println!("{}", text.red().bold());
         }
+    } else {
+        println!("{text}");
+    }
+}
+
+fn print_status_pending(text: &str, use_color: bool) {
+    if use_color {
+        println!("{}", text.yellow().bold());
     } else {
         println!("{text}");
     }

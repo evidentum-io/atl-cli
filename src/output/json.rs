@@ -10,6 +10,7 @@ use crate::verify::single::SingleVerificationResult;
 #[derive(Serialize)]
 struct SingleResultJson {
     status: &'static str,
+    anchor_status: &'static str,
     mode: &'static str,
     source_file: String,
     receipt_file: String,
@@ -59,12 +60,17 @@ pub fn print_single_result(
     result: &SingleVerificationResult,
     mode: VerificationMode,
 ) -> CliResult<()> {
+    let (status, anchor_status) = if result.is_lite_valid() {
+        ("pending", "unanchored")
+    } else if result.is_valid() {
+        ("valid", "anchored")
+    } else {
+        ("invalid", "n/a")
+    };
+
     let output = SingleResultJson {
-        status: if result.is_valid() {
-            "valid"
-        } else {
-            "invalid"
-        },
+        status,
+        anchor_status,
         mode: match mode {
             VerificationMode::Online => "online",
             VerificationMode::Offline => "offline",
@@ -95,7 +101,7 @@ pub fn print_single_result(
             None
         },
         anchors: vec![], // Anchors not verified in offline mode
-        errors: if !result.is_valid() {
+        errors: if !result.is_valid() && !result.is_lite_valid() {
             if !result.file_hash_valid {
                 vec![ErrorJson {
                     error_type: "file_hash_mismatch".to_string(),

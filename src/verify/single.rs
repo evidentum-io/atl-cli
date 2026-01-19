@@ -62,6 +62,37 @@ impl SingleVerificationResult {
 
         false
     }
+
+    /// Check if this is a valid "lite" receipt (no anchors)
+    ///
+    /// Returns true if:
+    /// - File hash matches
+    /// - All cryptographic proofs are valid
+    /// - The only "error" is NoTrustAnchor (no external anchors)
+    #[must_use]
+    pub fn is_lite_valid(&self) -> bool {
+        use atl_core::VerificationError;
+
+        if !self.file_hash_valid {
+            return false;
+        }
+
+        // Check if proofs are valid
+        let proofs_valid = self.core_result.inclusion_valid
+            && self.core_result.super_inclusion_valid
+            && self.core_result.super_consistency_valid;
+
+        if !proofs_valid {
+            return false;
+        }
+
+        // Check if the only "error" is NoTrustAnchor
+        self.core_result.errors.len() == 1
+            && matches!(
+                self.core_result.errors.first(),
+                Some(VerificationError::NoTrustAnchor)
+            )
+    }
 }
 
 /// Load a receipt from file
@@ -282,6 +313,102 @@ mod tests {
         assert_eq!(result.receipt_path, cloned.receipt_path);
         assert_eq!(result.file_hash, cloned.file_hash);
         assert_eq!(result.file_hash_valid, cloned.file_hash_valid);
+    }
+
+    #[test]
+    fn test_is_lite_valid_true() {
+        let receipt = create_test_receipt();
+        let mut core_result =
+            atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
+
+        // Simulate lite receipt condition
+        core_result.is_valid = false;
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt,
+            core_result,
+        };
+
+        assert!(result.is_lite_valid());
+        assert!(result.is_valid()); // is_valid() should also return true
+    }
+
+    #[test]
+    fn test_is_lite_valid_false_hash_mismatch() {
+        let receipt = create_test_receipt();
+        let mut core_result =
+            atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
+
+        // Simulate lite receipt with hash mismatch
+        core_result.is_valid = false;
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: false, // Hash mismatch
+            receipt,
+            core_result,
+        };
+
+        assert!(!result.is_lite_valid());
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_is_lite_valid_false_proof_failed() {
+        let receipt = create_test_receipt();
+        let mut core_result =
+            atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
+
+        // Simulate failed proofs
+        core_result.is_valid = false;
+        core_result.inclusion_valid = false; // Proof failed
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt,
+            core_result,
+        };
+
+        assert!(!result.is_lite_valid());
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_is_lite_valid_false_other_errors() {
+        let receipt = create_test_receipt();
+        let mut core_result =
+            atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
+
+        // Simulate other errors besides NoTrustAnchor
+        core_result.is_valid = false;
+        core_result.errors = vec![atl_core::VerificationError::MetadataHashMismatch {
+            actual: "sha256:test".to_string(),
+            expected: "sha256:expected".to_string(),
+        }];
+
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt,
+            core_result,
+        };
+
+        assert!(!result.is_lite_valid());
+        assert!(!result.is_valid());
     }
 
     // Note: Comprehensive tests with valid receipts are in integration tests
