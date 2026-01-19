@@ -26,11 +26,14 @@ pub fn execute(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
 
 /// Execute single file verification
 fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
+    // Determine mode BEFORE verification
+    let mode = verify_args.determine_mode()?;
+
     // Perform verification
     let result = verify_single(&verify_args.source, &verify_args.receipt)?;
 
-    // Output result
-    output::print_single_result(&result, args)?;
+    // Output result WITH mode
+    output::print_single_result(&result, args, mode)?;
 
     // Return error if verification failed
     if !result.is_valid() {
@@ -53,11 +56,14 @@ fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
 
 /// Execute batch verification
 fn execute_batch(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
+    // Determine mode BEFORE verification
+    let mode = verify_args.determine_mode()?;
+
     // Perform batch verification
     let result = verify_batch(&verify_args.source, &verify_args.receipt)?;
 
-    // Output result
-    output::print_batch_result(&result, args)?;
+    // Output result WITH mode
+    output::print_batch_result(&result, args, mode)?;
 
     // Return error if any failures
     if !result.is_valid() {

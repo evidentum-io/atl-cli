@@ -144,7 +144,6 @@ pub struct InspectArgs {
 
 /// Verification mode determined from args and environment
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum VerificationMode {
     /// Offline verification only (no internet or --offline flag)
     Offline,

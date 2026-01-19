@@ -2,7 +2,6 @@
 
 pub mod args;
 
-#[allow(unused_imports)]
 pub use args::VerificationMode;
 pub use args::{Args, Command, InspectArgs, VerifyArgs};
 

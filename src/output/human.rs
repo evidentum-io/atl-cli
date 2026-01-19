@@ -2,19 +2,30 @@
 
 use colored::Colorize;
 
+use crate::cli::VerificationMode;
 use crate::error::CliResult;
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
 use crate::verify::consistency::ConsistencyResult;
 use crate::verify::single::SingleVerificationResult;
 
 /// Print single file result
-pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -> CliResult<()> {
+pub fn print_single_result(
+    result: &SingleVerificationResult,
+    use_color: bool,
+    mode: VerificationMode,
+) -> CliResult<()> {
     println!("Verification Result");
     println!("===================");
     println!();
 
     // Mode indicator
-    println!("Mode: OFFLINE");
+    println!(
+        "Mode: {}",
+        match mode {
+            VerificationMode::Online => "ONLINE",
+            VerificationMode::Offline => "OFFLINE",
+        }
+    );
 
     // File info
     println!("File: {}", result.source_path.display());
@@ -73,12 +84,22 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
 }
 
 /// Print batch result
-pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> CliResult<()> {
+pub fn print_batch_result(
+    result: &BatchVerificationResult,
+    use_color: bool,
+    mode: VerificationMode,
+) -> CliResult<()> {
     println!("Batch Verification Summary");
     println!("==========================");
     println!();
 
-    println!("Mode: OFFLINE");
+    println!(
+        "Mode: {}",
+        match mode {
+            VerificationMode::Online => "ONLINE",
+            VerificationMode::Offline => "OFFLINE",
+        }
+    );
 
     // Summary
     let total =
@@ -273,6 +294,8 @@ mod tests {
 
     #[test]
     fn test_print_single_result_valid_with_color() {
+        use crate::cli::VerificationMode;
+
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -282,11 +305,13 @@ mod tests {
             core_result: create_test_verification_result(true),
         };
 
-        assert!(print_single_result(&result, true).is_ok());
+        assert!(print_single_result(&result, true, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_single_result_valid_no_color() {
+        use crate::cli::VerificationMode;
+
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -296,11 +321,13 @@ mod tests {
             core_result: create_test_verification_result(true),
         };
 
-        assert!(print_single_result(&result, false).is_ok());
+        assert!(print_single_result(&result, false, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_single_result_invalid() {
+        use crate::cli::VerificationMode;
+
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -310,11 +337,13 @@ mod tests {
             core_result: create_test_verification_result(false),
         };
 
-        assert!(print_single_result(&result, true).is_ok());
+        assert!(print_single_result(&result, true, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_single_result_hash_mismatch() {
+        use crate::cli::VerificationMode;
+
         let result = SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
@@ -324,11 +353,13 @@ mod tests {
             core_result: create_test_verification_result(true),
         };
 
-        assert!(print_single_result(&result, false).is_ok());
+        assert!(print_single_result(&result, false, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_color() {
+        use crate::cli::VerificationMode;
+
         let result = BatchVerificationResult {
             valid_count: 2,
             invalid_count: 0,
@@ -338,11 +369,13 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, true).is_ok());
+        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_no_color() {
+        use crate::cli::VerificationMode;
+
         let result = BatchVerificationResult {
             valid_count: 2,
             invalid_count: 0,
@@ -352,11 +385,13 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, false).is_ok());
+        assert!(print_batch_result(&result, false, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_failures() {
+        use crate::cli::VerificationMode;
+
         let result = BatchVerificationResult {
             valid_count: 1,
             invalid_count: 1,
@@ -366,11 +401,12 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, true).is_ok());
+        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_consistency_valid() {
+        use crate::cli::VerificationMode;
         use crate::verify::consistency::ConsistencyResult;
 
         let result = BatchVerificationResult {
@@ -389,11 +425,12 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, true).is_ok());
+        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_batch_result_with_consistency_failed() {
+        use crate::cli::VerificationMode;
         use crate::verify::consistency::ConsistencyResult;
 
         let result = BatchVerificationResult {
@@ -412,11 +449,12 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, false).is_ok());
+        assert!(print_batch_result(&result, false, VerificationMode::Offline).is_ok());
     }
 
     #[test]
     fn test_print_batch_all_item_types() {
+        use crate::cli::VerificationMode;
         use crate::error::CliError;
 
         let items = vec![
@@ -454,8 +492,8 @@ mod tests {
             items,
         };
 
-        assert!(print_batch_result(&result, true).is_ok());
-        assert!(print_batch_result(&result, false).is_ok());
+        assert!(print_batch_result(&result, true, VerificationMode::Offline).is_ok());
+        assert!(print_batch_result(&result, false, VerificationMode::Offline).is_ok());
     }
 
     #[test]
