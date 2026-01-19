@@ -270,41 +270,42 @@ async fn verify_bitcoin_ots(
     }
 
     // Extract computed root (last hash, byte-reversed for display, with sha256: prefix)
-    let computed_root = earliest.merkle_path.last().map_or_else(String::new, |last_hash| {
-        let mut reversed = *last_hash;
-        reversed.reverse();
-        format!("sha256:{}", hex::encode(reversed))
-    });
+    let computed_root = earliest
+        .merkle_path
+        .last()
+        .map_or_else(String::new, |last_hash| {
+            let mut reversed = *last_hash;
+            reversed.reverse();
+            format!("sha256:{}", hex::encode(reversed))
+        });
 
     let operation_count = earliest.merkle_path.len();
 
     // Fetch block info with merkle_root
-    let block_info = match crate::net::bitcoin::get_block_info(
-        earliest.block_height,
-        config.request_timeout,
-    )
-    .await
-    {
-        Ok(info) => info,
-        Err(e) => {
-            // Return with partial data for offline-like display
-            return AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some(e.to_string()),
-                details: AnchorDetails::Bitcoin {
-                    block_height: earliest.block_height,
-                    block_timestamp_secs: 0,
-                    target_hash: target_hash.to_string(),
-                    operation_count,
-                    computed_root,
-                    block_merkle_root: None,
-                    merkle_match: None,
-                },
-            };
-        }
-    };
+    let block_info =
+        match crate::net::bitcoin::get_block_info(earliest.block_height, config.request_timeout)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                // Return with partial data for offline-like display
+                return AnchorVerificationResult {
+                    anchor_type: "bitcoin_ots".to_string(),
+                    verified: false,
+                    timestamp_nanos: None,
+                    error: Some(e.to_string()),
+                    details: AnchorDetails::Bitcoin {
+                        block_height: earliest.block_height,
+                        block_timestamp_secs: 0,
+                        target_hash: target_hash.to_string(),
+                        operation_count,
+                        computed_root,
+                        block_merkle_root: None,
+                        merkle_match: None,
+                    },
+                };
+            }
+        };
 
     // CRITICAL: Verify merkle root matches (using atl-core method)
     let merkle_match = earliest.verify_against_block(&block_info.merkle_root);
@@ -832,5 +833,103 @@ mod tests {
 
         // Assert
         assert_eq!(count, 39);
+    }
+
+    #[test]
+    fn test_online_config_clone() {
+        let config = OnlineConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.request_timeout, cloned.request_timeout);
+    }
+
+    #[test]
+    fn test_online_config_debug() {
+        let config = OnlineConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("OnlineConfig"));
+    }
+
+    #[test]
+    fn test_anchor_verification_result_clone() {
+        let result = AnchorVerificationResult {
+            anchor_type: "test".to_string(),
+            verified: true,
+            timestamp_nanos: Some(123),
+            error: None,
+            details: AnchorDetails::Unknown,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.anchor_type, "test");
+        assert!(cloned.verified);
+    }
+
+    #[test]
+    fn test_anchor_details_clone() {
+        let rfc = AnchorDetails::Rfc3161 {
+            algorithm_oid: "test".to_string(),
+        };
+        let bitcoin = AnchorDetails::Bitcoin {
+            block_height: 1,
+            block_timestamp_secs: 2,
+            target_hash: "hash".to_string(),
+            operation_count: 3,
+            computed_root: "root".to_string(),
+            block_merkle_root: Some("merkle".to_string()),
+            merkle_match: Some(true),
+        };
+
+        let rfc_cloned = rfc.clone();
+        let bitcoin_cloned = bitcoin.clone();
+
+        match rfc_cloned {
+            AnchorDetails::Rfc3161 { algorithm_oid } => assert_eq!(algorithm_oid, "test"),
+            _ => panic!("Wrong variant"),
+        }
+
+        match bitcoin_cloned {
+            AnchorDetails::Bitcoin { block_height, .. } => assert_eq!(block_height, 1),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_online_verification_result_debug() {
+        let single = create_test_single_result(true);
+        let online = OnlineVerificationResult {
+            offline: single,
+            anchor_results: vec![],
+            all_anchors_verified: true,
+            mode: VerificationMode::Online,
+        };
+        let debug_str = format!("{:?}", online);
+        assert!(debug_str.contains("OnlineVerificationResult"));
+    }
+
+    #[test]
+    fn test_verify_rfc3161_with_base64_prefix() {
+        // Test that base64: prefix is handled correctly
+        let result = verify_rfc3161(
+            "data_tree_root",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "2024-01-01T00:00:00Z",
+            "base64:sometoken",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        );
+        // Will fail verification but should not fail on prefix handling
+        assert!(!result.verified);
+    }
+
+    #[test]
+    fn test_verify_rfc3161_without_base64_prefix() {
+        // Test that missing base64: prefix is added
+        let result = verify_rfc3161(
+            "data_tree_root",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "2024-01-01T00:00:00Z",
+            "sometoken",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        );
+        // Will fail verification but should not fail on prefix handling
+        assert!(!result.verified);
     }
 }

@@ -50,10 +50,7 @@ impl BatchVerificationResult {
     pub fn is_valid(&self) -> bool {
         self.invalid_count == 0
             && self.error_count == 0
-            && self
-                .consistency
-                .as_ref()
-                .map_or(true, ConsistencyResult::is_valid)
+            && self.consistency.as_ref().is_none_or(|c| c.is_valid())
     }
 }
 

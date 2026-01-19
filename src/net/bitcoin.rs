@@ -67,7 +67,10 @@ pub async fn get_block_info(height: u64, timeout: Duration) -> CliResult<Bitcoin
     for provider in PROVIDERS {
         match fetch_block_info_from_provider(&client, provider, height).await {
             Ok(info) => {
-                BLOCK_INFO_CACHE.write().unwrap().insert(height, info.clone());
+                BLOCK_INFO_CACHE
+                    .write()
+                    .unwrap()
+                    .insert(height, info.clone());
                 return Ok(info);
             }
             Err(e) => {
@@ -228,13 +231,9 @@ async fn fetch_block_info_single_step(
         .await
         .map_err(|e| format!("JSON error: {e}"))?;
 
-    let block = response["blocks"]
-        .get(0)
-        .ok_or("Missing 'blocks[0]'")?;
+    let block = response["blocks"].get(0).ok_or("Missing 'blocks[0]'")?;
 
-    let timestamp = block["time"]
-        .as_u64()
-        .ok_or("Missing 'blocks[0].time'")?;
+    let timestamp = block["time"].as_u64().ok_or("Missing 'blocks[0].time'")?;
 
     let block_hash = block["hash"]
         .as_str()

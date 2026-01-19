@@ -790,4 +790,303 @@ mod tests {
         print_batch_item(1, &item, true);
         print_batch_item(1, &item, false);
     }
+
+    #[test]
+    fn test_print_single_online_result_valid_with_color() {
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![],
+            all_anchors_verified: true,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_with_rfc3161_anchor() {
+        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
+
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let anchor = AnchorVerificationResult {
+            anchor_type: "rfc3161".to_string(),
+            verified: true,
+            timestamp_nanos: Some(1700000000000000000),
+            error: None,
+            details: AnchorDetails::Rfc3161 {
+                algorithm_oid: "2.16.840.1.101.3.4.2.1".to_string(),
+            },
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![anchor],
+            all_anchors_verified: true,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+        assert!(print_single_online_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_with_bitcoin_anchor_verified() {
+        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
+
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let anchor = AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verified: true,
+            timestamp_nanos: Some(1700000000000000000),
+            error: None,
+            details: AnchorDetails::Bitcoin {
+                block_height: 800000,
+                block_timestamp_secs: 1700000000,
+                target_hash: "sha256:abc123".to_string(),
+                operation_count: 39,
+                computed_root: "sha256:def456".to_string(),
+                block_merkle_root: Some("sha256:def456".to_string()),
+                merkle_match: Some(true),
+            },
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![anchor],
+            all_anchors_verified: true,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+        assert!(print_single_online_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_with_bitcoin_anchor_mismatch() {
+        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
+
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let anchor = AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verified: false,
+            timestamp_nanos: None,
+            error: Some("Merkle root mismatch".to_string()),
+            details: AnchorDetails::Bitcoin {
+                block_height: 800000,
+                block_timestamp_secs: 1700000000,
+                target_hash: "sha256:abc123".to_string(),
+                operation_count: 39,
+                computed_root: "sha256:def456".to_string(),
+                block_merkle_root: Some("sha256:wrong789".to_string()),
+                merkle_match: Some(false),
+            },
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![anchor],
+            all_anchors_verified: false,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+        assert!(print_single_online_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_with_bitcoin_anchor_offline() {
+        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
+
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let anchor = AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verified: false,
+            timestamp_nanos: None,
+            error: Some("API error".to_string()),
+            details: AnchorDetails::Bitcoin {
+                block_height: 800000,
+                block_timestamp_secs: 0,
+                target_hash: "sha256:abc123".to_string(),
+                operation_count: 39,
+                computed_root: "sha256:def456".to_string(),
+                block_merkle_root: None,
+                merkle_match: None,
+            },
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![anchor],
+            all_anchors_verified: false,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+        assert!(print_single_online_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_with_unknown_anchor() {
+        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
+
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let anchor = AnchorVerificationResult {
+            anchor_type: "unknown".to_string(),
+            verified: false,
+            timestamp_nanos: None,
+            error: Some("Unknown anchor type".to_string()),
+            details: AnchorDetails::Unknown,
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![anchor],
+            all_anchors_verified: false,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_hash_mismatch() {
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: false,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![],
+            all_anchors_verified: true,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_lite_pending() {
+        let mut offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+        // Empty anchors for lite receipt
+        offline.receipt.anchors = vec![];
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![],
+            all_anchors_verified: true,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+    }
+
+    #[test]
+    fn test_format_anchor_type() {
+        assert_eq!(format_anchor_type("rfc3161"), "RFC 3161 (TSA)");
+        assert_eq!(format_anchor_type("bitcoin_ots"), "Bitcoin OTS");
+        assert_eq!(format_anchor_type("other"), "other");
+    }
+
+    #[test]
+    fn test_format_timestamp_nanos() {
+        // Valid timestamp
+        let ts = format_timestamp_nanos(1700000000000000000);
+        assert!(ts.contains("2023"));
+
+        // Zero timestamp
+        let ts_zero = format_timestamp_nanos(0);
+        assert_eq!(ts_zero, "1970-01-01T00:00:00Z");
+
+        // Very large timestamp - when divided by 1B becomes i64::MAX
+        // chrono::Utc.timestamp_opt() returns None for out-of-range values
+        let ts_large = format_timestamp_nanos(u64::MAX);
+        // Should contain either valid date or fallback format with "ns"
+        assert!(ts_large.contains("ns") || ts_large.contains("Z"));
+    }
+
+    #[test]
+    fn test_format_timestamp_secs() {
+        // Valid timestamp
+        let ts = format_timestamp_secs(1700000000);
+        assert!(ts.contains("2023"));
+
+        // Zero timestamp
+        let ts_zero = format_timestamp_secs(0);
+        assert_eq!(ts_zero, "1970-01-01T00:00:00Z");
+
+        // Very large invalid timestamp
+        let ts_large = format_timestamp_secs(u64::MAX);
+        assert!(ts_large.contains(" s"));
+    }
+
+    #[test]
+    fn test_print_status_pending_with_color() {
+        print_status_pending("PENDING", true);
+    }
+
+    #[test]
+    fn test_print_status_pending_no_color() {
+        print_status_pending("PENDING", false);
+    }
 }

@@ -154,4 +154,49 @@ mod tests {
         let result = execute(&verify_args, &args);
         assert!(result.is_err());
     }
+
+    #[cfg(feature = "online")]
+    #[test]
+    fn test_execute_single_determines_mode_for_receipt() {
+        use std::fs;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("test.txt");
+        let receipt_path = temp_dir.path().join("test.txt.atl");
+
+        // Create a valid source file
+        fs::write(&source_path, b"test content").unwrap();
+
+        // Create a minimal valid receipt (lite receipt - no anchors)
+        let receipt_json = include_str!("../../test_data/receipts/valid/document.pdf.atl");
+        fs::write(&receipt_path, receipt_json).unwrap();
+
+        let verify_args = VerifyArgs {
+            source: source_path,
+            receipt: receipt_path,
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+
+        let args = Args {
+            command: Command::Verify(VerifyArgs {
+                source: verify_args.source.clone(),
+                receipt: verify_args.receipt.clone(),
+                offline: false,
+                online: false,
+                verbose: false,
+            }),
+            quiet: true,
+            json: false,
+            no_color: false,
+        };
+
+        // Execute should determine mode based on receipt anchors
+        // This lite receipt has no anchors, so should not check connectivity
+        let result = execute(&verify_args, &args);
+        // Result will be Err because file hash won't match, but mode detection worked
+        assert!(result.is_err());
+    }
 }
