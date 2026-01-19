@@ -38,8 +38,7 @@ pub fn hash_file(path: &Path) -> CliResult<[u8; 32]> {
     }
 
     // Check file size
-    let metadata =
-        std::fs::metadata(path).map_err(|e| CliError::file_read_error(path, e))?;
+    let metadata = std::fs::metadata(path).map_err(|e| CliError::file_read_error(path, e))?;
 
     if metadata.len() > MAX_SOURCE_FILE_SIZE {
         return Err(CliError::FileTooLarge {
@@ -143,8 +142,7 @@ mod tests {
     #[test]
     fn test_compare_hash_mismatch() {
         let hash = [0xab; 32];
-        let expected =
-            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let expected = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         assert!(!compare_hash(&hash, expected));
     }
 
@@ -158,5 +156,74 @@ mod tests {
             hex::encode(hash),
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    #[test]
+    fn test_hash_file_large() {
+        let mut file = NamedTempFile::new().unwrap();
+        // Write 1MB of data
+        let data = vec![0u8; 1024 * 1024];
+        file.write_all(&data).unwrap();
+
+        // Should succeed (under 1GB limit)
+        let hash = hash_file(file.path());
+        assert!(hash.is_ok());
+    }
+
+    #[test]
+    fn test_constants() {
+        // Verify constants are set to expected values
+        assert_eq!(MAX_SOURCE_FILE_SIZE, 1024 * 1024 * 1024);
+        assert_eq!(MAX_RECEIPT_SIZE, 10 * 1024 * 1024);
+        assert_eq!(HASH_BUFFER_SIZE, 64 * 1024);
+    }
+
+    #[test]
+    fn test_format_hash_all_zeros() {
+        let hash = [0u8; 32];
+        let formatted = format_hash(&hash);
+        assert_eq!(
+            formatted,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn test_format_hash_all_ff() {
+        let hash = [0xff; 32];
+        let formatted = format_hash(&hash);
+        assert_eq!(
+            formatted,
+            "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+    }
+
+    #[test]
+    fn test_compare_hash_case_sensitive() {
+        let hash = [0xab; 32];
+        // Lowercase
+        let expected_lower =
+            "sha256:abababababababababababababababababababababababababababababababab";
+        assert!(compare_hash(&hash, expected_lower));
+
+        // Uppercase should NOT match (SHA-256 hashes are lowercase in our format)
+        let expected_upper =
+            "sha256:ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB";
+        assert!(!compare_hash(&hash, expected_upper));
+    }
+
+    #[test]
+    fn test_compare_hash_missing_prefix() {
+        let hash = [0xab; 32];
+        let expected_no_prefix = "abababababababababababababababababababababababababababababababab";
+        assert!(!compare_hash(&hash, expected_no_prefix));
+    }
+
+    #[test]
+    fn test_compare_hash_wrong_prefix() {
+        let hash = [0xab; 32];
+        let expected_wrong_prefix =
+            "sha512:abababababababababababababababababababababababababababababababab";
+        assert!(!compare_hash(&hash, expected_wrong_prefix));
     }
 }

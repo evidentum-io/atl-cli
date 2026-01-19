@@ -54,3 +54,15 @@ fn run() -> ExitCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_exit_code_values() {
+        assert_eq!(ExitCode::Valid.code(), 0);
+        assert_eq!(ExitCode::Invalid.code(), 1);
+        assert_eq!(ExitCode::Error.code(), 2);
+    }
+}

@@ -11,10 +11,7 @@ use crate::verify::single::SingleVerificationResult;
 /// Print single file verification result
 ///
 /// Output format determined by Args (human-readable or JSON)
-pub fn print_single_result(
-    result: &SingleVerificationResult,
-    args: &Args,
-) -> CliResult<()> {
+pub fn print_single_result(result: &SingleVerificationResult, args: &Args) -> CliResult<()> {
     if args.is_quiet() {
         return Ok(());
     }
@@ -29,10 +26,7 @@ pub fn print_single_result(
 /// Print batch verification result
 ///
 /// Output format determined by Args (human-readable or JSON)
-pub fn print_batch_result(
-    result: &BatchVerificationResult,
-    args: &Args,
-) -> CliResult<()> {
+pub fn print_batch_result(result: &BatchVerificationResult, args: &Args) -> CliResult<()> {
     if args.is_quiet() {
         return Ok(());
     }

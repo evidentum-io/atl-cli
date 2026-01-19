@@ -265,10 +265,143 @@ impl VerifyArgs {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_verification_mode_eq() {
+        assert_eq!(VerificationMode::Offline, VerificationMode::Offline);
+        assert_eq!(VerificationMode::Online, VerificationMode::Online);
+        assert_ne!(VerificationMode::Offline, VerificationMode::Online);
+    }
+
+    #[test]
+    fn test_verification_mode_clone() {
+        let mode = VerificationMode::Offline;
+        let cloned = mode;
+        assert_eq!(mode, cloned);
+    }
+
+    #[test]
+    fn test_args_use_color_enabled() {
+        let args = Args {
+            command: Command::Inspect(InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: false,
+            json: false,
+            no_color: false,
+        };
+        // use_color depends on atty::is_stdout which may vary
+        let _ = args.use_color();
+    }
+
+    #[test]
+    fn test_args_use_color_disabled() {
+        let args = Args {
+            command: Command::Inspect(InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: false,
+            json: false,
+            no_color: true,
+        };
+        assert!(!args.use_color());
+    }
+
+    #[test]
+    fn test_args_use_json() {
+        let args = Args {
+            command: Command::Inspect(InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: false,
+            json: true,
+            no_color: false,
+        };
+        assert!(args.use_json());
+
+        let args2 = Args {
+            command: Command::Inspect(InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: false,
+            json: false,
+            no_color: false,
+        };
+        assert!(!args2.use_json());
+    }
+
+    #[test]
+    fn test_args_is_quiet() {
+        let args = Args {
+            command: Command::Inspect(InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: true,
+            json: false,
+            no_color: false,
+        };
+        assert!(args.is_quiet());
+
+        let args2 = Args {
+            command: Command::Inspect(InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: false,
+            json: false,
+            no_color: false,
+        };
+        assert!(!args2.is_quiet());
+    }
+
+    #[test]
+    fn test_verify_args_is_batch_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let dir_path = temp_dir.path().to_path_buf();
+
+        let args = VerifyArgs {
+            source: dir_path.clone(),
+            receipt: dir_path,
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        assert!(args.is_batch_mode());
+
+        let args2 = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        assert!(!args2.is_batch_mode());
+    }
+
+    #[test]
+    fn test_verify_args_is_verbose() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: true,
+        };
+        assert!(args.is_verbose());
+
+        let args2 = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        assert!(!args2.is_verbose());
+    }
 
     #[test]
     fn test_determine_mode_offline_flag() {
@@ -295,5 +428,136 @@ mod tests {
         };
         let mode = args.determine_mode().unwrap();
         assert_eq!(mode, VerificationMode::Offline);
+    }
+
+    #[test]
+    #[cfg(not(feature = "online"))]
+    fn test_determine_mode_online_without_feature() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: true,
+            verbose: false,
+        };
+        let result = args.determine_mode();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_source_not_found() {
+        let args = VerifyArgs {
+            source: PathBuf::from("/nonexistent/test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        let result = args.validate();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CliError::SourceNotFound(_)));
+    }
+
+    #[test]
+    fn test_validate_receipt_not_found() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("test.pdf");
+        fs::write(&source_path, b"test").unwrap();
+
+        let args = VerifyArgs {
+            source: source_path,
+            receipt: PathBuf::from("/nonexistent/test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        let result = args.validate();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), CliError::ReceiptNotFound(_)));
+    }
+
+    #[test]
+    fn test_validate_mismatched_types() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_file = temp_dir.path().join("test.pdf");
+        let receipt_dir = temp_dir.path().join("receipts");
+
+        fs::write(&source_file, b"test").unwrap();
+        fs::create_dir(&receipt_dir).unwrap();
+
+        let args = VerifyArgs {
+            source: source_file,
+            receipt: receipt_dir,
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        let result = args.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            CliError::MismatchedInputTypes { .. }
+        ));
+    }
+
+    #[test]
+    fn test_validate_valid_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("test.pdf");
+        let receipt_path = temp_dir.path().join("test.pdf.atl");
+
+        fs::write(&source_path, b"test").unwrap();
+        fs::write(&receipt_path, b"receipt").unwrap();
+
+        let args = VerifyArgs {
+            source: source_path,
+            receipt: receipt_path,
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        let result = args.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_valid_directories() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("files");
+        let receipt_dir = temp_dir.path().join("receipts");
+
+        fs::create_dir(&source_dir).unwrap();
+        fs::create_dir(&receipt_dir).unwrap();
+
+        let args = VerifyArgs {
+            source: source_dir,
+            receipt: receipt_dir,
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        let result = args.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_non_atl_extension_warning() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_path = temp_dir.path().join("test.pdf");
+        let receipt_path = temp_dir.path().join("test.txt");
+
+        fs::write(&source_path, b"test").unwrap();
+        fs::write(&receipt_path, b"receipt").unwrap();
+
+        let args = VerifyArgs {
+            source: source_path,
+            receipt: receipt_path,
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        // Should still succeed, just prints warning
+        let result = args.validate();
+        assert!(result.is_ok());
     }
 }

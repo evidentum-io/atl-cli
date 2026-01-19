@@ -13,6 +13,10 @@ categories = ["command-line-utilities", "cryptography"]
 name = "atl-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "generate_test_data"
+path = "test_data/fixtures/generate_test_data.rs"
+
 [dependencies]
 # Core - always required (with online features)
 atl-core = { path = "../atl-core", features = ["rfc3161-verify", "bitcoin-ots"] }

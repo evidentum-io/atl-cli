@@ -26,9 +26,41 @@ pub struct SingleVerificationResult {
 
 impl SingleVerificationResult {
     /// Check if all verifications passed
+    ///
+    /// Verification is valid if:
+    /// - File hash matches payload_hash
+    /// - Core cryptographic proofs are valid (inclusion, super_proof)
+    ///
+    /// Note: `NoTrustAnchor` error is NOT considered a failure for Receipt-Lite.
+    /// This allows verification of receipts without external anchors (offline mode).
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        self.file_hash_valid && self.core_result.is_valid
+        use atl_core::VerificationError;
+
+        if !self.file_hash_valid {
+            return false;
+        }
+
+        // Check if core verification passed
+        if self.core_result.is_valid {
+            return true;
+        }
+
+        // If not valid, check if the only error is NoTrustAnchor
+        // In that case, consider it valid for Receipt-Lite (offline) verification
+        if self.core_result.errors.len() == 1
+            && matches!(
+                self.core_result.errors.first(),
+                Some(VerificationError::NoTrustAnchor)
+            )
+        {
+            // NoTrustAnchor alone is OK - Receipt-Lite verification passed
+            return self.core_result.inclusion_valid
+                && self.core_result.super_inclusion_valid
+                && self.core_result.super_consistency_valid;
+        }
+
+        false
     }
 }
 
@@ -52,8 +84,7 @@ pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
     }
 
     // Check file size
-    let metadata =
-        std::fs::metadata(path).map_err(|e| CliError::file_read_error(path, e))?;
+    let metadata = std::fs::metadata(path).map_err(|e| CliError::file_read_error(path, e))?;
 
     if metadata.len() > MAX_RECEIPT_SIZE {
         return Err(CliError::FileTooLarge {
@@ -64,11 +95,10 @@ pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
     }
 
     // Read and parse
-    let contents = std::fs::read_to_string(path)
-        .map_err(|e| CliError::file_read_error(path, e))?;
+    let contents = std::fs::read_to_string(path).map_err(|e| CliError::file_read_error(path, e))?;
 
-    let receipt: Receipt = serde_json::from_str(&contents)
-        .map_err(|e| CliError::ReceiptParseError(e.to_string()))?;
+    let receipt: Receipt =
+        serde_json::from_str(&contents).map_err(|e| CliError::ReceiptParseError(e.to_string()))?;
 
     // Validate version
     if !receipt.spec_version.starts_with("2.") {
@@ -136,12 +166,124 @@ pub fn verify_single(
 mod tests {
     use super::*;
 
+    fn create_test_receipt() -> atl_core::Receipt {
+        // Load a minimal valid receipt from test data
+        serde_json::from_str(include_str!(
+            "../../test_data/receipts/valid/document.pdf.atl"
+        ))
+        .expect("Failed to parse test receipt")
+    }
+
+    fn create_test_verification_result(is_valid: bool) -> atl_core::VerificationResult {
+        // Create a real verification result using the test receipt
+        let receipt = create_test_receipt();
+        let mut result =
+            atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
+
+        // Override is_valid for testing purposes
+        result.is_valid = is_valid;
+        if !is_valid {
+            result
+                .errors
+                .push(atl_core::VerificationError::MetadataHashMismatch {
+                    actual: "sha256:test".to_string(),
+                    expected: "sha256:expected".to_string(),
+                });
+        }
+
+        result
+    }
+
     #[test]
     fn test_load_receipt_not_found() {
         let result = load_receipt(Path::new("/nonexistent/receipt.atl"));
         assert!(matches!(result, Err(CliError::ReceiptNotFound(_))));
     }
 
+    #[test]
+    fn test_single_verification_result_is_valid_true() {
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            receipt: create_test_receipt(),
+            file_hash_valid: true,
+            core_result: create_test_verification_result(true),
+        };
+
+        assert!(result.is_valid());
+    }
+
+    #[test]
+    fn test_single_verification_result_is_valid_false_hash_mismatch() {
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            receipt: create_test_receipt(),
+            file_hash_valid: false,
+            core_result: create_test_verification_result(true),
+        };
+
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_single_verification_result_is_valid_false_core_invalid() {
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            receipt: create_test_receipt(),
+            file_hash_valid: true,
+            core_result: create_test_verification_result(false),
+        };
+
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn test_single_verification_result_valid_with_no_trust_anchor() {
+        let receipt = create_test_receipt();
+        let mut core_result =
+            atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
+
+        // Simulate NoTrustAnchor scenario
+        core_result.is_valid = false;
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            receipt,
+            file_hash_valid: true,
+            core_result,
+        };
+
+        // NoTrustAnchor alone should be treated as valid for offline mode
+        // when all cryptographic proofs are valid
+        assert!(result.is_valid());
+    }
+
+    #[test]
+    fn test_verify_single_result_clone() {
+        let result = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            receipt: create_test_receipt(),
+            file_hash_valid: true,
+            core_result: create_test_verification_result(true),
+        };
+
+        let cloned = result.clone();
+        assert_eq!(result.source_path, cloned.source_path);
+        assert_eq!(result.receipt_path, cloned.receipt_path);
+        assert_eq!(result.file_hash, cloned.file_hash);
+        assert_eq!(result.file_hash_valid, cloned.file_hash_valid);
+    }
+
     // Note: Comprehensive tests with valid receipts are in integration tests
-    // Unit tests here focus on error paths only
+    // Unit tests here focus on error paths and logic branches
 }

@@ -2,9 +2,9 @@
 
 pub mod args;
 
-pub use args::{Args, Command, InspectArgs, VerifyArgs};
 #[allow(unused_imports)]
 pub use args::VerificationMode;
+pub use args::{Args, Command, InspectArgs, VerifyArgs};
 
 use crate::error::CliError;
 use clap::Parser;
@@ -21,9 +21,8 @@ where
     I: IntoIterator<Item = T>,
     T: Into<std::ffi::OsString> + Clone,
 {
-    Args::try_parse_from(iter).map_err(|e| {
-        CliError::InvalidReceiptFormat(format!("Failed to parse CLI arguments: {e}"))
-    })
+    Args::try_parse_from(iter)
+        .map_err(|e| CliError::InvalidReceiptFormat(format!("Failed to parse CLI arguments: {e}")))
 }
 
 #[cfg(test)]

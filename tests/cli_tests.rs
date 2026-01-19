@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! CLI integration tests
 
 use assert_cmd::Command;
@@ -47,8 +48,14 @@ fn test_verify_help() {
 #[test]
 fn test_offline_online_mutual_exclusion() {
     let mut cmd = Command::cargo_bin("atl-cli").unwrap();
-    cmd.args(["verify", "test.pdf", "test.pdf.atl", "--offline", "--online"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
+    cmd.args([
+        "verify",
+        "test.pdf",
+        "test.pdf.atl",
+        "--offline",
+        "--online",
+    ])
+    .assert()
+    .failure()
+    .stderr(predicate::str::contains("cannot be used with"));
 }

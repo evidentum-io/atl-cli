@@ -50,7 +50,10 @@ impl BatchVerificationResult {
     pub fn is_valid(&self) -> bool {
         self.invalid_count == 0
             && self.error_count == 0
-            && self.consistency.as_ref().map_or(true, ConsistencyResult::is_valid)
+            && self
+                .consistency
+                .as_ref()
+                .map_or(true, ConsistencyResult::is_valid)
     }
 }
 
@@ -106,9 +109,7 @@ pub fn match_files_to_receipts(
         .collect();
 
     if receipt_files.is_empty() {
-        return Err(CliError::EmptyReceiptDirectory(
-            receipt_dir.to_path_buf(),
-        ));
+        return Err(CliError::EmptyReceiptDirectory(receipt_dir.to_path_buf()));
     }
 
     // Build receipt lookup by expected source name
@@ -171,10 +172,7 @@ pub fn match_files_to_receipts(
 /// Returns error if:
 /// - Directories cannot be read
 /// - No files or receipts found
-pub fn verify_batch(
-    source_dir: &Path,
-    receipt_dir: &Path,
-) -> CliResult<BatchVerificationResult> {
+pub fn verify_batch(source_dir: &Path, receipt_dir: &Path) -> CliResult<BatchVerificationResult> {
     // Match files to receipts
     let (matched, unmatched_sources, unmatched_receipts) =
         match_files_to_receipts(source_dir, receipt_dir)?;
@@ -285,10 +283,7 @@ mod tests {
         std::fs::write(source_dir.path().join("doc1.pdf"), b"content1").unwrap();
 
         let result = match_files_to_receipts(source_dir.path(), receipt_dir.path());
-        assert!(matches!(
-            result,
-            Err(CliError::EmptyReceiptDirectory(_))
-        ));
+        assert!(matches!(result, Err(CliError::EmptyReceiptDirectory(_))));
     }
 
     #[test]

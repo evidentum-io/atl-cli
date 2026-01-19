@@ -70,3 +70,52 @@ fn execute_batch(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Command;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_execute_single_invalid_source() {
+        let verify_args = VerifyArgs {
+            source: PathBuf::from("/nonexistent/file.pdf"),
+            receipt: PathBuf::from("test.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        let args = Args {
+            command: Command::Inspect(crate::cli::InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: true,
+            json: false,
+            no_color: false,
+        };
+        let result = execute(&verify_args, &args);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_batch_invalid_source() {
+        let verify_args = VerifyArgs {
+            source: PathBuf::from("/nonexistent/dir/"),
+            receipt: PathBuf::from("/nonexistent/receipts/"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+        let args = Args {
+            command: Command::Inspect(crate::cli::InspectArgs {
+                receipt: PathBuf::from("test.atl"),
+            }),
+            quiet: true,
+            json: false,
+            no_color: false,
+        };
+        let result = execute(&verify_args, &args);
+        assert!(result.is_err());
+    }
+}

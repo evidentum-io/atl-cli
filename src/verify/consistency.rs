@@ -54,9 +54,7 @@ impl ConsistencyResult {
 ///
 /// Returns error only if internal verification fails unexpectedly.
 /// Consistency failures are reported in the result structure.
-pub fn verify_consistency(
-    results: &[SingleVerificationResult],
-) -> CliResult<ConsistencyResult> {
+pub fn verify_consistency(results: &[SingleVerificationResult]) -> CliResult<ConsistencyResult> {
     if results.len() < 2 {
         return Ok(ConsistencyResult {
             same_log: true,
@@ -85,8 +83,11 @@ pub fn verify_consistency(
 
     // Check all have same genesis
     for result in results.iter().skip(1) {
-        let genesis =
-            result.receipt.super_proof.as_ref().map(|sp| &sp.genesis_super_root);
+        let genesis = result
+            .receipt
+            .super_proof
+            .as_ref()
+            .map(|sp| &sp.genesis_super_root);
         if genesis != first_genesis {
             same_log = false;
             errors.push(format!(
@@ -100,7 +101,10 @@ pub fn verify_consistency(
     // Sort by super_tree_size for pairwise verification
     let mut sorted: Vec<_> = results.iter().collect();
     sorted.sort_by_key(|r| {
-        r.receipt.super_proof.as_ref().map_or(0, |sp| sp.super_tree_size)
+        r.receipt
+            .super_proof
+            .as_ref()
+            .map_or(0, |sp| sp.super_tree_size)
     });
 
     // Verify consecutive pairs

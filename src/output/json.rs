@@ -56,7 +56,11 @@ struct ErrorJson {
 
 pub fn print_single_result(result: &SingleVerificationResult) -> CliResult<()> {
     let output = SingleResultJson {
-        status: if result.is_valid() { "valid" } else { "invalid" },
+        status: if result.is_valid() {
+            "valid"
+        } else {
+            "invalid"
+        },
         mode: "offline",
         source_file: result.source_path.display().to_string(),
         receipt_file: result.receipt_path.display().to_string(),
@@ -243,7 +247,11 @@ pub fn print_batch_result(result: &BatchVerificationResult) -> CliResult<()> {
         .collect();
 
     let output = BatchResultJson {
-        status: if result.is_valid() { "valid" } else { "invalid" },
+        status: if result.is_valid() {
+            "valid"
+        } else {
+            "invalid"
+        },
         mode: "offline",
         source_dir: String::new(), // Would need to be passed in
         receipt_dir: String::new(),
@@ -272,4 +280,372 @@ pub fn print_batch_result(result: &BatchVerificationResult) -> CliResult<()> {
     let json = serde_json::to_string_pretty(&output)?;
     println!("{json}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn create_test_receipt() -> atl_core::Receipt {
+        // Load a minimal valid receipt from test data
+        serde_json::from_str(include_str!(
+            "../../test_data/receipts/valid/document.pdf.atl"
+        ))
+        .expect("Failed to parse test receipt")
+    }
+
+    fn create_test_verification_result(is_valid: bool) -> atl_core::VerificationResult {
+        // Create a real verification result using the test receipt
+        let receipt = create_test_receipt();
+        let mut result =
+            atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
+
+        // Override is_valid for testing purposes
+        result.is_valid = is_valid;
+        if !is_valid {
+            result
+                .errors
+                .push(atl_core::VerificationError::MetadataHashMismatch {
+                    actual: "sha256:test".to_string(),
+                    expected: "sha256:expected".to_string(),
+                });
+        }
+
+        result
+    }
+
+    #[test]
+    fn test_print_single_result_valid() {
+        let result = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        assert!(print_single_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_result_invalid() {
+        let result = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(false),
+        };
+
+        assert!(print_single_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_result_hash_mismatch() {
+        let result = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: false,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        assert!(print_single_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_result_with_super_proof() {
+        let receipt = create_test_receipt();
+        // The test receipt already has super_proof
+
+        let result = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt,
+            core_result: create_test_verification_result(true),
+        };
+
+        assert!(print_single_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_print_batch_result_all_valid() {
+        let result = BatchVerificationResult {
+            valid_count: 2,
+            invalid_count: 0,
+            error_count: 0,
+            unmatched_count: 0,
+            consistency: None,
+            items: vec![],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_print_batch_result_with_failures() {
+        let result = BatchVerificationResult {
+            valid_count: 1,
+            invalid_count: 1,
+            error_count: 1,
+            unmatched_count: 1,
+            consistency: None,
+            items: vec![],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_print_batch_result_with_consistency() {
+        use crate::verify::consistency::ConsistencyResult;
+
+        let result = BatchVerificationResult {
+            valid_count: 2,
+            invalid_count: 0,
+            error_count: 0,
+            unmatched_count: 0,
+            consistency: Some(ConsistencyResult {
+                genesis_super_root: Some([0x12; 32]),
+                receipt_count: 2,
+                same_log: true,
+                history_consistent: true,
+                cross_results: vec![],
+                errors: vec![],
+            }),
+            items: vec![],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_print_batch_result_consistency_failed() {
+        use crate::verify::consistency::ConsistencyResult;
+
+        let result = BatchVerificationResult {
+            valid_count: 0,
+            invalid_count: 0,
+            error_count: 0,
+            unmatched_count: 0,
+            consistency: Some(ConsistencyResult {
+                genesis_super_root: None,
+                receipt_count: 2,
+                same_log: false,
+                history_consistent: false,
+                cross_results: vec![],
+                errors: vec!["Inconsistent logs".to_string()],
+            }),
+            items: vec![],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_batch_item_valid() {
+        let item = BatchItemResult::Valid(SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        });
+
+        let result = BatchVerificationResult {
+            valid_count: 1,
+            invalid_count: 0,
+            error_count: 0,
+            unmatched_count: 0,
+            consistency: None,
+            items: vec![item],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_batch_item_invalid() {
+        let item = BatchItemResult::Invalid(SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: false,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(false),
+        });
+
+        let result = BatchVerificationResult {
+            valid_count: 0,
+            invalid_count: 1,
+            error_count: 0,
+            unmatched_count: 0,
+            consistency: None,
+            items: vec![item],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_batch_item_error() {
+        use crate::error::CliError;
+
+        let item = BatchItemResult::Error {
+            source: PathBuf::from("test.pdf"),
+            receipt: Some(PathBuf::from("test.pdf.atl")),
+            error: CliError::SourceNotFound(PathBuf::from("test.pdf")),
+        };
+
+        let result = BatchVerificationResult {
+            valid_count: 0,
+            invalid_count: 0,
+            error_count: 1,
+            unmatched_count: 0,
+            consistency: None,
+            items: vec![item],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_batch_item_no_receipt() {
+        let item = BatchItemResult::NoReceipt(PathBuf::from("test.pdf"));
+
+        let result = BatchVerificationResult {
+            valid_count: 0,
+            invalid_count: 0,
+            error_count: 0,
+            unmatched_count: 1,
+            consistency: None,
+            items: vec![item],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_batch_item_no_source() {
+        let item = BatchItemResult::NoSource(PathBuf::from("test.pdf.atl"));
+
+        let result = BatchVerificationResult {
+            valid_count: 0,
+            invalid_count: 0,
+            error_count: 0,
+            unmatched_count: 1,
+            consistency: None,
+            items: vec![item],
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_batch_mixed_items() {
+        use crate::error::CliError;
+
+        let items = vec![
+            BatchItemResult::Valid(SingleVerificationResult {
+                source_path: PathBuf::from("test1.pdf"),
+                receipt_path: PathBuf::from("test1.pdf.atl"),
+                file_hash: [0xab; 32],
+                file_hash_valid: true,
+                receipt: create_test_receipt(),
+                core_result: create_test_verification_result(true),
+            }),
+            BatchItemResult::Invalid(SingleVerificationResult {
+                source_path: PathBuf::from("test2.pdf"),
+                receipt_path: PathBuf::from("test2.pdf.atl"),
+                file_hash: [0xcd; 32],
+                file_hash_valid: false,
+                receipt: create_test_receipt(),
+                core_result: create_test_verification_result(false),
+            }),
+            BatchItemResult::Error {
+                source: PathBuf::from("test3.pdf"),
+                receipt: Some(PathBuf::from("test3.pdf.atl")),
+                error: CliError::SourceNotFound(PathBuf::from("test3.pdf")),
+            },
+            BatchItemResult::NoReceipt(PathBuf::from("test4.pdf")),
+            BatchItemResult::NoSource(PathBuf::from("test5.pdf.atl")),
+        ];
+
+        let result = BatchVerificationResult {
+            valid_count: 1,
+            invalid_count: 1,
+            error_count: 1,
+            unmatched_count: 2,
+            consistency: None,
+            items,
+        };
+
+        assert!(print_batch_result(&result).is_ok());
+    }
+
+    #[test]
+    fn test_serialization_structures() {
+        // Test that all JSON structures can be serialized
+        let file_hash = FileHashJson {
+            computed: "sha256:abcd".to_string(),
+            expected: "sha256:abcd".to_string(),
+            is_match: true,
+        };
+        assert!(serde_json::to_string(&file_hash).is_ok());
+
+        let verification = VerificationJson {
+            entry_id: "1".to_string(),
+            inclusion_valid: true,
+            super_inclusion_valid: Some(true),
+            super_consistency_valid: Some(true),
+        };
+        assert!(serde_json::to_string(&verification).is_ok());
+
+        let anchor = AnchorJson {
+            anchor_type: "bitcoin".to_string(),
+            target: "000000000000000000012345".to_string(),
+            verified: Some(true),
+            timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            block_height: Some(800000),
+        };
+        assert!(serde_json::to_string(&anchor).is_ok());
+
+        let error = ErrorJson {
+            error_type: "verification_failed".to_string(),
+            message: "Test error".to_string(),
+        };
+        assert!(serde_json::to_string(&error).is_ok());
+
+        let summary = SummaryJson {
+            total: 10,
+            valid: 8,
+            invalid: 1,
+            errors: 1,
+            unmatched: 0,
+        };
+        assert!(serde_json::to_string(&summary).is_ok());
+
+        let consistency = ConsistencyJson {
+            status: "verified",
+            genesis_super_root: Some("sha256:abcd".to_string()),
+            receipt_count: 10,
+        };
+        assert!(serde_json::to_string(&consistency).is_ok());
+
+        let batch_item = BatchItemJson {
+            file: "test.pdf".to_string(),
+            receipt: Some("test.pdf.atl".to_string()),
+            status: "valid",
+            file_hash_match: Some(true),
+            error: None,
+        };
+        assert!(serde_json::to_string(&batch_item).is_ok());
+    }
 }

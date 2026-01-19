@@ -38,7 +38,6 @@ pub enum CliError {
     // ========================================================================
     // Input Errors (Exit Code 2: ERROR)
     // ========================================================================
-
     /// Source file not found
     #[error("Source file not found: {0}")]
     SourceNotFound(PathBuf),
@@ -73,7 +72,6 @@ pub enum CliError {
     // ========================================================================
     // Receipt Parse Errors (Exit Code 2: ERROR)
     // ========================================================================
-
     /// Receipt JSON parse error
     #[error("Failed to parse receipt: {0}")]
     #[allow(dead_code)]
@@ -90,7 +88,6 @@ pub enum CliError {
     // ========================================================================
     // Verification Failures (Exit Code 1: INVALID)
     // ========================================================================
-
     /// File hash does not match receipt's payload_hash
     #[error("File hash mismatch: file has changed since receipt was issued")]
     #[allow(dead_code)]
@@ -106,10 +103,7 @@ pub enum CliError {
     /// Metadata hash mismatch
     #[error("Metadata hash mismatch in receipt")]
     #[allow(dead_code)]
-    MetadataHashMismatch {
-        expected: String,
-        actual: String,
-    },
+    MetadataHashMismatch { expected: String, actual: String },
 
     /// Merkle inclusion proof failed
     #[error("Merkle inclusion proof failed: {reason}")]
@@ -139,7 +133,6 @@ pub enum CliError {
     // ========================================================================
     // Batch Mode Errors (Exit Codes vary)
     // ========================================================================
-
     /// No matching receipt found for file (Exit Code 2 if critical, or just warning)
     #[error("No receipt found for file: {0}")]
     #[allow(dead_code)]
@@ -172,9 +165,10 @@ pub enum CliError {
     // ========================================================================
     // Consistency Errors (Exit Code 1: INVALID)
     // ========================================================================
-
     /// Receipts have different genesis (from different logs)
-    #[error("Log consistency failed: receipts are from different logs (different genesis_super_root)")]
+    #[error(
+        "Log consistency failed: receipts are from different logs (different genesis_super_root)"
+    )]
     #[allow(dead_code)]
     DifferentLogOrigins {
         /// First receipt's genesis
@@ -199,7 +193,6 @@ pub enum CliError {
     // ========================================================================
     // Network Errors (Exit Code 2: ERROR)
     // ========================================================================
-
     /// No internet connection (when --online flag used)
     #[error("No internet connection (--online mode requires network access)")]
     #[allow(dead_code)]
@@ -236,7 +229,6 @@ pub enum CliError {
     // ========================================================================
     // Internal Errors (Exit Code 2: ERROR)
     // ========================================================================
-
     /// I/O error
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -316,15 +308,11 @@ use atl_core::VerificationError as CoreVerificationError;
 impl From<CoreVerificationError> for CliError {
     fn from(err: CoreVerificationError) -> Self {
         match err {
-            CoreVerificationError::InvalidReceipt(msg) => {
-                Self::InvalidReceiptFormat(msg)
-            }
+            CoreVerificationError::InvalidReceipt(msg) => Self::InvalidReceiptFormat(msg),
             CoreVerificationError::InvalidHash { field, message } => {
                 Self::InvalidReceiptFormat(format!("Invalid hash in {field}: {message}"))
             }
-            CoreVerificationError::SignatureFailed => {
-                Self::SignatureVerificationFailed
-            }
+            CoreVerificationError::SignatureFailed => Self::SignatureVerificationFailed,
             CoreVerificationError::InclusionProofFailed { reason } => {
                 Self::InclusionProofFailed { reason }
             }
@@ -337,39 +325,38 @@ impl From<CoreVerificationError> for CliError {
             CoreVerificationError::TreeSizeMismatch => {
                 Self::VerificationFailed("Tree size mismatch".to_string())
             }
-            CoreVerificationError::AnchorFailed { anchor_type, reason } => {
-                match anchor_type.as_str() {
-                    "rfc3161" => Self::TsaVerificationFailed(reason),
-                    "bitcoin_ots" => Self::OtsVerificationFailed(reason),
-                    _ => Self::VerificationFailed(format!("Anchor {anchor_type} failed: {reason}")),
-                }
-            }
+            CoreVerificationError::AnchorFailed {
+                anchor_type,
+                reason,
+            } => match anchor_type.as_str() {
+                "rfc3161" => Self::TsaVerificationFailed(reason),
+                "bitcoin_ots" => Self::OtsVerificationFailed(reason),
+                _ => Self::VerificationFailed(format!("Anchor {anchor_type} failed: {reason}")),
+            },
             CoreVerificationError::SuperInclusionFailed { reason } => {
                 Self::SuperInclusionFailed { reason }
             }
             CoreVerificationError::SuperConsistencyFailed { reason } => {
                 Self::SuperConsistencyFailed { reason }
             }
-            CoreVerificationError::SuperDataMismatch { field, expected, actual } => {
-                Self::VerificationFailed(format!(
-                    "Super-Tree data mismatch in {field}: expected {expected}, got {actual}"
-                ))
-            }
+            CoreVerificationError::SuperDataMismatch {
+                field,
+                expected,
+                actual,
+            } => Self::VerificationFailed(format!(
+                "Super-Tree data mismatch in {field}: expected {expected}, got {actual}"
+            )),
             CoreVerificationError::MissingSuperProof => {
                 Self::InvalidReceiptFormat("Missing super_proof (required in v2.0)".to_string())
             }
-            CoreVerificationError::UnsupportedVersion(version) => {
-                Self::UnsupportedReceiptVersion {
-                    version,
-                    expected: "2.0.0".to_string(),
-                }
-            }
+            CoreVerificationError::UnsupportedVersion(version) => Self::UnsupportedReceiptVersion {
+                version,
+                expected: "2.0.0".to_string(),
+            },
             CoreVerificationError::MetadataHashMismatch { expected, actual } => {
                 Self::MetadataHashMismatch { expected, actual }
             }
-            CoreVerificationError::NoTrustAnchor => {
-                Self::NoTrustAnchor
-            }
+            CoreVerificationError::NoTrustAnchor => Self::NoTrustAnchor,
         }
     }
 }
@@ -558,5 +545,158 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let cli_err: CliError = io_err.into();
         assert!(matches!(cli_err, CliError::Io(_)));
+    }
+
+    #[test]
+    fn test_from_core_anchor_failed_rfc3161() {
+        let core_err = CoreVerificationError::AnchorFailed {
+            anchor_type: "rfc3161".to_string(),
+            reason: "TSA cert expired".to_string(),
+        };
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::TsaVerificationFailed(_)));
+    }
+
+    #[test]
+    fn test_from_core_anchor_failed_bitcoin_ots() {
+        let core_err = CoreVerificationError::AnchorFailed {
+            anchor_type: "bitcoin_ots".to_string(),
+            reason: "OTS not confirmed".to_string(),
+        };
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::OtsVerificationFailed(_)));
+    }
+
+    #[test]
+    fn test_from_core_anchor_failed_unknown() {
+        let core_err = CoreVerificationError::AnchorFailed {
+            anchor_type: "unknown".to_string(),
+            reason: "test".to_string(),
+        };
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::VerificationFailed(_)));
+    }
+
+    #[test]
+    fn test_from_core_super_inclusion_failed() {
+        let core_err = CoreVerificationError::SuperInclusionFailed {
+            reason: "test reason".to_string(),
+        };
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::SuperInclusionFailed { .. }));
+    }
+
+    #[test]
+    fn test_from_core_super_consistency_failed() {
+        let core_err = CoreVerificationError::SuperConsistencyFailed {
+            reason: "test reason".to_string(),
+        };
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::SuperConsistencyFailed { .. }));
+    }
+
+    #[test]
+    fn test_from_core_super_data_mismatch() {
+        let core_err = CoreVerificationError::SuperDataMismatch {
+            field: "test_field".to_string(),
+            expected: "expected_value".to_string(),
+            actual: "actual_value".to_string(),
+        };
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::VerificationFailed(_)));
+    }
+
+    #[test]
+    fn test_from_core_missing_super_proof() {
+        let core_err = CoreVerificationError::MissingSuperProof;
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::InvalidReceiptFormat(_)));
+    }
+
+    #[test]
+    fn test_from_core_unsupported_version() {
+        let core_err = CoreVerificationError::UnsupportedVersion("3.0.0".to_string());
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(
+            cli_err,
+            CliError::UnsupportedReceiptVersion { .. }
+        ));
+    }
+
+    #[test]
+    fn test_from_core_metadata_hash_mismatch() {
+        let core_err = CoreVerificationError::MetadataHashMismatch {
+            expected: "expected".to_string(),
+            actual: "actual".to_string(),
+        };
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::MetadataHashMismatch { .. }));
+    }
+
+    #[test]
+    fn test_from_core_no_trust_anchor() {
+        let core_err = CoreVerificationError::NoTrustAnchor;
+        let cli_err: CliError = core_err.into();
+        assert!(matches!(cli_err, CliError::NoTrustAnchor));
+    }
+
+    #[test]
+    fn test_network_error() {
+        let err = CliError::NetworkError("connection failed".to_string());
+        assert_eq!(err.exit_code(), ExitCode::Error);
+    }
+
+    #[test]
+    fn test_ots_verification_failed() {
+        let err = CliError::OtsVerificationFailed("test".to_string());
+        assert_eq!(err.exit_code(), ExitCode::Invalid);
+    }
+
+    #[test]
+    fn test_file_read_error_helper() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
+        let err = CliError::file_read_error(PathBuf::from("/test/file"), io_err);
+        assert!(matches!(err, CliError::FileReadError { .. }));
+    }
+
+    #[test]
+    fn test_file_hash_mismatch_helper() {
+        let computed = [0u8; 32];
+        let expected = "sha256:abcd";
+        let err = CliError::file_hash_mismatch(PathBuf::from("/test/file"), &computed, expected);
+        assert!(matches!(err, CliError::FileHashMismatch { .. }));
+    }
+
+    #[test]
+    fn test_different_logs_helper() {
+        let genesis_a = [0xAAu8; 32];
+        let genesis_b = [0xBBu8; 32];
+        let err = CliError::different_logs(&genesis_a, &genesis_b);
+        assert!(matches!(err, CliError::DifferentLogOrigins { .. }));
+    }
+
+    #[test]
+    fn test_receipt_parse_error() {
+        let err = CliError::ReceiptParseError("invalid JSON".to_string());
+        assert_eq!(err.exit_code(), ExitCode::Error);
+    }
+
+    #[test]
+    fn test_unsupported_receipt_version() {
+        let err = CliError::UnsupportedReceiptVersion {
+            version: "3.0.0".to_string(),
+            expected: "2.0.0".to_string(),
+        };
+        assert_eq!(err.exit_code(), ExitCode::Error);
+    }
+
+    #[test]
+    fn test_file_too_large() {
+        let err = CliError::FileTooLarge {
+            path: PathBuf::from("/test/file"),
+            size_bytes: 100_000_000,
+            max_bytes: 10_000_000,
+        };
+        assert_eq!(err.exit_code(), ExitCode::Error);
     }
 }
