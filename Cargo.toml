@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.1.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75.0"
 license = "Apache-2.0"
@@ -13,9 +13,13 @@ categories = ["command-line-utilities", "cryptography"]
 name = "atl-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "generate_test_data"
+path = "test_data/fixtures/generate_test_data.rs"
+
 [dependencies]
-# Core - always required
-atl-core = { path = "../atl-core" }
+# Core - always required (with online features)
+atl-core = { path = "../atl-core", features = ["rfc3161-verify", "bitcoin-ots"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -28,10 +32,13 @@ sha2 = "0.10"
 # Output formatting
 colored = "2"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+atty = "0.2"
 
 # Online verification (optional)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"], optional = true }
 tokio = { version = "1", features = ["rt", "macros"], optional = true }
+futures = { version = "0.3", optional = true }
+once_cell = { version = "1", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2"
@@ -40,7 +47,7 @@ tempfile = "3"
 
 [features]
 default = []
-online = ["reqwest", "tokio"]
+online = ["reqwest", "tokio", "futures", "once_cell"]
 
 [profile.release]
 strip = true
