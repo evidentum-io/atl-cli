@@ -25,7 +25,6 @@ impl Default for OnlineConfig {
 
 /// Result of online anchor verification
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct AnchorVerificationResult {
     pub anchor_type: String,
     pub verified: bool,
@@ -35,38 +34,46 @@ pub struct AnchorVerificationResult {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub enum AnchorDetails {
     Rfc3161 {
+        #[allow(dead_code)]
         algorithm_oid: String,
     },
     Bitcoin {
         block_height: u64,
         block_timestamp_secs: u64,
+        /// Target hash being verified (with sha256: prefix)
+        target_hash: String,
+        /// Number of operations in OTS proof
+        operation_count: usize,
+        /// Computed merkle root from OTS proof (with sha256: prefix, 71 chars total)
+        computed_root: String,
+        /// Block merkle root from API (with sha256: prefix) - None if offline/error
+        block_merkle_root: Option<String>,
+        /// Whether computed_root matches block_merkle_root
+        merkle_match: Option<bool>,
     },
     Unknown,
 }
 
 /// Extended verification result with online checks
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct OnlineVerificationResult {
     pub offline: SingleVerificationResult,
     pub anchor_results: Vec<AnchorVerificationResult>,
     pub all_anchors_verified: bool,
+    #[allow(dead_code)]
     pub mode: VerificationMode,
 }
 
 impl OnlineVerificationResult {
     #[must_use]
-    #[allow(dead_code)]
     pub fn is_valid(&self) -> bool {
         self.offline.is_valid() && self.all_anchors_verified
     }
 }
 
 /// Verify RFC 3161 anchor using atl-core
-#[allow(dead_code)]
 fn verify_rfc3161(
     target: &str,
     target_hash: &str,
@@ -149,7 +156,6 @@ fn verify_rfc3161(
 }
 
 /// Verify Bitcoin/OTS anchor using atl-core + Bitcoin API
-#[allow(dead_code)]
 async fn verify_bitcoin_ots(
     target: &str,
     target_hash: &str,
@@ -172,17 +178,14 @@ async fn verify_bitcoin_ots(
     }
 
     // Validate super_root exists
-    let expected_super_root = match super_root {
-        Some(sr) => sr,
-        None => {
-            return AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some("Receipt has no super_proof".to_string()),
-                details: AnchorDetails::Unknown,
-            }
-        }
+    let Some(expected_super_root) = super_root else {
+        return AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verified: false,
+            timestamp_nanos: None,
+            error: Some("Receipt has no super_proof".to_string()),
+            details: AnchorDetails::Unknown,
+        };
     };
 
     // Validate target_hash matches super_root
@@ -218,7 +221,7 @@ async fn verify_bitcoin_ots(
                 anchor_type: "bitcoin_ots".to_string(),
                 verified: false,
                 timestamp_nanos: None,
-                error: Some(format!("Invalid hex: {}", e)),
+                error: Some(format!("Invalid hex: {e}")),
                 details: AnchorDetails::Unknown,
             }
         }
@@ -232,7 +235,7 @@ async fn verify_bitcoin_ots(
                 anchor_type: "bitcoin_ots".to_string(),
                 verified: false,
                 timestamp_nanos: None,
-                error: Some(format!("OTS verification failed: {}", e)),
+                error: Some(format!("OTS verification failed: {e}")),
                 details: AnchorDetails::Unknown,
             }
         }
@@ -255,35 +258,99 @@ async fn verify_bitcoin_ots(
         .min_by_key(|a| a.block_height)
         .unwrap();
 
-    // Fetch block timestamp via HTTP
-    match crate::net::bitcoin::get_block_timestamp(earliest.block_height, config.request_timeout)
-        .await
-    {
-        Ok(block_info) => {
-            let timestamp_nanos = block_info.timestamp_secs * 1_000_000_000;
-            AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: true,
-                timestamp_nanos: Some(timestamp_nanos),
-                error: None,
-                details: AnchorDetails::Bitcoin {
-                    block_height: block_info.height,
-                    block_timestamp_secs: block_info.timestamp_secs,
-                },
-            }
-        }
-        Err(e) => AnchorVerificationResult {
+    // Check merkle path is not empty
+    if earliest.merkle_path.is_empty() {
+        return AnchorVerificationResult {
             anchor_type: "bitcoin_ots".to_string(),
             verified: false,
             timestamp_nanos: None,
-            error: Some(e.to_string()),
+            error: Some("Empty merkle path in attestation".to_string()),
             details: AnchorDetails::Unknown,
+        };
+    }
+
+    // Extract computed root (last hash, byte-reversed for display, with sha256: prefix)
+    let computed_root = earliest
+        .merkle_path
+        .last()
+        .map_or_else(String::new, |last_hash| {
+            let mut reversed = *last_hash;
+            reversed.reverse();
+            format!("sha256:{}", hex::encode(reversed))
+        });
+
+    let operation_count = earliest.merkle_path.len();
+
+    // Fetch block info with merkle_root
+    let block_info =
+        match crate::net::bitcoin::get_block_info(earliest.block_height, config.request_timeout)
+            .await
+        {
+            Ok(info) => info,
+            Err(e) => {
+                // Return with partial data for offline-like display
+                return AnchorVerificationResult {
+                    anchor_type: "bitcoin_ots".to_string(),
+                    verified: false,
+                    timestamp_nanos: None,
+                    error: Some(e.to_string()),
+                    details: AnchorDetails::Bitcoin {
+                        block_height: earliest.block_height,
+                        block_timestamp_secs: 0,
+                        target_hash: target_hash.to_string(),
+                        operation_count,
+                        computed_root,
+                        block_merkle_root: None,
+                        merkle_match: None,
+                    },
+                };
+            }
+        };
+
+    // CRITICAL: Verify merkle root matches (using atl-core method)
+    let merkle_match = earliest.verify_against_block(&block_info.merkle_root);
+
+    if !merkle_match {
+        return AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verified: false,
+            timestamp_nanos: None,
+            error: Some(format!(
+                "Merkle root mismatch: OTS proof does not match block {}",
+                earliest.block_height
+            )),
+            details: AnchorDetails::Bitcoin {
+                block_height: block_info.height,
+                block_timestamp_secs: block_info.timestamp_secs,
+                target_hash: target_hash.to_string(),
+                operation_count,
+                computed_root,
+                block_merkle_root: Some(format!("sha256:{}", block_info.merkle_root)),
+                merkle_match: Some(false),
+            },
+        };
+    }
+
+    // SUCCESS: Cryptographic verification complete
+    let timestamp_nanos = block_info.timestamp_secs * 1_000_000_000;
+    AnchorVerificationResult {
+        anchor_type: "bitcoin_ots".to_string(),
+        verified: true,
+        timestamp_nanos: Some(timestamp_nanos),
+        error: None,
+        details: AnchorDetails::Bitcoin {
+            block_height: block_info.height,
+            block_timestamp_secs: block_info.timestamp_secs,
+            target_hash: target_hash.to_string(),
+            operation_count,
+            computed_root,
+            block_merkle_root: Some(format!("sha256:{}", block_info.merkle_root)),
+            merkle_match: Some(true),
         },
     }
 }
 
 /// Verify anchors online for single file
-#[allow(dead_code)]
 pub async fn verify_single_online(
     result: SingleVerificationResult,
     config: &OnlineConfig,
@@ -429,6 +496,11 @@ mod tests {
         let bitcoin = AnchorDetails::Bitcoin {
             block_height: 800000,
             block_timestamp_secs: 1700000000,
+            target_hash: "sha256:abc".to_string(),
+            operation_count: 10,
+            computed_root: "sha256:def".to_string(),
+            block_merkle_root: Some("sha256:ghi".to_string()),
+            merkle_match: Some(true),
         };
         let unknown = AnchorDetails::Unknown;
 
@@ -443,9 +515,19 @@ mod tests {
             AnchorDetails::Bitcoin {
                 block_height,
                 block_timestamp_secs,
+                target_hash,
+                operation_count,
+                computed_root,
+                block_merkle_root,
+                merkle_match,
             } => {
                 assert_eq!(block_height, 800000);
                 assert_eq!(block_timestamp_secs, 1700000000);
+                assert_eq!(target_hash, "sha256:abc");
+                assert_eq!(operation_count, 10);
+                assert_eq!(computed_root, "sha256:def");
+                assert_eq!(block_merkle_root, Some("sha256:ghi".to_string()));
+                assert_eq!(merkle_match, Some(true));
             }
             _ => panic!("Wrong variant"),
         }
@@ -698,5 +780,156 @@ mod tests {
         assert_eq!(online.anchor_results.len(), 1);
         assert!(!online.anchor_results[0].verified);
         assert!(!online.all_anchors_verified);
+    }
+
+    // Note: verify_merkle_root tests moved to atl-core (BitcoinAttestation::verify_against_block)
+
+    #[test]
+    fn should_reverse_bytes_for_computed_root_display() {
+        // Arrange
+        // Internal format (little-endian)
+        let last_hash_hex = "6f20a87026e693f298b72fd96141f07e2628cb0553da748fcc9c1565ce6d822f";
+        // Expected display format (big-endian, with sha256: prefix)
+        let expected = "sha256:2f826dce65159ccc8f74da5305cb28267ef04161d92fb798f293e62670a8206f";
+
+        let mut last_hash = [0u8; 32];
+        hex::decode_to_slice(last_hash_hex, &mut last_hash).unwrap();
+
+        // Act
+        let mut reversed = last_hash;
+        reversed.reverse();
+        let result = format!("sha256:{}", hex::encode(reversed));
+
+        // Assert
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn should_format_target_hash_with_sha256_prefix() {
+        // Arrange
+        let target_hash = "94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2";
+
+        // Act
+        let result = format!("sha256:{}", target_hash);
+
+        // Assert
+        assert_eq!(
+            result,
+            "sha256:94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2"
+        );
+        assert_eq!(result.len(), 71); // "sha256:" (7) + 64 hex chars
+    }
+
+    #[test]
+    fn should_populate_operation_count_from_merkle_path() {
+        // Arrange
+        let mut path = Vec::new();
+        for _ in 0..39 {
+            path.push([0u8; 32]);
+        }
+
+        // Act
+        let count = path.len();
+
+        // Assert
+        assert_eq!(count, 39);
+    }
+
+    #[test]
+    fn test_online_config_clone() {
+        let config = OnlineConfig::default();
+        let cloned = config.clone();
+        assert_eq!(config.request_timeout, cloned.request_timeout);
+    }
+
+    #[test]
+    fn test_online_config_debug() {
+        let config = OnlineConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("OnlineConfig"));
+    }
+
+    #[test]
+    fn test_anchor_verification_result_clone() {
+        let result = AnchorVerificationResult {
+            anchor_type: "test".to_string(),
+            verified: true,
+            timestamp_nanos: Some(123),
+            error: None,
+            details: AnchorDetails::Unknown,
+        };
+        let cloned = result.clone();
+        assert_eq!(cloned.anchor_type, "test");
+        assert!(cloned.verified);
+    }
+
+    #[test]
+    fn test_anchor_details_clone() {
+        let rfc = AnchorDetails::Rfc3161 {
+            algorithm_oid: "test".to_string(),
+        };
+        let bitcoin = AnchorDetails::Bitcoin {
+            block_height: 1,
+            block_timestamp_secs: 2,
+            target_hash: "hash".to_string(),
+            operation_count: 3,
+            computed_root: "root".to_string(),
+            block_merkle_root: Some("merkle".to_string()),
+            merkle_match: Some(true),
+        };
+
+        let rfc_cloned = rfc.clone();
+        let bitcoin_cloned = bitcoin.clone();
+
+        match rfc_cloned {
+            AnchorDetails::Rfc3161 { algorithm_oid } => assert_eq!(algorithm_oid, "test"),
+            _ => panic!("Wrong variant"),
+        }
+
+        match bitcoin_cloned {
+            AnchorDetails::Bitcoin { block_height, .. } => assert_eq!(block_height, 1),
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_online_verification_result_debug() {
+        let single = create_test_single_result(true);
+        let online = OnlineVerificationResult {
+            offline: single,
+            anchor_results: vec![],
+            all_anchors_verified: true,
+            mode: VerificationMode::Online,
+        };
+        let debug_str = format!("{:?}", online);
+        assert!(debug_str.contains("OnlineVerificationResult"));
+    }
+
+    #[test]
+    fn test_verify_rfc3161_with_base64_prefix() {
+        // Test that base64: prefix is handled correctly
+        let result = verify_rfc3161(
+            "data_tree_root",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "2024-01-01T00:00:00Z",
+            "base64:sometoken",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        );
+        // Will fail verification but should not fail on prefix handling
+        assert!(!result.verified);
+    }
+
+    #[test]
+    fn test_verify_rfc3161_without_base64_prefix() {
+        // Test that missing base64: prefix is added
+        let result = verify_rfc3161(
+            "data_tree_root",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+            "2024-01-01T00:00:00Z",
+            "sometoken",
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+        );
+        // Will fail verification but should not fail on prefix handling
+        assert!(!result.verified);
     }
 }

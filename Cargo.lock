@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "atl-cli"
-version = "0.6.1"
+version = "0.6.11"
 dependencies = [
  "assert_cmd",
  "atl-core",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "atl-core"
-version = "0.22.4"
+version = "0.23.0"
 dependencies = [
  "base64",
  "bcder",

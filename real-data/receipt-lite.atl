@@ -1,0 +1,28 @@
+{
+    "entry": {
+	"id": "896d398f-f983-467b-a376-60e795e66d3b",
+	"metadata": {
+	    "customer_id": 1,
+	    "customer_name": "OVCI_MUST_DIE"
+	},
+	"metadata_hash": "sha256:e94841a4d4ff89f1b9bdd69515a33358aeedfe60bebb7306d48da5081c4ef998",
+	"payload_hash": "sha256:94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2"
+    },
+    "proof": {
+	"checkpoint": {
+	    "key_id": "sha256:4dc428464553c56998da8c02d6eeb8da8e3b4bf1585c250bd24d5f4f68b6dfda",
+	    "origin": "sha256:cd00fe57b229db72c9c29529cdfd3b387089704f063f1c1463c030d233e86694",
+	    "root_hash": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+	    "signature": "base64:ClZfRNqEe7DiOIsqLpDNmPZq7eoZo2OqOcqzWT+fMSnMRuzl+vWZ9Lafz/Q8U5CjIPW8nQbAxCropiMdwRQqBg==",
+	    "timestamp": 1768797880652947000,
+	    "tree_size": 1
+	},
+	"inclusion_path": [],
+	"leaf_index": 0,
+	"root_hash": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+	"tree_size": 1
+    },
+    "spec_version": "2.0.0",
+    "super_proof": null,
+    "upgrade_url": "http://127.0.0.1:4000/v1/anchor/896d398f-f983-467b-a376-60e795e66d3b"
+}

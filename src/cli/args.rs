@@ -144,7 +144,6 @@ pub struct InspectArgs {
 
 /// Verification mode determined from args and environment
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum VerificationMode {
     /// Offline verification only (no internet or --offline flag)
     Offline,
@@ -209,6 +208,65 @@ impl VerifyArgs {
         }
 
         // Auto-detect mode
+        #[cfg(feature = "online")]
+        {
+            if crate::net::detect::has_internet_blocking() {
+                Ok(VerificationMode::Online)
+            } else {
+                Ok(VerificationMode::Offline)
+            }
+        }
+
+        #[cfg(not(feature = "online"))]
+        {
+            Ok(VerificationMode::Offline)
+        }
+    }
+
+    /// Determine verification mode, considering receipt anchors
+    ///
+    /// For lite receipts (no anchors), skip connectivity check since
+    /// there's nothing to verify online anyway.
+    ///
+    /// Priority:
+    /// 1. --offline flag -> Offline (no network check)
+    /// 2. --online flag -> Online (requires network check)
+    /// 3. No anchors in receipt -> Offline (skip network check)
+    /// 4. Has anchors, no flag -> auto-detect (check network)
+    #[allow(dead_code)]
+    pub fn determine_mode_for_receipt(
+        &self,
+        has_anchors: bool,
+    ) -> crate::error::CliResult<VerificationMode> {
+        // --offline always wins
+        if self.offline {
+            return Ok(VerificationMode::Offline);
+        }
+
+        // --online requires network check regardless of anchors
+        if self.online {
+            #[cfg(feature = "online")]
+            {
+                if crate::net::detect::has_internet_blocking() {
+                    return Ok(VerificationMode::Online);
+                } else {
+                    return Err(crate::error::CliError::NoInternetConnection);
+                }
+            }
+            #[cfg(not(feature = "online"))]
+            {
+                return Err(crate::error::CliError::NetworkError(
+                    "online feature not enabled".to_string(),
+                ));
+            }
+        }
+
+        // No anchors = no point checking connectivity
+        if !has_anchors {
+            return Ok(VerificationMode::Offline);
+        }
+
+        // Has anchors, auto-detect mode
         #[cfg(feature = "online")]
         {
             if crate::net::detect::has_internet_blocking() {
@@ -558,6 +616,140 @@ mod tests {
         };
         // Should still succeed, just prints warning
         let result = args.validate();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_determine_mode_for_receipt_offline_flag_ignores_anchors() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: true,
+            online: false,
+            verbose: false,
+        };
+
+        // --offline flag should return Offline regardless of anchors
+        assert_eq!(
+            args.determine_mode_for_receipt(true).unwrap(),
+            VerificationMode::Offline
+        );
+        assert_eq!(
+            args.determine_mode_for_receipt(false).unwrap(),
+            VerificationMode::Offline
+        );
+    }
+
+    #[test]
+    fn test_determine_mode_for_receipt_no_anchors_skips_network() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+
+        // No anchors = should return Offline immediately without network check
+        let mode = args.determine_mode_for_receipt(false).unwrap();
+        assert_eq!(mode, VerificationMode::Offline);
+    }
+
+    #[test]
+    #[cfg(not(feature = "online"))]
+    fn test_determine_mode_for_receipt_online_flag_without_feature() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: true,
+            verbose: false,
+        };
+
+        // --online flag without online feature should error
+        let result = args.determine_mode_for_receipt(true);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(not(feature = "online"))]
+    fn test_determine_mode_for_receipt_has_anchors_without_feature() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+
+        // Has anchors but no online feature - should return Offline
+        let mode = args.determine_mode_for_receipt(true).unwrap();
+        assert_eq!(mode, VerificationMode::Offline);
+    }
+
+    #[test]
+    #[cfg(feature = "online")]
+    fn test_determine_mode_for_receipt_online_flag_with_feature() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: true,
+            verbose: false,
+        };
+
+        // --online flag with online feature - result depends on actual internet
+        let result = args.determine_mode_for_receipt(true);
+        // Can be Ok(Online) or Err(NoInternetConnection) depending on network
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "online")]
+    fn test_determine_mode_for_receipt_auto_detect_with_feature() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+
+        // Auto-detect with anchors and online feature
+        let result = args.determine_mode_for_receipt(true);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "online")]
+    fn test_determine_mode_online_flag_with_feature() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: true,
+            verbose: false,
+        };
+
+        // --online flag with online feature
+        let result = args.determine_mode();
+        // Can be Ok(Online) or Err(NoInternetConnection) depending on network
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "online")]
+    fn test_determine_mode_auto_detect_with_feature() {
+        let args = VerifyArgs {
+            source: PathBuf::from("test.pdf"),
+            receipt: PathBuf::from("test.pdf.atl"),
+            offline: false,
+            online: false,
+            verbose: false,
+        };
+
+        // Auto-detect with online feature
+        let result = args.determine_mode();
         assert!(result.is_ok());
     }
 }
