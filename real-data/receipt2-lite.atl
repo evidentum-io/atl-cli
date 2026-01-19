@@ -1,0 +1,30 @@
+{
+    "entry": {
+	"id": "c6c18512-3913-4206-8dbf-e2961ef95afd",
+	"metadata": {
+	    "customer_id": 1,
+	    "customer_name": "OVCI_MUST_DIE"
+	},
+	"metadata_hash": "sha256:e94841a4d4ff89f1b9bdd69515a33358aeedfe60bebb7306d48da5081c4ef998",
+	"payload_hash": "sha256:632c17535cd00829b97bf42e475898549b778b133dc3bd1aec4b2541730c9c96"
+    },
+    "proof": {
+	"checkpoint": {
+	    "key_id": "sha256:4dc428464553c56998da8c02d6eeb8da8e3b4bf1585c250bd24d5f4f68b6dfda",
+	    "origin": "sha256:cd00fe57b229db72c9c29529cdfd3b387089704f063f1c1463c030d233e86694",
+	    "root_hash": "sha256:c179095c8db6d0fdfb3c16c4545f0b5cadffe25935a867289a0949fdcfb3da89",
+	    "signature": "base64:+QMUo/fJCEMnmCxaxgY3Ja4Bzwtz7aKWWHOlswbCCxPPfUe/5B1J7FJTDjnzWA1ZJajsnleSYeJR5s+J+kAiBg==",
+	    "timestamp": 1768857185412034000,
+	    "tree_size": 2
+	},
+	"inclusion_path": [
+	    "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb"
+	],
+	"leaf_index": 1,
+	"root_hash": "sha256:c179095c8db6d0fdfb3c16c4545f0b5cadffe25935a867289a0949fdcfb3da89",
+	"tree_size": 2
+    },
+    "spec_version": "2.0.0",
+    "super_proof": null,
+    "upgrade_url": "http://127.0.0.1:4000/v1/anchor/c6c18512-3913-4206-8dbf-e2961ef95afd"
+}

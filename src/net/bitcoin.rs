@@ -34,27 +34,27 @@ const PROVIDERS: &[ApiProvider] = &[
     },
 ];
 
-/// Global cache for block timestamps
-static BLOCK_TIME_CACHE: once_cell::sync::Lazy<RwLock<HashMap<u64, u64>>> =
+/// Global cache for block information
+static BLOCK_INFO_CACHE: once_cell::sync::Lazy<RwLock<HashMap<u64, BitcoinBlockInfo>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
-/// Bitcoin block information
+/// Bitcoin block information with header data
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct BitcoinBlockInfo {
     pub height: u64,
     pub timestamp_secs: u64,
+    /// Block hash (hex string, 64 chars)
+    #[allow(dead_code)]
+    pub block_hash: String,
+    /// Merkle root from block header (hex string, 64 chars)
+    pub merkle_root: String,
 }
 
-/// Get Bitcoin block timestamp from blockchain APIs (round-robin)
-#[allow(dead_code)]
-pub async fn get_block_timestamp(height: u64, timeout: Duration) -> CliResult<BitcoinBlockInfo> {
+/// Get Bitcoin block info including merkle_root
+pub async fn get_block_info(height: u64, timeout: Duration) -> CliResult<BitcoinBlockInfo> {
     // Check cache first
-    if let Some(&ts) = BLOCK_TIME_CACHE.read().unwrap().get(&height) {
-        return Ok(BitcoinBlockInfo {
-            height,
-            timestamp_secs: ts,
-        });
+    if let Some(info) = BLOCK_INFO_CACHE.read().unwrap().get(&height) {
+        return Ok(info.clone());
     }
 
     let client = reqwest::Client::builder()
@@ -65,13 +65,13 @@ pub async fn get_block_timestamp(height: u64, timeout: Duration) -> CliResult<Bi
     let mut errors = Vec::new();
 
     for provider in PROVIDERS {
-        match fetch_from_provider(&client, provider, height).await {
-            Ok(ts) => {
-                BLOCK_TIME_CACHE.write().unwrap().insert(height, ts);
-                return Ok(BitcoinBlockInfo {
-                    height,
-                    timestamp_secs: ts,
-                });
+        match fetch_block_info_from_provider(&client, provider, height).await {
+            Ok(info) => {
+                BLOCK_INFO_CACHE
+                    .write()
+                    .unwrap()
+                    .insert(height, info.clone());
+                return Ok(info);
             }
             Err(e) => {
                 errors.push(format!("{}: {}", provider.name, e));
@@ -86,6 +86,26 @@ pub async fn get_block_timestamp(height: u64, timeout: Duration) -> CliResult<Bi
     )))
 }
 
+/// Get Bitcoin block timestamp from blockchain APIs (round-robin)
+/// Deprecated: Use get_block_info() instead
+#[allow(dead_code)]
+pub async fn get_block_timestamp(height: u64, timeout: Duration) -> CliResult<BitcoinBlockInfo> {
+    get_block_info(height, timeout).await
+}
+
+async fn fetch_block_info_from_provider(
+    client: &reqwest::Client,
+    provider: &ApiProvider,
+    height: u64,
+) -> Result<BitcoinBlockInfo, String> {
+    if provider.two_step {
+        fetch_block_info_two_step(client, provider.base_url, height).await
+    } else {
+        fetch_block_info_single_step(client, provider.base_url, height).await
+    }
+}
+
+#[allow(dead_code)]
 async fn fetch_from_provider(
     client: &reqwest::Client,
     provider: &ApiProvider,
@@ -98,6 +118,67 @@ async fn fetch_from_provider(
     }
 }
 
+async fn fetch_block_info_two_step(
+    client: &reqwest::Client,
+    base_url: &str,
+    height: u64,
+) -> Result<BitcoinBlockInfo, String> {
+    // Step 1: Get block hash by height
+    let hash_url = format!("{base_url}/block-height/{height}");
+    let block_hash = client
+        .get(&hash_url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("HTTP status error: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Read error: {e}"))?
+        .trim()
+        .to_string();
+
+    // Validate block hash format (64 hex chars)
+    if block_hash.len() != 64 || !block_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("Invalid block hash format: {block_hash}"));
+    }
+
+    // Step 2: Get block details
+    let block_url = format!("{base_url}/block/{block_hash}");
+    let response = client
+        .get(&block_url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("HTTP status error: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("JSON error: {e}"))?;
+
+    let timestamp = response["timestamp"]
+        .as_u64()
+        .ok_or("Missing 'timestamp' field")?;
+
+    let merkle_root = response["merkle_root"]
+        .as_str()
+        .ok_or("Missing 'merkle_root' field")?
+        .to_string();
+
+    // Validate merkle_root format (64 hex chars)
+    if merkle_root.len() != 64 || !merkle_root.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("Invalid merkle_root format: {merkle_root}"));
+    }
+
+    Ok(BitcoinBlockInfo {
+        height,
+        timestamp_secs: timestamp,
+        block_hash,
+        merkle_root,
+    })
+}
+
+#[allow(dead_code)]
 async fn fetch_two_step(
     client: &reqwest::Client,
     base_url: &str,
@@ -133,6 +214,55 @@ async fn fetch_two_step(
         .ok_or_else(|| format!("Missing '{timestamp_field}' field"))
 }
 
+async fn fetch_block_info_single_step(
+    client: &reqwest::Client,
+    base_url: &str,
+    height: u64,
+) -> Result<BitcoinBlockInfo, String> {
+    let url = format!("{base_url}/block-height/{height}?format=json");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("HTTP error: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("HTTP status error: {e}"))?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("JSON error: {e}"))?;
+
+    let block = response["blocks"].get(0).ok_or("Missing 'blocks[0]'")?;
+
+    let timestamp = block["time"].as_u64().ok_or("Missing 'blocks[0].time'")?;
+
+    let block_hash = block["hash"]
+        .as_str()
+        .ok_or("Missing 'blocks[0].hash'")?
+        .to_string();
+
+    let merkle_root = block["mrkl_root"]
+        .as_str()
+        .ok_or("Missing 'blocks[0].mrkl_root'")?
+        .to_string();
+
+    // Validate formats
+    if block_hash.len() != 64 || !block_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("Invalid block hash format: {block_hash}"));
+    }
+
+    if merkle_root.len() != 64 || !merkle_root.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("Invalid merkle_root format: {merkle_root}"));
+    }
+
+    Ok(BitcoinBlockInfo {
+        height,
+        timestamp_secs: timestamp,
+        block_hash,
+        merkle_root,
+    })
+}
+
+#[allow(dead_code)]
 async fn fetch_single_step(
     client: &reqwest::Client,
     base_url: &str,
@@ -166,9 +296,15 @@ mod tests {
         let info = BitcoinBlockInfo {
             height: 800000,
             timestamp_secs: 1700000000,
+            block_hash: "00000000000000000002a7c4c1e48d76c5a37902165a270156b7a8d72728a054"
+                .to_string(),
+            merkle_root: "91f01a00530c8c83617190048ea8b0814d506cf24dfdbcf8893f8f0cab7f0855"
+                .to_string(),
         };
         assert_eq!(info.height, 800000);
         assert_eq!(info.timestamp_secs, 1700000000);
+        assert_eq!(info.block_hash.len(), 64);
+        assert_eq!(info.merkle_root.len(), 64);
     }
 
     #[test]
@@ -176,10 +312,14 @@ mod tests {
         let info = BitcoinBlockInfo {
             height: 1,
             timestamp_secs: 2,
+            block_hash: "0".repeat(64),
+            merkle_root: "1".repeat(64),
         };
         let debug_str = format!("{:?}", info);
         assert!(debug_str.contains("height"));
         assert!(debug_str.contains("timestamp_secs"));
+        assert!(debug_str.contains("block_hash"));
+        assert!(debug_str.contains("merkle_root"));
     }
 
     #[test]
@@ -187,10 +327,14 @@ mod tests {
         let info = BitcoinBlockInfo {
             height: 123,
             timestamp_secs: 456,
+            block_hash: "abc".repeat(21) + "a",
+            merkle_root: "def".repeat(21) + "d",
         };
         let cloned = info.clone();
         assert_eq!(cloned.height, 123);
         assert_eq!(cloned.timestamp_secs, 456);
+        assert_eq!(cloned.block_hash, info.block_hash);
+        assert_eq!(cloned.merkle_root, info.merkle_root);
     }
 
     #[test]
@@ -225,36 +369,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_block_timestamp_caching() {
+    async fn test_get_block_info_caching() {
         // Pre-populate cache with test data
         {
-            let mut cache = BLOCK_TIME_CACHE.write().unwrap();
-            cache.insert(123456, 9999999);
+            let mut cache = BLOCK_INFO_CACHE.write().unwrap();
+            cache.insert(
+                123456,
+                BitcoinBlockInfo {
+                    height: 123456,
+                    timestamp_secs: 9999999,
+                    block_hash: "a".repeat(64),
+                    merkle_root: "b".repeat(64),
+                },
+            );
         }
 
         // Second call should hit cache
-        let result = get_block_timestamp(123456, Duration::from_secs(1)).await;
+        let result = get_block_info(123456, Duration::from_secs(1)).await;
         assert!(result.is_ok());
         let info = result.unwrap();
         assert_eq!(info.height, 123456);
         assert_eq!(info.timestamp_secs, 9999999);
+        assert_eq!(info.block_hash.len(), 64);
+        assert_eq!(info.merkle_root.len(), 64);
     }
 
     #[tokio::test]
-    async fn test_get_block_timestamp_cache_multiple_entries() {
+    async fn test_get_block_info_cache_multiple_entries() {
         // Add multiple entries to cache
         {
-            let mut cache = BLOCK_TIME_CACHE.write().unwrap();
-            cache.insert(100000, 1000000);
-            cache.insert(200000, 2000000);
+            let mut cache = BLOCK_INFO_CACHE.write().unwrap();
+            cache.insert(
+                100000,
+                BitcoinBlockInfo {
+                    height: 100000,
+                    timestamp_secs: 1000000,
+                    block_hash: "c".repeat(64),
+                    merkle_root: "d".repeat(64),
+                },
+            );
+            cache.insert(
+                200000,
+                BitcoinBlockInfo {
+                    height: 200000,
+                    timestamp_secs: 2000000,
+                    block_hash: "e".repeat(64),
+                    merkle_root: "f".repeat(64),
+                },
+            );
         }
 
         // Verify both can be retrieved
-        let r1 = get_block_timestamp(100000, Duration::from_secs(1)).await;
+        let r1 = get_block_info(100000, Duration::from_secs(1)).await;
         assert!(r1.is_ok());
         assert_eq!(r1.unwrap().timestamp_secs, 1000000);
 
-        let r2 = get_block_timestamp(200000, Duration::from_secs(1)).await;
+        let r2 = get_block_info(200000, Duration::from_secs(1)).await;
         assert!(r2.is_ok());
         assert_eq!(r2.unwrap().timestamp_secs, 2000000);
     }
@@ -321,7 +491,7 @@ mod tests {
     #[test]
     fn test_cache_initialization() {
         // Just accessing the cache should work
-        let _cache = BLOCK_TIME_CACHE.read().unwrap();
+        let _cache = BLOCK_INFO_CACHE.read().unwrap();
         // Cache should be empty or contain entries from previous tests
     }
 
@@ -330,6 +500,8 @@ mod tests {
         let info = BitcoinBlockInfo {
             height: 700000,
             timestamp_secs: 1638000000,
+            block_hash: "0".repeat(64),
+            merkle_root: "1".repeat(64),
         };
         let debug = format!("{:?}", info);
         assert!(debug.contains("700000"));
@@ -337,16 +509,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_block_timestamp_two_calls_different_heights() {
+    async fn test_get_block_info_two_calls_different_heights() {
         // Pre-populate cache
         {
-            let mut cache = BLOCK_TIME_CACHE.write().unwrap();
-            cache.insert(111111, 1111111);
-            cache.insert(222222, 2222222);
+            let mut cache = BLOCK_INFO_CACHE.write().unwrap();
+            cache.insert(
+                111111,
+                BitcoinBlockInfo {
+                    height: 111111,
+                    timestamp_secs: 1111111,
+                    block_hash: "1".repeat(64),
+                    merkle_root: "2".repeat(64),
+                },
+            );
+            cache.insert(
+                222222,
+                BitcoinBlockInfo {
+                    height: 222222,
+                    timestamp_secs: 2222222,
+                    block_hash: "3".repeat(64),
+                    merkle_root: "4".repeat(64),
+                },
+            );
         }
 
-        let r1 = get_block_timestamp(111111, Duration::from_secs(1)).await;
-        let r2 = get_block_timestamp(222222, Duration::from_secs(1)).await;
+        let r1 = get_block_info(111111, Duration::from_secs(1)).await;
+        let r2 = get_block_info(222222, Duration::from_secs(1)).await;
 
         assert!(r1.is_ok());
         assert!(r2.is_ok());
