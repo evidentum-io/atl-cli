@@ -5,6 +5,7 @@ use crate::error::CliResult;
 use crate::verify::single::SingleVerificationResult;
 use std::time::Duration;
 
+use atl_core::core::ots::BitcoinAttestation;
 use atl_core::core::verify::anchors::bitcoin_ots::verify_ots_anchor_impl;
 use atl_core::core::verify::anchors::rfc3161::verify_rfc3161_anchor_impl;
 use atl_core::ReceiptAnchor;
@@ -61,6 +62,25 @@ impl OnlineVerificationResult {
     pub fn is_valid(&self) -> bool {
         self.offline.is_valid() && self.all_anchors_verified
     }
+}
+
+/// Verify that OTS merkle path leads to block's merkle root.
+///
+/// The last element of merkle_path (with reversed bytes) should equal
+/// the block's merkle_root as returned by Bitcoin APIs.
+///
+/// Bitcoin uses little-endian internally but displays hashes in big-endian.
+/// OTS stores hashes in internal format, so we reverse bytes for comparison.
+fn verify_merkle_root(attestation: &BitcoinAttestation, block_merkle_root: &str) -> bool {
+    let Some(last_hash) = attestation.merkle_path.last() else {
+        return false;
+    };
+
+    // Reverse bytes: OTS internal format (little-endian) -> display format (big-endian)
+    let mut reversed = *last_hash;
+    reversed.reverse();
+
+    hex::encode(reversed) == block_merkle_root
 }
 
 /// Verify RFC 3161 anchor using atl-core
@@ -248,29 +268,60 @@ async fn verify_bitcoin_ots(
         .min_by_key(|a| a.block_height)
         .unwrap();
 
-    // Fetch block timestamp via HTTP
-    match crate::net::bitcoin::get_block_timestamp(earliest.block_height, config.request_timeout)
-        .await
-    {
-        Ok(block_info) => {
-            let timestamp_nanos = block_info.timestamp_secs * 1_000_000_000;
-            AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: true,
-                timestamp_nanos: Some(timestamp_nanos),
-                error: None,
-                details: AnchorDetails::Bitcoin {
-                    block_height: block_info.height,
-                    block_timestamp_secs: block_info.timestamp_secs,
-                },
-            }
-        }
-        Err(e) => AnchorVerificationResult {
+    // Check merkle path is not empty
+    if earliest.merkle_path.is_empty() {
+        return AnchorVerificationResult {
             anchor_type: "bitcoin_ots".to_string(),
             verified: false,
             timestamp_nanos: None,
-            error: Some(e.to_string()),
+            error: Some("Empty merkle path in attestation".to_string()),
             details: AnchorDetails::Unknown,
+        };
+    }
+
+    // Fetch block info with merkle_root
+    let block_info = match crate::net::bitcoin::get_block_info(
+        earliest.block_height,
+        config.request_timeout,
+    )
+    .await
+    {
+        Ok(info) => info,
+        Err(e) => {
+            return AnchorVerificationResult {
+                anchor_type: "bitcoin_ots".to_string(),
+                verified: false,
+                timestamp_nanos: None,
+                error: Some(e.to_string()),
+                details: AnchorDetails::Unknown,
+            };
+        }
+    };
+
+    // CRITICAL: Verify merkle root matches
+    if !verify_merkle_root(earliest, &block_info.merkle_root) {
+        return AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verified: false,
+            timestamp_nanos: None,
+            error: Some(format!(
+                "Merkle root mismatch: OTS proof does not match block {}",
+                earliest.block_height
+            )),
+            details: AnchorDetails::Unknown,
+        };
+    }
+
+    // SUCCESS: Cryptographic verification complete
+    let timestamp_nanos = block_info.timestamp_secs * 1_000_000_000;
+    AnchorVerificationResult {
+        anchor_type: "bitcoin_ots".to_string(),
+        verified: true,
+        timestamp_nanos: Some(timestamp_nanos),
+        error: None,
+        details: AnchorDetails::Bitcoin {
+            block_height: block_info.height,
+            block_timestamp_secs: block_info.timestamp_secs,
         },
     }
 }
@@ -690,5 +741,63 @@ mod tests {
         assert_eq!(online.anchor_results.len(), 1);
         assert!(!online.anchor_results[0].verified);
         assert!(!online.all_anchors_verified);
+    }
+
+    #[test]
+    fn should_verify_merkle_root_when_bytes_match_after_reversal() {
+        // Arrange
+        // Real data from block 932897
+        let last_hash_hex = "6f20a87026e693f298b72fd96141f07e2628cb0553da748fcc9c1565ce6d822f";
+        let expected_merkle_root = "2f826dce65159ccc8f74da5305cb28267ef04161d92fb798f293e62670a8206f";
+
+        let mut last_hash = [0u8; 32];
+        hex::decode_to_slice(last_hash_hex, &mut last_hash).unwrap();
+
+        let attestation = BitcoinAttestation {
+            block_height: 932897,
+            merkle_path: vec![last_hash],
+            timestamp: None,
+        };
+
+        // Act
+        let result = verify_merkle_root(&attestation, expected_merkle_root);
+
+        // Assert
+        assert!(result, "Merkle root should match after byte reversal");
+    }
+
+    #[test]
+    fn should_fail_verification_when_merkle_root_mismatch() {
+        // Arrange
+        let last_hash = [0x12; 32];
+        let wrong_merkle_root = "0000000000000000000000000000000000000000000000000000000000000000";
+
+        let attestation = BitcoinAttestation {
+            block_height: 100000,
+            merkle_path: vec![last_hash],
+            timestamp: None,
+        };
+
+        // Act
+        let result = verify_merkle_root(&attestation, wrong_merkle_root);
+
+        // Assert
+        assert!(!result, "Verification should fail on merkle root mismatch");
+    }
+
+    #[test]
+    fn should_fail_verification_when_merkle_path_empty() {
+        // Arrange
+        let attestation = BitcoinAttestation {
+            block_height: 100000,
+            merkle_path: vec![],
+            timestamp: None,
+        };
+
+        // Act
+        let result = verify_merkle_root(&attestation, "any_merkle_root");
+
+        // Assert
+        assert!(!result, "Verification should fail on empty merkle path");
     }
 }
