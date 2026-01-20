@@ -155,6 +155,17 @@ struct ConsistencyJson {
     status: &'static str,
     genesis_super_root: Option<String>,
     receipt_count: usize,
+    cross_checks_passed: usize,
+    cross_checks: Vec<CrossCheckJson>,
+}
+
+#[derive(Serialize)]
+struct CrossCheckJson {
+    from_index: usize,
+    to_index: usize,
+    from_file: String,
+    to_file: String,
+    included: bool,
 }
 
 #[derive(Serialize)]
@@ -165,68 +176,156 @@ struct BatchItemJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     file_hash_match: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    super_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_tree_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
 }
 
 pub fn print_batch_result(
     result: &BatchVerificationResult,
     mode: VerificationMode,
+    source_dir: &std::path::Path,
+    receipt_dir: &std::path::Path,
 ) -> CliResult<()> {
     let total =
         result.valid_count + result.invalid_count + result.error_count + result.unmatched_count;
 
-    let consistency = result.consistency.as_ref().map(|c| ConsistencyJson {
-        status: if c.is_valid() { "verified" } else { "failed" },
-        genesis_super_root: c
-            .genesis_super_root
-            .map(|h| format!("sha256:{}", hex::encode(h))),
-        receipt_count: c.receipt_count,
+    // Build sorted list of valid items for cross-check file name lookup
+    let mut valid_items_sorted: Vec<_> = result
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            BatchItemResult::Valid(r) => {
+                let data_tree_index = r
+                    .receipt
+                    .super_proof
+                    .as_ref()
+                    .map(|sp| sp.data_tree_index)
+                    .unwrap_or(0);
+                let filename = r
+                    .source_path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                Some((data_tree_index, filename))
+            }
+            _ => None,
+        })
+        .collect();
+    valid_items_sorted.sort_by_key(|(idx, _)| *idx);
+
+    let consistency = result.consistency.as_ref().map(|c| {
+        let cross_checks_passed = c
+            .cross_results
+            .iter()
+            .filter(|cr| cr.history_consistent)
+            .count();
+
+        // Build cross_checks array with file names
+        let cross_checks: Vec<CrossCheckJson> = c
+            .cross_results
+            .iter()
+            .enumerate()
+            .map(|(idx, cr)| {
+                let from_file = valid_items_sorted
+                    .get(idx)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_default();
+                let to_file = valid_items_sorted
+                    .get(idx + 1)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_default();
+
+                CrossCheckJson {
+                    from_index: idx + 1,
+                    to_index: idx + 2,
+                    from_file,
+                    to_file,
+                    included: cr.history_consistent,
+                }
+            })
+            .collect();
+
+        ConsistencyJson {
+            status: if c.is_valid() { "verified" } else { "failed" },
+            genesis_super_root: c
+                .genesis_super_root
+                .map(|h| format!("sha256:{}", hex::encode(h))),
+            receipt_count: c.receipt_count,
+            cross_checks_passed,
+            cross_checks,
+        }
     });
 
     let items: Vec<BatchItemJson> = result
         .items
         .iter()
         .map(|item| match item {
-            BatchItemResult::Valid(r) => BatchItemJson {
-                file: r
-                    .source_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                receipt: Some(
-                    r.receipt_path
+            BatchItemResult::Valid(r) => {
+                let (super_root, data_tree_index) = r
+                    .receipt
+                    .super_proof
+                    .as_ref()
+                    .map(|sp| (Some(sp.super_root.clone()), Some(sp.data_tree_index)))
+                    .unwrap_or((None, None));
+
+                BatchItemJson {
+                    file: r
+                        .source_path
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string(),
-                ),
-                status: "valid",
-                file_hash_match: Some(true),
-                error: None,
-            },
-            BatchItemResult::Invalid(r) => BatchItemJson {
-                file: r
-                    .source_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-                receipt: Some(
-                    r.receipt_path
+                    receipt: Some(
+                        r.receipt_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    status: "valid",
+                    file_hash_match: Some(true),
+                    super_root,
+                    data_tree_index,
+                    error: None,
+                }
+            }
+            BatchItemResult::Invalid(r) => {
+                let (super_root, data_tree_index) = r
+                    .receipt
+                    .super_proof
+                    .as_ref()
+                    .map(|sp| (Some(sp.super_root.clone()), Some(sp.data_tree_index)))
+                    .unwrap_or((None, None));
+
+                BatchItemJson {
+                    file: r
+                        .source_path
                         .file_name()
                         .unwrap_or_default()
                         .to_string_lossy()
                         .to_string(),
-                ),
-                status: "invalid",
-                file_hash_match: Some(r.file_hash_valid),
-                error: if !r.file_hash_valid {
-                    Some("File hash mismatch".to_string())
-                } else {
-                    None
-                },
-            },
+                    receipt: Some(
+                        r.receipt_path
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                    ),
+                    status: "invalid",
+                    file_hash_match: Some(r.file_hash_valid),
+                    super_root,
+                    data_tree_index,
+                    error: if !r.file_hash_valid {
+                        Some("File hash mismatch".to_string())
+                    } else {
+                        None
+                    },
+                }
+            }
             BatchItemResult::Error { source, error, .. } => BatchItemJson {
                 file: source
                     .file_name()
@@ -236,6 +335,8 @@ pub fn print_batch_result(
                 receipt: None,
                 status: "error",
                 file_hash_match: None,
+                super_root: None,
+                data_tree_index: None,
                 error: Some(error.to_string()),
             },
             BatchItemResult::NoReceipt(path) => BatchItemJson {
@@ -247,6 +348,8 @@ pub fn print_batch_result(
                 receipt: None,
                 status: "no_receipt",
                 file_hash_match: None,
+                super_root: None,
+                data_tree_index: None,
                 error: None,
             },
             BatchItemResult::NoSource(path) => BatchItemJson {
@@ -258,6 +361,8 @@ pub fn print_batch_result(
                 receipt: None,
                 status: "no_source",
                 file_hash_match: None,
+                super_root: None,
+                data_tree_index: None,
                 error: None,
             },
         })
@@ -273,8 +378,8 @@ pub fn print_batch_result(
             VerificationMode::Online => "online",
             VerificationMode::Offline => "offline",
         },
-        source_dir: String::new(), // Would need to be passed in
-        receipt_dir: String::new(),
+        source_dir: source_dir.display().to_string(),
+        receipt_dir: receipt_dir.display().to_string(),
         summary: SummaryJson {
             total,
             valid: result.valid_count,
@@ -572,6 +677,7 @@ mod tests {
     #[test]
     fn test_print_batch_result_all_valid() {
         use crate::cli::VerificationMode;
+        use std::path::Path;
 
         let result = BatchVerificationResult {
             valid_count: 2,
@@ -582,12 +688,17 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_print_batch_result_with_failures() {
         use crate::cli::VerificationMode;
+        use std::path::Path;
 
         let result = BatchVerificationResult {
             valid_count: 1,
@@ -598,13 +709,18 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_print_batch_result_with_consistency() {
         use crate::cli::VerificationMode;
         use crate::verify::consistency::ConsistencyResult;
+        use std::path::Path;
 
         let result = BatchVerificationResult {
             valid_count: 2,
@@ -622,13 +738,18 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_print_batch_result_consistency_failed() {
         use crate::cli::VerificationMode;
         use crate::verify::consistency::ConsistencyResult;
+        use std::path::Path;
 
         let result = BatchVerificationResult {
             valid_count: 0,
@@ -646,12 +767,17 @@ mod tests {
             items: vec![],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_batch_item_valid() {
         use crate::cli::VerificationMode;
+        use std::path::Path;
 
         let item = BatchItemResult::Valid(SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
@@ -671,12 +797,17 @@ mod tests {
             items: vec![item],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_batch_item_invalid() {
         use crate::cli::VerificationMode;
+        use std::path::Path;
 
         let item = BatchItemResult::Invalid(SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
@@ -696,13 +827,18 @@ mod tests {
             items: vec![item],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_batch_item_error() {
         use crate::cli::VerificationMode;
         use crate::error::CliError;
+        use std::path::Path;
 
         let item = BatchItemResult::Error {
             source: PathBuf::from("test.pdf"),
@@ -719,12 +855,17 @@ mod tests {
             items: vec![item],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_batch_item_no_receipt() {
         use crate::cli::VerificationMode;
+        use std::path::Path;
 
         let item = BatchItemResult::NoReceipt(PathBuf::from("test.pdf"));
 
@@ -737,12 +878,17 @@ mod tests {
             items: vec![item],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_batch_item_no_source() {
         use crate::cli::VerificationMode;
+        use std::path::Path;
 
         let item = BatchItemResult::NoSource(PathBuf::from("test.pdf.atl"));
 
@@ -755,13 +901,18 @@ mod tests {
             items: vec![item],
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
     fn test_batch_mixed_items() {
         use crate::cli::VerificationMode;
         use crate::error::CliError;
+        use std::path::Path;
 
         let items = vec![
             BatchItemResult::Valid(SingleVerificationResult {
@@ -798,7 +949,11 @@ mod tests {
             items,
         };
 
-        assert!(print_batch_result(&result, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_batch_result(&result, VerificationMode::Offline, source_dir, receipt_dir).is_ok()
+        );
     }
 
     #[test]
@@ -843,10 +998,21 @@ mod tests {
         };
         assert!(serde_json::to_string(&summary).is_ok());
 
+        let cross_check = CrossCheckJson {
+            from_index: 1,
+            to_index: 2,
+            from_file: "test1.pdf".to_string(),
+            to_file: "test2.pdf".to_string(),
+            included: true,
+        };
+        assert!(serde_json::to_string(&cross_check).is_ok());
+
         let consistency = ConsistencyJson {
             status: "verified",
             genesis_super_root: Some("sha256:abcd".to_string()),
             receipt_count: 10,
+            cross_checks_passed: 9,
+            cross_checks: vec![cross_check],
         };
         assert!(serde_json::to_string(&consistency).is_ok());
 
@@ -855,6 +1021,8 @@ mod tests {
             receipt: Some("test.pdf.atl".to_string()),
             status: "valid",
             file_hash_match: Some(true),
+            super_root: Some("sha256:abc123".to_string()),
+            data_tree_index: Some(5),
             error: None,
         };
         assert!(serde_json::to_string(&batch_item).is_ok());

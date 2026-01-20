@@ -50,13 +50,15 @@ pub fn print_batch_result(
     result: &BatchVerificationResult,
     args: &Args,
     mode: VerificationMode,
+    source_dir: &std::path::Path,
+    receipt_dir: &std::path::Path,
 ) -> CliResult<()> {
     if args.is_quiet() {
         return Ok(());
     }
 
     if args.use_json() {
-        json::print_batch_result(result, mode)
+        json::print_batch_result(result, mode, source_dir, receipt_dir)
     } else {
         human::print_batch_result(result, args.use_color())
     }
@@ -133,6 +135,8 @@ mod tests {
 
     #[test]
     fn test_print_batch_result_quiet_mode() {
+        use std::path::Path;
+
         let result = BatchVerificationResult {
             valid_count: 1,
             invalid_count: 0,
@@ -143,7 +147,16 @@ mod tests {
         };
 
         let args = create_test_args(true, false);
-        assert!(print_batch_result(&result, &args, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(print_batch_result(
+            &result,
+            &args,
+            VerificationMode::Offline,
+            source_dir,
+            receipt_dir
+        )
+        .is_ok());
     }
 
     #[test]
@@ -185,6 +198,8 @@ mod tests {
 
     #[test]
     fn test_print_batch_result_json_mode() {
+        use std::path::Path;
+
         let result = BatchVerificationResult {
             valid_count: 1,
             invalid_count: 0,
@@ -195,6 +210,15 @@ mod tests {
         };
 
         let args = create_test_args(false, true);
-        assert!(print_batch_result(&result, &args, VerificationMode::Offline).is_ok());
+        let source_dir = Path::new("/test/source");
+        let receipt_dir = Path::new("/test/receipts");
+        assert!(print_batch_result(
+            &result,
+            &args,
+            VerificationMode::Offline,
+            source_dir,
+            receipt_dir
+        )
+        .is_ok());
     }
 }

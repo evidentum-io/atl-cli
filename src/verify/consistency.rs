@@ -17,7 +17,6 @@ pub struct ConsistencyResult {
     /// Number of receipts checked
     pub receipt_count: usize,
     /// Cross-receipt verification results
-    #[allow(dead_code)]
     pub cross_results: Vec<CrossReceiptVerificationResult>,
     /// Specific errors
     pub errors: Vec<String>,

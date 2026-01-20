@@ -8,6 +8,17 @@ use crate::verify::consistency::ConsistencyResult;
 use crate::verify::online::{AnchorDetails, OnlineVerificationResult};
 use crate::verify::single::SingleVerificationResult;
 
+/// Info about a receipt for consistency proof display
+#[derive(Debug, Clone)]
+struct ReceiptProofInfo {
+    /// File name (for display)
+    filename: String,
+    /// Super root hash string at registration time (e.g., "sha256:abc...")
+    super_root: String,
+    /// Data tree index (for ordering receipts in display)
+    data_tree_index: u64,
+}
+
 /// Print single file result
 pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -> CliResult<()> {
     println!("Verification Result");
@@ -123,9 +134,40 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     println!("{}", result.unmatched_count);
     println!();
 
-    // Consistency
+    // Collect receipt proof info for display (using super_root, not genesis!)
+    let receipt_infos: Vec<ReceiptProofInfo> = result
+        .items
+        .iter()
+        .filter_map(|item| {
+            if let BatchItemResult::Valid(r) = item {
+                let filename = r
+                    .source_path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                // Get super_root (NOT genesis!) and data_tree_index from receipt
+                let (super_root, data_tree_index) = r
+                    .receipt
+                    .super_proof
+                    .as_ref()
+                    .map(|sp| (sp.super_root.clone(), sp.data_tree_index))
+                    .unwrap_or_else(|| ("none".to_string(), 0));
+
+                Some(ReceiptProofInfo {
+                    filename,
+                    super_root,
+                    data_tree_index,
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    // Consistency (now with full proof!)
     if let Some(consistency) = &result.consistency {
-        print_consistency(consistency, use_color);
+        print_consistency(consistency, &receipt_infos, use_color);
     }
 
     // Individual results
@@ -138,7 +180,6 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     }
 
     // Overall status
-    println!();
     print!("Overall: ");
     if result.is_valid() {
         print_status("VALID", true, use_color);
@@ -149,7 +190,11 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     Ok(())
 }
 
-fn print_consistency(consistency: &ConsistencyResult, use_color: bool) {
+fn print_consistency(
+    consistency: &ConsistencyResult,
+    receipt_infos: &[ReceiptProofInfo],
+    use_color: bool,
+) {
     print!("Log Consistency: ");
     if consistency.is_valid() {
         print_status(
@@ -157,14 +202,104 @@ fn print_consistency(consistency: &ConsistencyResult, use_color: bool) {
             true,
             use_color,
         );
-        if let Some(genesis) = &consistency.genesis_super_root {
-            println!("  Genesis: {}", format_hash(genesis));
+        // Two-part proof explanation
+        let cross_count = consistency.cross_results.len();
+        print_checkmark("Same log origin (genesis match)", true, use_color);
+        print_checkmark(
+            &format!(
+                "Append-only history verified ({} cross-check{} passed)",
+                cross_count,
+                if cross_count == 1 { "" } else { "s" }
+            ),
+            true,
+            use_color,
+        );
+
+        // Proof section with super_root per receipt
+        print_proof_section(receipt_infos, use_color);
+
+        // Cross-checks section (show ALL cross results)
+        print_cross_checks_section(&consistency.cross_results, None, use_color);
+
+        // Summary
+        println!();
+        if use_color {
+            println!(
+                "    {} All provided receipts form unbroken append-only chain",
+                "→".green()
+            );
+        } else {
+            println!("    → All provided receipts form unbroken append-only chain");
         }
-        println!("  All receipts from same log instance");
     } else {
         print_status("FAILED", false, use_color);
-        for err in &consistency.errors {
-            println!("  Error: {err}");
+
+        // Determine failure type and find first broken cross-check
+        let first_failure_idx = consistency
+            .cross_results
+            .iter()
+            .position(|cr| !cr.history_consistent);
+
+        if !consistency.same_log {
+            print_checkmark("Different log origins (genesis mismatch)", false, use_color);
+        } else {
+            print_checkmark(
+                "History inconsistent (cross-check failed)",
+                false,
+                use_color,
+            );
+        }
+
+        // Proof section (show divergent data)
+        if !receipt_infos.is_empty() {
+            print_proof_section(receipt_infos, use_color);
+
+            // Cross-check section for failed case
+            if !consistency.same_log {
+                println!();
+                if use_color {
+                    println!(
+                        "    {} Receipts are from different logs or log was forked",
+                        "→".red()
+                    );
+                } else {
+                    println!("    → Receipts are from different logs or log was forked");
+                }
+            } else if !consistency.cross_results.is_empty() {
+                // Show ALL cross-checks, marking failure point
+                print_cross_checks_section(
+                    &consistency.cross_results,
+                    first_failure_idx,
+                    use_color,
+                );
+
+                // Summary with specific break point
+                println!();
+                if let Some(fail_idx) = first_failure_idx {
+                    let break_at_a = fail_idx + 1;
+                    let break_at_b = fail_idx + 2;
+                    if use_color {
+                        println!(
+                            "    {} Log was tampered between [{}] and [{}]",
+                            "→".red(),
+                            break_at_a,
+                            break_at_b
+                        );
+                    } else {
+                        println!(
+                            "    → Log was tampered between [{}] and [{}]",
+                            break_at_a, break_at_b
+                        );
+                    }
+                } else if use_color {
+                    println!(
+                        "    {} Log was tampered or forked between registrations",
+                        "→".red()
+                    );
+                } else {
+                    println!("    → Log was tampered or forked between registrations");
+                }
+            }
         }
     }
     println!();
@@ -234,6 +369,108 @@ fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
         }
     }
     println!();
+}
+
+/// Print a checkmark or cross with message
+fn print_checkmark(message: &str, is_success: bool, use_color: bool) {
+    if use_color {
+        if is_success {
+            println!("  {} {}", "✓".green(), message);
+        } else {
+            println!("  {} {}", "✗".red(), message);
+        }
+    } else {
+        let symbol = if is_success { "✓" } else { "✗" };
+        println!("  {} {}", symbol, message);
+    }
+}
+
+/// Print the "Proof:" section with per-receipt super_root hashes
+fn print_proof_section(receipt_infos: &[ReceiptProofInfo], _use_color: bool) {
+    println!();
+    println!("  Proof:");
+
+    // Sort by data_tree_index for display (receipt order in the log)
+    let mut sorted_infos: Vec<_> = receipt_infos.iter().enumerate().collect();
+    sorted_infos.sort_by_key(|(_, info)| info.data_tree_index);
+
+    for (display_idx, (_, info)) in sorted_infos.iter().enumerate() {
+        println!(
+            "    [{}] {}    registered at super_root {}",
+            display_idx + 1,
+            info.filename,
+            &info.super_root
+        );
+    }
+}
+
+/// Print the "Cross-checks:" section showing all N-1 cross-verification results
+///
+/// # Arguments
+/// * `cross_results` - All cross-check results (N-1 for N receipts)
+/// * `first_failure_idx` - Index of first failed cross-check (None if all passed)
+/// * `use_color` - Whether to use colored output
+fn print_cross_checks_section(
+    cross_results: &[atl_core::CrossReceiptVerificationResult],
+    first_failure_idx: Option<usize>,
+    use_color: bool,
+) {
+    if cross_results.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("    Cross-checks:");
+
+    for (idx, cross) in cross_results.iter().enumerate() {
+        let from_idx = idx + 1;
+        let to_idx = idx + 2;
+
+        // Determine status: passed, failed, or skipped (after first failure)
+        let is_after_failure = first_failure_idx.is_some_and(|fail_idx| idx > fail_idx);
+
+        if is_after_failure {
+            // Skipped (chain already broken)
+            if use_color {
+                println!(
+                    "      [{}] → [{}]: {}",
+                    from_idx,
+                    to_idx,
+                    "(skipped)".dimmed()
+                );
+            } else {
+                println!("      [{}] → [{}]: (skipped)", from_idx, to_idx);
+            }
+        } else if cross.history_consistent {
+            // Passed
+            if use_color {
+                println!(
+                    "      [{}] → [{}]: {} included",
+                    from_idx,
+                    to_idx,
+                    "✓".green()
+                );
+            } else {
+                println!("      [{}] → [{}]: ✓ included", from_idx, to_idx);
+            }
+        } else {
+            // Failed (this is the break point)
+            if use_color {
+                println!(
+                    "      [{}] → [{}]: {} NOT included  {} BREAK",
+                    from_idx,
+                    to_idx,
+                    "✗".red(),
+                    "←".red()
+                );
+            } else {
+                println!(
+                    "      [{}] → [{}]: ✗ NOT included  ← BREAK",
+                    from_idx, to_idx
+                );
+            }
+        }
+    }
 }
 
 fn print_status(text: &str, is_success: bool, use_color: bool) {
@@ -575,6 +812,17 @@ mod tests {
     fn test_print_batch_result_with_consistency_valid() {
         use crate::verify::consistency::ConsistencyResult;
 
+        let cross_result = atl_core::CrossReceiptVerificationResult {
+            same_log_instance: true,
+            history_consistent: true,
+            genesis_super_root: [0x12; 32],
+            receipt_a_index: 0,
+            receipt_b_index: 1,
+            receipt_a_super_tree_size: 1,
+            receipt_b_super_tree_size: 2,
+            errors: vec![],
+        };
+
         let result = BatchVerificationResult {
             valid_count: 2,
             invalid_count: 0,
@@ -585,10 +833,27 @@ mod tests {
                 receipt_count: 2,
                 same_log: true,
                 history_consistent: true,
-                cross_results: vec![],
+                cross_results: vec![cross_result],
                 errors: vec![],
             }),
-            items: vec![],
+            items: vec![
+                BatchItemResult::Valid(SingleVerificationResult {
+                    source_path: PathBuf::from("test1.pdf"),
+                    receipt_path: PathBuf::from("test1.pdf.atl"),
+                    file_hash: [0xab; 32],
+                    file_hash_valid: true,
+                    receipt: create_test_receipt(),
+                    core_result: create_test_verification_result(true),
+                }),
+                BatchItemResult::Valid(SingleVerificationResult {
+                    source_path: PathBuf::from("test2.pdf"),
+                    receipt_path: PathBuf::from("test2.pdf.atl"),
+                    file_hash: [0xcd; 32],
+                    file_hash_valid: true,
+                    receipt: create_test_receipt(),
+                    core_result: create_test_verification_result(true),
+                }),
+            ],
         };
 
         assert!(print_batch_result(&result, true).is_ok());
@@ -701,17 +966,45 @@ mod tests {
     fn test_print_consistency_verified() {
         use crate::verify::consistency::ConsistencyResult;
 
-        let consistency = ConsistencyResult {
-            genesis_super_root: Some([0xaa; 32]),
-            receipt_count: 5,
-            same_log: true,
+        let cross_result = atl_core::CrossReceiptVerificationResult {
+            same_log_instance: true,
             history_consistent: true,
-            cross_results: vec![],
+            genesis_super_root: [0xaa; 32],
+            receipt_a_index: 0,
+            receipt_b_index: 1,
+            receipt_a_super_tree_size: 1,
+            receipt_b_super_tree_size: 2,
             errors: vec![],
         };
 
-        print_consistency(&consistency, true);
-        print_consistency(&consistency, false);
+        let consistency = ConsistencyResult {
+            genesis_super_root: Some([0xaa; 32]),
+            receipt_count: 2,
+            same_log: true,
+            history_consistent: true,
+            cross_results: vec![cross_result],
+            errors: vec![],
+        };
+
+        let receipt_infos = vec![
+            ReceiptProofInfo {
+                filename: "file1.txt".to_string(),
+                super_root:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                data_tree_index: 0,
+            },
+            ReceiptProofInfo {
+                filename: "file2.txt".to_string(),
+                super_root:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                data_tree_index: 1,
+            },
+        ];
+
+        print_consistency(&consistency, &receipt_infos, true);
+        print_consistency(&consistency, &receipt_infos, false);
     }
 
     #[test]
@@ -720,15 +1013,32 @@ mod tests {
 
         let consistency = ConsistencyResult {
             genesis_super_root: None,
-            receipt_count: 5,
+            receipt_count: 2,
             same_log: false,
             history_consistent: false,
             cross_results: vec![],
-            errors: vec!["Error 1".to_string(), "Error 2".to_string()],
+            errors: vec!["Different genesis".to_string()],
         };
 
-        print_consistency(&consistency, true);
-        print_consistency(&consistency, false);
+        let receipt_infos = vec![
+            ReceiptProofInfo {
+                filename: "file1.txt".to_string(),
+                super_root:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                data_tree_index: 0,
+            },
+            ReceiptProofInfo {
+                filename: "file2.txt".to_string(),
+                super_root:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                data_tree_index: 0,
+            },
+        ];
+
+        print_consistency(&consistency, &receipt_infos, true);
+        print_consistency(&consistency, &receipt_infos, false);
     }
 
     #[test]
@@ -789,6 +1099,258 @@ mod tests {
 
         print_batch_item(1, &item, true);
         print_batch_item(1, &item, false);
+    }
+
+    #[test]
+    fn test_print_consistency_verified_5_receipts() {
+        use crate::verify::consistency::ConsistencyResult;
+
+        // 5 receipts = 4 cross-checks
+        let cross_results = (0..4)
+            .map(|i| atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true,
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: i,
+                receipt_b_index: i + 1,
+                receipt_a_super_tree_size: i + 1,
+                receipt_b_super_tree_size: i + 2,
+                errors: vec![],
+            })
+            .collect::<Vec<_>>();
+
+        let consistency = ConsistencyResult {
+            genesis_super_root: Some([0xaa; 32]),
+            receipt_count: 5,
+            same_log: true,
+            history_consistent: true,
+            cross_results,
+            errors: vec![],
+        };
+
+        let receipt_infos: Vec<_> = (1..=5)
+            .map(|i| ReceiptProofInfo {
+                filename: format!("file{}.txt", i),
+                super_root: format!("sha256:{:064x}", i),
+                data_tree_index: i - 1,
+            })
+            .collect();
+
+        print_consistency(&consistency, &receipt_infos, false);
+    }
+
+    #[test]
+    fn test_print_consistency_failure_in_middle_of_chain() {
+        use crate::verify::consistency::ConsistencyResult;
+
+        // 5 receipts, failure at cross-check [3] -> [4]
+        let cross_results = vec![
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true, // [1] -> [2] OK
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 0,
+                receipt_b_index: 1,
+                receipt_a_super_tree_size: 1,
+                receipt_b_super_tree_size: 2,
+                errors: vec![],
+            },
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true, // [2] -> [3] OK
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 1,
+                receipt_b_index: 2,
+                receipt_a_super_tree_size: 2,
+                receipt_b_super_tree_size: 3,
+                errors: vec![],
+            },
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: false, // [3] -> [4] FAILED!
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 2,
+                receipt_b_index: 3,
+                receipt_a_super_tree_size: 3,
+                receipt_b_super_tree_size: 4,
+                errors: vec!["Consistency proof failed".to_string()],
+            },
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true, // [4] -> [5] - would pass but skipped
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 3,
+                receipt_b_index: 4,
+                receipt_a_super_tree_size: 4,
+                receipt_b_super_tree_size: 5,
+                errors: vec![],
+            },
+        ];
+
+        let consistency = ConsistencyResult {
+            genesis_super_root: Some([0xaa; 32]),
+            receipt_count: 5,
+            same_log: true,
+            history_consistent: false, // Failed due to tampering
+            cross_results,
+            errors: vec!["Cross-receipt error: Consistency proof failed".to_string()],
+        };
+
+        let receipt_infos: Vec<_> = (1..=5)
+            .map(|i| ReceiptProofInfo {
+                filename: format!("file{}.txt", i),
+                super_root: format!("sha256:{:064x}", i),
+                data_tree_index: i - 1,
+            })
+            .collect();
+
+        print_consistency(&consistency, &receipt_infos, false);
+    }
+
+    #[test]
+    fn test_print_consistency_failure_at_beginning() {
+        use crate::verify::consistency::ConsistencyResult;
+
+        // Failure at first cross-check [1] -> [2]
+        let cross_result = atl_core::CrossReceiptVerificationResult {
+            same_log_instance: true,
+            history_consistent: false, // History NOT consistent = tampering
+            genesis_super_root: [0xaa; 32],
+            receipt_a_index: 0,
+            receipt_b_index: 1,
+            receipt_a_super_tree_size: 1,
+            receipt_b_super_tree_size: 2,
+            errors: vec!["Consistency proof failed".to_string()],
+        };
+
+        let consistency = ConsistencyResult {
+            genesis_super_root: Some([0xaa; 32]),
+            receipt_count: 2,
+            same_log: true,
+            history_consistent: false, // Failed due to tampering
+            cross_results: vec![cross_result],
+            errors: vec!["Cross-receipt error: Consistency proof failed".to_string()],
+        };
+
+        let receipt_infos = vec![
+            ReceiptProofInfo {
+                filename: "file1.txt".to_string(),
+                super_root:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                data_tree_index: 0,
+            },
+            ReceiptProofInfo {
+                filename: "file2.txt".to_string(),
+                super_root:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                data_tree_index: 1,
+            },
+        ];
+
+        print_consistency(&consistency, &receipt_infos, false);
+    }
+
+    #[test]
+    fn test_print_checkmark_success() {
+        print_checkmark("Test message", true, true);
+        print_checkmark("Test message", true, false);
+    }
+
+    #[test]
+    fn test_print_checkmark_failure() {
+        print_checkmark("Test message", false, true);
+        print_checkmark("Test message", false, false);
+    }
+
+    #[test]
+    fn test_print_proof_section_sorted_by_index() {
+        // Receipts in wrong order in vector
+        let receipt_infos = vec![
+            ReceiptProofInfo {
+                filename: "later.txt".to_string(),
+                super_root:
+                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                        .to_string(),
+                data_tree_index: 5, // Later
+            },
+            ReceiptProofInfo {
+                filename: "earlier.txt".to_string(),
+                super_root:
+                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                        .to_string(),
+                data_tree_index: 2, // Earlier
+            },
+        ];
+
+        print_proof_section(&receipt_infos, false);
+    }
+
+    #[test]
+    fn test_print_cross_checks_section_all_passed() {
+        let cross_results = vec![
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true,
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 0,
+                receipt_b_index: 1,
+                receipt_a_super_tree_size: 1,
+                receipt_b_super_tree_size: 2,
+                errors: vec![],
+            },
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true,
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 1,
+                receipt_b_index: 2,
+                receipt_a_super_tree_size: 2,
+                receipt_b_super_tree_size: 3,
+                errors: vec![],
+            },
+        ];
+
+        print_cross_checks_section(&cross_results, None, false);
+    }
+
+    #[test]
+    fn test_print_cross_checks_section_with_failure() {
+        let cross_results = vec![
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true,
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 0,
+                receipt_b_index: 1,
+                receipt_a_super_tree_size: 1,
+                receipt_b_super_tree_size: 2,
+                errors: vec![],
+            },
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: false, // Failed
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 1,
+                receipt_b_index: 2,
+                receipt_a_super_tree_size: 2,
+                receipt_b_super_tree_size: 3,
+                errors: vec![],
+            },
+            atl_core::CrossReceiptVerificationResult {
+                same_log_instance: true,
+                history_consistent: true, // Would pass but skipped
+                genesis_super_root: [0xaa; 32],
+                receipt_a_index: 2,
+                receipt_b_index: 3,
+                receipt_a_super_tree_size: 3,
+                receipt_b_super_tree_size: 4,
+                errors: vec![],
+            },
+        ];
+
+        print_cross_checks_section(&cross_results, Some(1), false);
     }
 
     #[test]
