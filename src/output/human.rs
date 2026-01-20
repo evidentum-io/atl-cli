@@ -138,7 +138,6 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     }
 
     // Overall status
-    println!();
     print!("Overall: ");
     if result.is_valid() {
         print_status("VALID", true, use_color);
