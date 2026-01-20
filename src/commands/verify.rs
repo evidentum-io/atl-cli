@@ -92,8 +92,14 @@ fn execute_batch(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
     });
     let mode = verify_args.determine_mode_for_receipt(has_any_anchors)?;
 
-    // Output result WITH mode
-    output::print_batch_result(&result, args, mode)?;
+    // Output result WITH mode and paths
+    output::print_batch_result(
+        &result,
+        args,
+        mode,
+        &verify_args.source,
+        &verify_args.receipt,
+    )?;
 
     // Return error if any failures
     if !result.is_valid() {
