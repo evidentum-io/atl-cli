@@ -79,7 +79,6 @@ fn verify_rfc3161(
     target_hash: &str,
     timestamp: &str,
     token_der: &str,
-    data_tree_root: &str,
 ) -> AnchorVerificationResult {
     // Validate target
     if target != "data_tree_root" {
@@ -91,17 +90,6 @@ fn verify_rfc3161(
                 "Invalid target '{}', expected 'data_tree_root'",
                 target
             )),
-            details: AnchorDetails::Unknown,
-        };
-    }
-
-    // Validate target_hash matches data_tree_root
-    if target_hash != data_tree_root {
-        return AnchorVerificationResult {
-            anchor_type: "rfc3161".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("target_hash does not match data_tree_root".to_string()),
             details: AnchorDetails::Unknown,
         };
     }
@@ -357,7 +345,6 @@ pub async fn verify_single_online(
 ) -> CliResult<OnlineVerificationResult> {
     let mut anchor_results = Vec::new();
 
-    let data_tree_root = &result.receipt.proof.root_hash;
     let super_root = result
         .receipt
         .super_proof
@@ -372,7 +359,7 @@ pub async fn verify_single_online(
                 timestamp,
                 token_der,
                 ..
-            } => verify_rfc3161(target, target_hash, timestamp, token_der, data_tree_root),
+            } => verify_rfc3161(target, target_hash, timestamp, token_der),
             ReceiptAnchor::BitcoinOts {
                 target,
                 target_hash,
@@ -561,7 +548,6 @@ mod tests {
             "sha256:abc",
             "2024-01-01T00:00:00Z",
             "base64:token",
-            "sha256:abc",
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
@@ -572,30 +558,12 @@ mod tests {
     }
 
     #[test]
-    fn test_verify_rfc3161_hash_mismatch() {
-        let result = verify_rfc3161(
-            "data_tree_root",
-            "sha256:abc",
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-            "sha256:different",
-        );
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result
-            .error
-            .unwrap()
-            .contains("target_hash does not match data_tree_root"));
-    }
-
-    #[test]
     fn test_verify_rfc3161_invalid_hex() {
         let result = verify_rfc3161(
             "data_tree_root",
             "sha256:notvalidhex",
             "2024-01-01T00:00:00Z",
             "base64:token",
-            "sha256:notvalidhex",
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
@@ -609,7 +577,6 @@ mod tests {
             "sha256:aabb",
             "2024-01-01T00:00:00Z",
             "base64:token",
-            "sha256:aabb",
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
@@ -913,7 +880,6 @@ mod tests {
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             "2024-01-01T00:00:00Z",
             "base64:sometoken",
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         );
         // Will fail verification but should not fail on prefix handling
         assert!(!result.verified);
@@ -927,7 +893,6 @@ mod tests {
             "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
             "2024-01-01T00:00:00Z",
             "sometoken",
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
         );
         // Will fail verification but should not fail on prefix handling
         assert!(!result.verified);
