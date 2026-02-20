@@ -15,25 +15,36 @@ const CONNECTIVITY_ENDPOINTS: &[&str] = &[
 #[cfg(feature = "online")]
 const DETECT_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Pinned boxed future that resolves to `Result<(), ()>`, used for connectivity checks.
+#[cfg(feature = "online")]
+type ConnectFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ()>>>>;
+
 /// Check if internet is available (async)
 ///
 /// Returns true if any endpoint responds within timeout.
 /// Uses parallel requests with first-success-wins strategy.
 #[cfg(feature = "online")]
 pub async fn has_internet() -> bool {
-    use futures::future::select_all;
+    use futures::future::select_ok;
 
-    let checks: Vec<_> = CONNECTIVITY_ENDPOINTS
+    let checks: Vec<ConnectFuture> = CONNECTIVITY_ENDPOINTS
         .iter()
-        .map(|url| Box::pin(check_endpoint(url)))
+        .map(|url| {
+            Box::pin(async move {
+                if check_endpoint(url).await {
+                    Ok(())
+                } else {
+                    Err(())
+                }
+            }) as ConnectFuture
+        })
         .collect();
 
     if checks.is_empty() {
         return false;
     }
 
-    let (first_result, _remaining_index, _remaining) = select_all(checks).await;
-    first_result
+    select_ok(checks).await.is_ok()
 }
 
 #[cfg(feature = "online")]

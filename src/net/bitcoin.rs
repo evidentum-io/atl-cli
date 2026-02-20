@@ -52,9 +52,13 @@ pub struct BitcoinBlockInfo {
 
 /// Get Bitcoin block info including merkle_root
 pub async fn get_block_info(height: u64, timeout: Duration) -> CliResult<BitcoinBlockInfo> {
-    // Check cache first
-    if let Some(info) = BLOCK_INFO_CACHE.read().unwrap().get(&height) {
-        return Ok(info.clone());
+    // Check cache first; if the lock is poisoned, treat as cache miss
+    if let Some(info) = BLOCK_INFO_CACHE
+        .read()
+        .ok()
+        .and_then(|c| c.get(&height).cloned())
+    {
+        return Ok(info);
     }
 
     let client = reqwest::Client::builder()
@@ -67,10 +71,10 @@ pub async fn get_block_info(height: u64, timeout: Duration) -> CliResult<Bitcoin
     for provider in PROVIDERS {
         match fetch_block_info_from_provider(&client, provider, height).await {
             Ok(info) => {
-                BLOCK_INFO_CACHE
-                    .write()
-                    .unwrap()
-                    .insert(height, info.clone());
+                // Write to cache; if the lock is poisoned, skip caching (non-critical)
+                if let Ok(mut cache) = BLOCK_INFO_CACHE.write() {
+                    cache.insert(height, info.clone());
+                }
                 return Ok(info);
             }
             Err(e) => {

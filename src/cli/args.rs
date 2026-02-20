@@ -155,7 +155,8 @@ impl Args {
     /// Check if colored output should be used
     #[allow(dead_code)]
     pub fn use_color(&self) -> bool {
-        !self.no_color && atty::is(atty::Stream::Stdout)
+        use std::io::IsTerminal as _;
+        !self.no_color && std::io::stdout().is_terminal()
     }
 
     /// Check if output should be JSON
