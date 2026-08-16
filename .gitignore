@@ -4,3 +4,6 @@
 # Added by cargo
 
 /target
+
+# Local-only override for developing against a sibling atl-core checkout
+/.cargo/config.toml
