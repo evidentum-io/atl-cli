@@ -42,7 +42,7 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     // File hash comparison
     println!("File Hash:");
     println!("  Computed: {}", format_hash(&result.file_hash));
-    println!("  Expected: {}", &result.receipt.entry.payload_hash);
+    println!("  Expected: {}", result.receipt.entry.payload_hash);
     print!("  Match: ");
     if result.file_hash_valid {
         print_status("YES", true, use_color);
@@ -399,7 +399,7 @@ fn print_proof_section(receipt_infos: &[ReceiptProofInfo], _use_color: bool) {
             "    [{}] {}    registered at super_root {}",
             display_idx + 1,
             info.filename,
-            &info.super_root
+            info.super_root
         );
     }
 }
@@ -535,7 +535,7 @@ pub fn print_single_online_result(
     // File hash comparison
     println!("File Hash:");
     println!("  Computed: {}", format_hash(&result.offline.file_hash));
-    println!("  Expected: {}", &result.offline.receipt.entry.payload_hash);
+    println!("  Expected: {}", result.offline.receipt.entry.payload_hash);
     print!("  Match: ");
     if result.offline.file_hash_valid {
         print_status("YES", true, use_color);
