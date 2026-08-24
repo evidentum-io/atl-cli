@@ -35,6 +35,27 @@ struct VerificationJson {
     inclusion_valid: bool,
     super_inclusion_valid: Option<bool>,
     super_consistency_valid: Option<bool>,
+    /// Honest single-number aggregate over what was actually checked:
+    /// `inclusion_valid` AND (super proofs, if the receipt has a
+    /// `super_proof`). This is a statement about **proofs**, not about
+    /// **trust** — it can be `true` for an unanchored receipt, an
+    /// unverified checkpoint signature, or a timestamp no external anchor
+    /// corroborates. Consumers must look at `status` (and, in online mode,
+    /// `anchor_verification`) to judge trust; do not read `proofs_valid:
+    /// true` as "this receipt is verified". See `ProofVerdict::proofs_valid`.
+    proofs_valid: bool,
+}
+
+impl VerificationJson {
+    fn from_verdict(entry_id: String, verdict: crate::verify::ProofVerdict) -> Self {
+        Self {
+            entry_id,
+            inclusion_valid: verdict.inclusion_valid,
+            super_inclusion_valid: verdict.super_proof.map(|s| s.inclusion_valid),
+            super_consistency_valid: verdict.super_proof.map(|s| s.consistency_valid),
+            proofs_valid: verdict.proofs_valid(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -57,10 +78,14 @@ struct ErrorJson {
     message: String,
 }
 
-pub fn print_single_result(
+/// Build the JSON representation of a single-file (offline) verification result.
+///
+/// Split out from [`print_single_result`] so tests can inspect the resulting
+/// fields directly instead of parsing captured stdout.
+fn build_single_result_json(
     result: &SingleVerificationResult,
     mode: VerificationMode,
-) -> CliResult<()> {
+) -> SingleResultJson {
     let (status, anchor_status) = if result.is_lite_valid() {
         ("pending", "unanchored")
     } else if result.is_valid() {
@@ -84,20 +109,10 @@ pub fn print_single_result(
             is_match: result.file_hash_valid,
         },
         verification: if result.file_hash_valid {
-            Some(VerificationJson {
-                entry_id: result.receipt.entry.id.to_string(),
-                inclusion_valid: result.core_result.is_valid,
-                super_inclusion_valid: result
-                    .receipt
-                    .super_proof
-                    .as_ref()
-                    .map(|_| result.core_result.is_valid),
-                super_consistency_valid: result
-                    .receipt
-                    .super_proof
-                    .as_ref()
-                    .map(|_| result.core_result.is_valid),
-            })
+            Some(VerificationJson::from_verdict(
+                result.receipt.entry.id.to_string(),
+                result.proof_verdict(),
+            ))
         } else {
             None
         },
@@ -124,6 +139,14 @@ pub fn print_single_result(
         },
     };
 
+    output
+}
+
+pub fn print_single_result(
+    result: &SingleVerificationResult,
+    mode: VerificationMode,
+) -> CliResult<()> {
+    let output = build_single_result_json(result, mode);
     let json = serde_json::to_string_pretty(&output)?;
     println!("{json}");
     Ok(())
@@ -442,12 +465,6 @@ struct AnchorVerificationJson {
 }
 
 #[derive(Serialize)]
-struct VerificationDetailsJson {
-    entry_id: String,
-    inclusion_valid: bool,
-}
-
-#[derive(Serialize)]
 struct SingleOnlineResultJson {
     status: &'static str,
     mode: &'static str,
@@ -456,8 +473,12 @@ struct SingleOnlineResultJson {
     file_hash_valid: bool,
     computed_hash: String,
     expected_hash: String,
+    // Same shape as the offline `verification` block (`VerificationJson`) —
+    // online mode used to be a strictly poorer subset of offline; this keeps
+    // the two structurally identical so consumers get the same diagnostics
+    // regardless of mode.
     #[serde(skip_serializing_if = "Option::is_none")]
-    verification: Option<VerificationDetailsJson>,
+    verification: Option<VerificationJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anchor_verification: Option<AnchorVerificationJson>,
 }
@@ -480,7 +501,11 @@ fn format_timestamp_secs_iso(secs: u64) -> Option<String> {
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
-pub fn print_single_online_result(result: &OnlineVerificationResult) -> CliResult<()> {
+/// Build the JSON representation of a single-file online verification result.
+///
+/// Split out from [`print_single_online_result`] so tests can inspect the
+/// resulting fields directly instead of parsing captured stdout.
+fn build_single_online_result_json(result: &OnlineVerificationResult) -> SingleOnlineResultJson {
     let status = if result.is_valid() {
         "valid"
     } else if result.offline.is_lite_valid() {
@@ -489,12 +514,13 @@ pub fn print_single_online_result(result: &OnlineVerificationResult) -> CliResul
         "invalid"
     };
 
-    // Verification details
+    // Verification details — same canonical `ProofVerdict` the offline
+    // renderer uses, so online and offline JSON can never disagree.
     let verification = if result.offline.file_hash_valid {
-        Some(VerificationDetailsJson {
-            entry_id: result.offline.receipt.entry.id.to_string(),
-            inclusion_valid: result.offline.core_result.is_valid,
-        })
+        Some(VerificationJson::from_verdict(
+            result.offline.receipt.entry.id.to_string(),
+            result.offline.proof_verdict(),
+        ))
     } else {
         None
     };
@@ -569,6 +595,11 @@ pub fn print_single_online_result(result: &OnlineVerificationResult) -> CliResul
         anchor_verification,
     };
 
+    output
+}
+
+pub fn print_single_online_result(result: &OnlineVerificationResult) -> CliResult<()> {
+    let output = build_single_online_result_json(result);
     let json = serde_json::to_string_pretty(&output)?;
     println!("{json}");
     Ok(())
@@ -971,6 +1002,7 @@ mod tests {
             inclusion_valid: true,
             super_inclusion_valid: Some(true),
             super_consistency_valid: Some(true),
+            proofs_valid: true,
         };
         assert!(serde_json::to_string(&verification).is_ok());
 
@@ -1067,9 +1099,12 @@ mod tests {
     #[test]
     fn should_serialize_verification_details_json() {
         // Arrange
-        let details = VerificationDetailsJson {
+        let details = VerificationJson {
             entry_id: "896d398f-f983-467b-a376-60e795e66d3b".to_string(),
             inclusion_valid: true,
+            super_inclusion_valid: Some(true),
+            super_consistency_valid: Some(true),
+            proofs_valid: true,
         };
 
         // Act
@@ -1136,5 +1171,327 @@ mod tests {
         assert!(!json_str.contains("operation_count"));
         assert!(!json_str.contains("merkle_match"));
         assert!(json_str.contains("timestamp"));
+    }
+
+    // ========================================================================
+    // Canonical verdict regression tests
+    //
+    // Covers the two symmetric bugs the `ProofVerdict` refactor fixes:
+    // - offline JSON used to fold `inclusion_valid` / super fields into the
+    //   aggregate `core_result.is_valid`, which is `false` for any valid but
+    //   unanchored receipt (too strict);
+    // - online JSON only ever exposed base `inclusion_valid` and never
+    //   exposed the super-tree fields at all, so a broken super-tree proof
+    //   was invisible in online mode (too lenient — the online *human*
+    //   renderer had the matching bug, fixed by the same shared method).
+    // ========================================================================
+
+    /// Real (unmodified) anchor-only verification of the bundled valid
+    /// receipt: unanchored (`NoTrustAnchor`), but every cryptographic proof
+    /// — base inclusion, super inclusion, super consistency — genuinely
+    /// passes.
+    fn real_unanchored_core_result() -> atl_core::VerificationResult {
+        let receipt = create_test_receipt();
+        atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt")
+    }
+
+    fn single_result_with(
+        core_result: atl_core::VerificationResult,
+        receipt: atl_core::Receipt,
+    ) -> SingleVerificationResult {
+        SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt,
+            core_result,
+        }
+    }
+
+    #[test]
+    fn unanchored_valid_receipt_reports_true_inclusion_and_super_flags_offline() {
+        use crate::cli::VerificationMode;
+
+        // core_result.is_valid is false here (NoTrustAnchor) — the whole
+        // point of the test is that this must NOT leak into the proof flags.
+        let core_result = real_unanchored_core_result();
+        assert!(!core_result.is_valid, "fixture must be unanchored");
+        assert!(core_result.inclusion_valid);
+        assert!(core_result.super_inclusion_valid);
+        assert!(core_result.super_consistency_valid);
+
+        let result = single_result_with(core_result, create_test_receipt());
+        let json = build_single_result_json(&result, VerificationMode::Offline);
+        let value = serde_json::to_value(&json).unwrap();
+
+        assert_eq!(value["status"], "pending");
+        assert_eq!(value["verification"]["inclusion_valid"], true);
+        assert_eq!(value["verification"]["super_inclusion_valid"], true);
+        assert_eq!(value["verification"]["super_consistency_valid"], true);
+        assert_eq!(value["verification"]["proofs_valid"], true);
+    }
+
+    #[test]
+    fn broken_super_proof_reports_invalid_in_offline_json() {
+        use crate::cli::VerificationMode;
+
+        let mut core_result = real_unanchored_core_result();
+        core_result.super_inclusion_valid = false;
+        core_result.is_valid = false;
+        core_result
+            .errors
+            .push(atl_core::VerificationError::SuperInclusionFailed {
+                reason: "data tree root not included in super root".to_string(),
+            });
+
+        let result = single_result_with(core_result, create_test_receipt());
+        // Base inclusion is untouched and genuinely valid; only the super
+        // proof is broken.
+        assert!(result.core_result.inclusion_valid);
+
+        let json = build_single_result_json(&result, VerificationMode::Offline);
+        let value = serde_json::to_value(&json).unwrap();
+
+        assert_eq!(value["status"], "invalid");
+        assert_eq!(value["verification"]["inclusion_valid"], true);
+        assert_eq!(value["verification"]["super_inclusion_valid"], false);
+        assert_eq!(
+            value["verification"]["proofs_valid"], false,
+            "a broken super-tree proof must never be reported as proofs_valid: true"
+        );
+    }
+
+    #[test]
+    fn broken_super_consistency_only_reports_invalid_via_real_crypto() {
+        // Review finding: `broken_super_proof.atl` corrupts `super_root`,
+        // which breaks BOTH `super_inclusion_valid` and
+        // `super_consistency_valid` at once (for a size-1 Super-Tree,
+        // inclusion requires `super_root == data_tree_root` and consistency
+        // requires `genesis_super_root == super_root`). That fixture alone
+        // cannot prove the renderer catches a consistency-only failure. This
+        // test uses a second fixture,
+        // `broken_super_consistency_only.atl`, that keeps `super_root`
+        // correct (so super-tree inclusion genuinely passes) and corrupts
+        // only `genesis_super_root` (so consistency-to-origin genuinely
+        // fails) — verified through the real `atl_core` crypto path, not by
+        // hand-flipping `VerificationResult` fields.
+        use crate::cli::VerificationMode;
+
+        let receipt: atl_core::Receipt = serde_json::from_str(include_str!(
+            "../../test_data/receipts/invalid/broken_super_consistency_only.atl"
+        ))
+        .expect("Failed to parse fixture receipt");
+        assert!(receipt.super_proof.is_some());
+
+        let core_result = atl_core::verify_receipt_anchor_only(&receipt)
+            .expect("Failed to verify fixture receipt");
+        assert!(
+            core_result.inclusion_valid,
+            "base inclusion must be untouched by this fixture"
+        );
+        assert!(
+            core_result.super_inclusion_valid,
+            "super-tree inclusion must genuinely pass: super_root was not touched"
+        );
+        assert!(
+            !core_result.super_consistency_valid,
+            "consistency-to-origin must genuinely fail: genesis_super_root was corrupted"
+        );
+
+        let result = single_result_with(core_result, receipt);
+        let json = build_single_result_json(&result, VerificationMode::Offline);
+        let value = serde_json::to_value(&json).unwrap();
+
+        assert_eq!(value["status"], "invalid");
+        assert_eq!(value["verification"]["inclusion_valid"], true);
+        assert_eq!(value["verification"]["super_inclusion_valid"], true);
+        assert_eq!(
+            value["verification"]["super_consistency_valid"], false,
+            "consistency-only breakage must surface distinctly from inclusion breakage"
+        );
+        assert_eq!(value["verification"]["proofs_valid"], false);
+    }
+
+    #[test]
+    fn broken_super_proof_reports_invalid_in_online_json() {
+        // Regression for the online-mode "mildness" bug: online JSON used to
+        // report only `core_result.is_valid` under `inclusion_valid` and had
+        // no super fields at all, so a broken super-tree proof was
+        // completely invisible. It must now match the offline shape and
+        // verdict exactly.
+        let mut core_result = real_unanchored_core_result();
+        core_result.super_inclusion_valid = false;
+        core_result.is_valid = false;
+        core_result
+            .errors
+            .push(atl_core::VerificationError::SuperInclusionFailed {
+                reason: "data tree root not included in super root".to_string(),
+            });
+
+        let offline = single_result_with(core_result, create_test_receipt());
+        let online = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![],
+            all_anchors_verified: true,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        let json = build_single_online_result_json(&online);
+        let value = serde_json::to_value(&json).unwrap();
+
+        assert_eq!(value["status"], "invalid");
+        assert_eq!(value["verification"]["inclusion_valid"], true);
+        assert_eq!(value["verification"]["super_inclusion_valid"], false);
+        assert_eq!(value["verification"]["proofs_valid"], false);
+    }
+
+    #[test]
+    fn offline_and_online_json_agree_on_verdict_matrix() {
+        // Structural equality check: build both offline and online JSON from
+        // the same underlying (core_result, receipt) pair across a matrix of
+        // scenarios, and assert the `verification` blocks are byte-for-byte
+        // identical. This is what makes divergence between the two renderers
+        // structurally impossible rather than "currently consistent".
+        use crate::cli::VerificationMode;
+
+        // Test-only fixture; a state machine / enum would obscure the
+        // matrix more than the four independent flags it's spelling out.
+        #[allow(clippy::struct_excessive_bools)]
+        struct Case {
+            name: &'static str,
+            has_super_proof: bool,
+            inclusion_valid: bool,
+            super_inclusion_valid: bool,
+            super_consistency_valid: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "no super_proof, base valid",
+                has_super_proof: false,
+                inclusion_valid: true,
+                super_inclusion_valid: true,
+                super_consistency_valid: true,
+            },
+            Case {
+                name: "no super_proof, base broken",
+                has_super_proof: false,
+                inclusion_valid: false,
+                super_inclusion_valid: true,
+                super_consistency_valid: true,
+            },
+            Case {
+                name: "super_proof present, all valid",
+                has_super_proof: true,
+                inclusion_valid: true,
+                super_inclusion_valid: true,
+                super_consistency_valid: true,
+            },
+            Case {
+                name: "super_proof present, super_inclusion broken",
+                has_super_proof: true,
+                inclusion_valid: true,
+                super_inclusion_valid: false,
+                super_consistency_valid: true,
+            },
+            Case {
+                name: "super_proof present, super_consistency broken",
+                has_super_proof: true,
+                inclusion_valid: true,
+                super_inclusion_valid: true,
+                super_consistency_valid: false,
+            },
+            Case {
+                name: "super_proof present, base inclusion broken",
+                has_super_proof: true,
+                inclusion_valid: false,
+                super_inclusion_valid: true,
+                super_consistency_valid: true,
+            },
+        ];
+
+        for case in cases {
+            let mut core_result = real_unanchored_core_result();
+            core_result.inclusion_valid = case.inclusion_valid;
+            core_result.super_inclusion_valid = case.super_inclusion_valid;
+            core_result.super_consistency_valid = case.super_consistency_valid;
+
+            let mut receipt = create_test_receipt();
+            if !case.has_super_proof {
+                receipt.super_proof = None;
+            }
+
+            let offline_result = single_result_with(core_result, receipt);
+            let offline_json = build_single_result_json(&offline_result, VerificationMode::Offline);
+            let offline_value = serde_json::to_value(&offline_json).unwrap();
+
+            let online_result = OnlineVerificationResult {
+                offline: offline_result,
+                anchor_results: vec![],
+                all_anchors_verified: true,
+                mode: VerificationMode::Online,
+            };
+            let online_json = build_single_online_result_json(&online_result);
+            let online_value = serde_json::to_value(&online_json).unwrap();
+
+            assert_eq!(
+                offline_value["verification"], online_value["verification"],
+                "offline/online verification blocks diverged for case: {}",
+                case.name
+            );
+            // Note: `status` is deliberately NOT compared here. Its
+            // offline/online precedence (`is_lite_valid()` vs `is_valid()`
+            // checked first) is pre-existing, untouched by this fix (see
+            // task scope: "не меняй семантику status"), and unreachable in
+            // practice — the real CLI only ever routes to the online
+            // renderer when `receipt.anchors` is non-empty, at which point
+            // `is_lite_valid()` is false for both. This test wraps a
+            // zero-anchor core_result in `OnlineVerificationResult` purely
+            // to reuse the same fixture across the matrix; it does not
+            // claim that combination is production-reachable.
+        }
+    }
+
+    #[test]
+    fn no_inclusion_field_is_derived_from_aggregate_is_valid() {
+        // Direct regression test for the root cause: build two otherwise
+        // identical results that differ ONLY in `core_result.is_valid`, and
+        // assert every `*inclusion*` field in the JSON output is unchanged.
+        // If any of them were still wired to the aggregate, this would fail.
+        use crate::cli::VerificationMode;
+
+        let mut valid_core = real_unanchored_core_result();
+        valid_core.is_valid = true;
+
+        let mut invalid_core = real_unanchored_core_result();
+        invalid_core.is_valid = false;
+
+        let valid_result = single_result_with(valid_core, create_test_receipt());
+        let invalid_result = single_result_with(invalid_core, create_test_receipt());
+
+        let valid_json = serde_json::to_value(build_single_result_json(
+            &valid_result,
+            VerificationMode::Offline,
+        ))
+        .unwrap();
+        let invalid_json = serde_json::to_value(build_single_result_json(
+            &invalid_result,
+            VerificationMode::Offline,
+        ))
+        .unwrap();
+
+        assert_eq!(
+            valid_json["verification"]["inclusion_valid"],
+            invalid_json["verification"]["inclusion_valid"]
+        );
+        assert_eq!(
+            valid_json["verification"]["super_inclusion_valid"],
+            invalid_json["verification"]["super_inclusion_valid"]
+        );
+        assert_eq!(
+            valid_json["verification"]["super_consistency_valid"],
+            invalid_json["verification"]["super_consistency_valid"]
+        );
     }
 }

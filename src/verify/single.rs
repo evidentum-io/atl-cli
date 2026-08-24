@@ -7,6 +7,89 @@ use atl_core::{verify_receipt_anchor_only, Receipt, VerificationResult};
 use crate::error::{CliError, CliResult};
 use crate::verify::file::{compare_hash, hash_file, MAX_RECEIPT_SIZE};
 
+/// Super-Tree proof verdict — only constructible (and only exists at all)
+/// when the receipt actually carries a `super_proof`.
+///
+/// Kept as its own type, rather than two loose `Option<bool>` fields on
+/// [`ProofVerdict`], specifically so "has a `super_proof`" and "both of its
+/// flags are populated" are tied together by the type system: there is no
+/// way to construct a state where one of `inclusion_valid` /
+/// `consistency_valid` is known and the other is not, or where a receipt
+/// with no `super_proof` still carries `Some` super flags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SuperProofVerdict {
+    /// Super-Tree inclusion proof (data tree root included in super root) is valid.
+    pub inclusion_valid: bool,
+    /// Super-Tree consistency-to-origin proof is valid.
+    pub consistency_valid: bool,
+}
+
+impl SuperProofVerdict {
+    /// Both the inclusion and consistency checks passed.
+    #[must_use]
+    pub const fn valid(self) -> bool {
+        self.inclusion_valid && self.consistency_valid
+    }
+}
+
+/// Canonical cryptographic-proof verdict for a receipt.
+///
+/// This is the single source of truth for "did the inclusion / super-tree
+/// proofs check out" — both the JSON and human-readable renderers must build
+/// their flags from this struct instead of re-deriving them, so the two
+/// output formats can never disagree.
+///
+/// `inclusion_valid` is the base Merkle inclusion proof against the log's
+/// `data_tree_root`. It does NOT fold in trust-anchor / signature status —
+/// an unanchored (Receipt-Lite) receipt can have `inclusion_valid: true`.
+/// `super_proof` is `None` when the receipt carries no `super_proof` at all
+/// (nothing to verify), and `Some(SuperProofVerdict)` otherwise — see
+/// [`SuperProofVerdict`] for why this is nested rather than two `Option<bool>`
+/// fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProofVerdict {
+    /// Base Merkle inclusion proof is valid.
+    pub inclusion_valid: bool,
+    /// Super-Tree verdict, or `None` if the receipt has no `super_proof`.
+    pub super_proof: Option<SuperProofVerdict>,
+}
+
+impl ProofVerdict {
+    /// Compute the canonical verdict from a core verification result and
+    /// whether the receipt carries a `super_proof`.
+    #[must_use]
+    pub const fn compute(core_result: &VerificationResult, has_super_proof: bool) -> Self {
+        let super_proof = if has_super_proof {
+            Some(SuperProofVerdict {
+                inclusion_valid: core_result.super_inclusion_valid,
+                consistency_valid: core_result.super_consistency_valid,
+            })
+        } else {
+            None
+        };
+
+        Self {
+            inclusion_valid: core_result.inclusion_valid,
+            super_proof,
+        }
+    }
+
+    /// Honest aggregate over what was actually cryptographically checked:
+    /// base inclusion AND (super proof, if the receipt has one).
+    ///
+    /// This is a statement about **proofs**, not about **trust**. It can be
+    /// `true` for a receipt that is unanchored, whose checkpoint signature
+    /// was never verified, or whose timestamp cannot be corroborated by any
+    /// external anchor — none of that is checked here. A caller that wants
+    /// to know whether a receipt should be *trusted* must look at `status`
+    /// and the anchor verification results, not at this flag alone. Do not
+    /// present `proofs_valid: true` to an end user as "receipt verified".
+    #[must_use]
+    pub fn proofs_valid(self) -> bool {
+        self.inclusion_valid && self.super_proof.is_none_or(SuperProofVerdict::valid)
+    }
+}
+
 /// Result of single file verification
 #[derive(Debug, Clone)]
 pub struct SingleVerificationResult {
@@ -75,6 +158,16 @@ impl SingleVerificationResult {
         }
 
         false
+    }
+
+    /// Compute the canonical cryptographic-proof verdict for this result.
+    ///
+    /// See [`ProofVerdict`] — this is the single source of truth JSON and
+    /// human-readable renderers must use for `inclusion_valid` / super-tree
+    /// flags, so the two output formats cannot structurally diverge.
+    #[must_use]
+    pub fn proof_verdict(&self) -> ProofVerdict {
+        ProofVerdict::compute(&self.core_result, self.receipt.super_proof.is_some())
     }
 
     /// Check if this is a valid "lite" receipt (no anchors)
@@ -437,4 +530,223 @@ mod tests {
 
     // Note: Comprehensive tests with valid receipts are in integration tests
     // Unit tests here focus on error paths and logic branches
+
+    // ========================================================================
+    // ProofVerdict — canonical verdict model
+    // ========================================================================
+    //
+    // These tests pin down the single source of truth both `output::json`
+    // and `output::human` build their `inclusion_valid` / super-tree flags
+    // from. Regression coverage for the underlying bug: neither renderer may
+    // derive an `inclusion`-named field from the aggregate `is_valid` (too
+    // strict for unanchored receipts), and neither may ignore a broken
+    // super-tree proof when only the base inclusion proof is checked (too
+    // lenient).
+
+    fn base_core_result() -> atl_core::VerificationResult {
+        // Real output of anchor-only verification against the bundled
+        // valid+unanchored test receipt: base inclusion, super inclusion and
+        // super consistency all genuinely pass; only `NoTrustAnchor` fires
+        // because the receipt carries no anchors. `is_valid` is therefore
+        // `false` at the core level even though every proof checks out —
+        // exactly the case the old code conflated.
+        let receipt = create_test_receipt();
+        atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt")
+    }
+
+    #[test]
+    fn proof_verdict_no_super_proof_ignores_super_fields() {
+        let mut core_result = base_core_result();
+        core_result.inclusion_valid = true;
+
+        let verdict = ProofVerdict::compute(&core_result, false);
+
+        assert!(verdict.inclusion_valid);
+        assert_eq!(verdict.super_proof, None);
+        assert!(verdict.proofs_valid());
+    }
+
+    #[test]
+    fn proof_verdict_no_super_proof_but_base_inclusion_broken_is_invalid() {
+        let mut core_result = base_core_result();
+        core_result.inclusion_valid = false;
+
+        let verdict = ProofVerdict::compute(&core_result, false);
+
+        assert!(!verdict.inclusion_valid);
+        assert!(!verdict.proofs_valid());
+    }
+
+    #[test]
+    fn proof_verdict_with_super_proof_all_valid() {
+        let mut core_result = base_core_result();
+        core_result.inclusion_valid = true;
+        core_result.super_inclusion_valid = true;
+        core_result.super_consistency_valid = true;
+
+        let verdict = ProofVerdict::compute(&core_result, true);
+
+        assert!(verdict.inclusion_valid);
+        assert_eq!(
+            verdict.super_proof,
+            Some(SuperProofVerdict {
+                inclusion_valid: true,
+                consistency_valid: true,
+            })
+        );
+        assert!(verdict.proofs_valid());
+    }
+
+    #[test]
+    fn proof_verdict_with_super_proof_base_valid_but_super_inclusion_broken() {
+        // Regression for the "online mode is too lenient" bug: base
+        // inclusion alone must NOT be enough to call the proofs valid when a
+        // super_proof is present and its inclusion check failed.
+        let mut core_result = base_core_result();
+        core_result.inclusion_valid = true;
+        core_result.super_inclusion_valid = false;
+        core_result.super_consistency_valid = true;
+
+        let verdict = ProofVerdict::compute(&core_result, true);
+
+        assert!(verdict.inclusion_valid);
+        assert_eq!(
+            verdict.super_proof,
+            Some(SuperProofVerdict {
+                inclusion_valid: false,
+                consistency_valid: true,
+            })
+        );
+        assert!(!verdict.proofs_valid());
+    }
+
+    #[test]
+    fn proof_verdict_with_super_proof_base_valid_but_super_consistency_broken() {
+        // Regression for the "matched fixture" gap flagged in review: a
+        // super_proof whose *inclusion* is fine but whose *consistency to
+        // origin* is broken must still fail `proofs_valid`, not just the
+        // (more common) case where both super flags break together.
+        let mut core_result = base_core_result();
+        core_result.inclusion_valid = true;
+        core_result.super_inclusion_valid = true;
+        core_result.super_consistency_valid = false;
+
+        let verdict = ProofVerdict::compute(&core_result, true);
+
+        assert_eq!(
+            verdict.super_proof,
+            Some(SuperProofVerdict {
+                inclusion_valid: true,
+                consistency_valid: false,
+            })
+        );
+        assert!(!verdict.proofs_valid());
+    }
+
+    #[test]
+    fn proof_verdict_base_inclusion_broken_dominates_even_with_valid_super() {
+        let mut core_result = base_core_result();
+        core_result.inclusion_valid = false;
+        core_result.super_inclusion_valid = true;
+        core_result.super_consistency_valid = true;
+
+        let verdict = ProofVerdict::compute(&core_result, true);
+
+        assert!(!verdict.proofs_valid());
+    }
+
+    #[test]
+    fn proof_verdict_is_not_derived_from_aggregate_is_valid() {
+        // Regression for the "offline mode is too strict" bug: an unanchored
+        // receipt has `core_result.is_valid == false` (no trust anchor) even
+        // though every cryptographic proof is genuinely valid. The verdict
+        // must reflect the real proof fields, not the aggregate.
+        let mut core_result = base_core_result();
+        core_result.is_valid = false;
+        core_result.inclusion_valid = true;
+        core_result.super_inclusion_valid = true;
+        core_result.super_consistency_valid = true;
+
+        let verdict = ProofVerdict::compute(&core_result, true);
+
+        assert!(verdict.inclusion_valid);
+        assert_eq!(
+            verdict.super_proof,
+            Some(SuperProofVerdict {
+                inclusion_valid: true,
+                consistency_valid: true,
+            })
+        );
+        assert!(verdict.proofs_valid());
+    }
+
+    #[test]
+    fn super_proof_verdict_partially_broken_is_never_reported_valid() {
+        // Regression for the review finding: `ProofVerdict` used to hold two
+        // independent `Option<bool>` fields, so a value like
+        // `{ super_inclusion_valid: Some(true), super_consistency_valid: None }`
+        // was constructible from outside the module (public fields) even
+        // though `ProofVerdict::compute` never produces it, and
+        // `proofs_valid()`'s `unwrap_or(true)` silently treated the missing
+        // half as passing. `SuperProofVerdict` makes that state
+        // unrepresentable: both flags live in one struct that only exists at
+        // all when there IS a super_proof, so there is no "half-known" verdict
+        // to construct. This test exhaustively checks all four combinations
+        // reachable through the public API.
+        for inclusion_valid in [true, false] {
+            for consistency_valid in [true, false] {
+                let verdict = ProofVerdict {
+                    inclusion_valid: true,
+                    super_proof: Some(SuperProofVerdict {
+                        inclusion_valid,
+                        consistency_valid,
+                    }),
+                };
+                assert_eq!(
+                    verdict.proofs_valid(),
+                    inclusion_valid && consistency_valid,
+                    "inclusion_valid={inclusion_valid} consistency_valid={consistency_valid}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn single_verification_result_proof_verdict_uses_receipt_super_proof_presence() {
+        // `SingleVerificationResult::proof_verdict()` must key `has_super_proof`
+        // off `receipt.super_proof.is_some()`, not off the core result alone.
+        let mut receipt = create_test_receipt();
+        assert!(
+            receipt.super_proof.is_some(),
+            "fixture must carry a super_proof"
+        );
+
+        let mut core_result = base_core_result();
+        core_result.inclusion_valid = true;
+        core_result.super_inclusion_valid = false;
+        core_result.super_consistency_valid = true;
+
+        let result_with_super = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: receipt.clone(),
+            core_result: core_result.clone(),
+        };
+        // With super_proof present, the broken super_inclusion must fail proofs_valid.
+        assert!(!result_with_super.proof_verdict().proofs_valid());
+
+        receipt.super_proof = None;
+        let result_without_super = SingleVerificationResult {
+            source_path: std::path::PathBuf::from("test.pdf"),
+            receipt_path: std::path::PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt,
+            core_result,
+        };
+        // With no super_proof, the (irrelevant) broken super fields are ignored.
+        assert!(result_without_super.proof_verdict().proofs_valid());
+    }
 }

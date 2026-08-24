@@ -17,4 +17,4 @@ pub use consistency::{verify_consistency, ConsistencyResult};
 #[allow(unused_imports)]
 pub use file::{compare_hash, format_hash, hash_file, MAX_RECEIPT_SIZE, MAX_SOURCE_FILE_SIZE};
 #[allow(unused_imports)]
-pub use single::{load_receipt, verify_single, SingleVerificationResult};
+pub use single::{load_receipt, verify_single, ProofVerdict, SingleVerificationResult};
