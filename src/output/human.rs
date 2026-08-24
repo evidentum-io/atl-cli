@@ -63,16 +63,11 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     println!("Receipt Verification:");
     println!("  Entry ID: {}", result.receipt.entry.id);
 
-    // Inclusion proof - account for super_proof being None
+    // Inclusion proof - canonical verdict (base inclusion AND super-tree
+    // proofs if the receipt has a super_proof), same source of truth the
+    // JSON renderer uses (see `ProofVerdict`).
     print!("  Inclusion Proof: ");
-    let proofs_valid = if result.receipt.super_proof.is_some() {
-        result.core_result.inclusion_valid
-            && result.core_result.super_inclusion_valid
-            && result.core_result.super_consistency_valid
-    } else {
-        // No super_proof = only check basic inclusion
-        result.core_result.inclusion_valid
-    };
+    let proofs_valid = result.proof_verdict().proofs_valid();
     if proofs_valid {
         print_status("VALID", true, use_color);
     } else {
@@ -556,9 +551,13 @@ pub fn print_single_online_result(
     println!("Receipt Verification:");
     println!("  Entry ID: {}", result.offline.receipt.entry.id);
 
-    // Inclusion proof
+    // Inclusion proof - canonical verdict (base inclusion AND super-tree
+    // proofs if the receipt has a super_proof). Previously this only checked
+    // `core_result.inclusion_valid`, silently ignoring a broken super-tree
+    // proof; it now uses the same `ProofVerdict` the offline renderer and
+    // the JSON output use, so online/offline/human/JSON cannot diverge.
     print!("  Inclusion Proof: ");
-    let proofs_valid = result.offline.core_result.inclusion_valid;
+    let proofs_valid = result.offline.proof_verdict().proofs_valid();
     if proofs_valid {
         print_status("VALID", true, use_color);
     } else {
