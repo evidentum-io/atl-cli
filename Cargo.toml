@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.6.13"
+version = "0.6.14"
 edition = "2021"
 rust-version = "1.92.0"
 license = "Apache-2.0"
@@ -25,6 +25,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 hex = "0.4"
+# Constant-time comparison for anchor target_hash pinning (see src/verify/online.rs)
+subtle = "2"
 
 # File hashing
 sha2 = "0.10"
