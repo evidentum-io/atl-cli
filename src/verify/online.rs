@@ -74,22 +74,25 @@ impl OnlineVerificationResult {
     }
 }
 
-/// Decode a `"sha256:<64 hex chars>"` (or bare hex) string into a 32-byte hash.
+/// Decode a `"sha256:<64 hex chars>"` string into a 32-byte hash.
 ///
 /// Shared by both anchor types so `target_hash`, `proof.root_hash` and
 /// `super_proof.super_root` are all parsed identically before being
 /// compared.
+///
+/// This delegates to [`atl_core::core::checkpoint::parse_hash`] rather than
+/// reimplementing hash-string parsing, so this crate's notion of "a valid
+/// hash string" can never drift from what `atl-core` itself accepts. An
+/// earlier version of this function had its own hex decoder that (unlike
+/// `atl_core::parse_hash`) also accepted a bare hex string with no
+/// `sha256:` prefix - a protocol-level discrepancy from `atl-core`, since
+/// fixed by reusing the core parser instead of re-deriving its rules.
+/// `atl_core::parse_hash` requires the prefix to be exactly `"sha256:"`
+/// (lowercase); it rejects `"SHA256:"`, any other case, and a missing
+/// prefix, matching `hex::decode`'s existing case-insensitivity for the hex
+/// digits themselves.
 fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
-    let hash_hex = s.strip_prefix("sha256:").unwrap_or(s);
-    match hex::decode(hash_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            Ok(arr)
-        }
-        Ok(b) => Err(format!("Invalid hash length: {} bytes", b.len())),
-        Err(e) => Err(format!("Invalid hex: {e}")),
-    }
+    atl_core::core::checkpoint::parse_hash(s).map_err(|e| e.to_string())
 }
 
 /// Constant-time 32-byte comparison.
@@ -127,6 +130,29 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// pinning check rather than call into `atl-core` for it. We keep the
 /// duplication to the two lines below and use the same `subtle`
 /// constant-time comparison `atl-core` uses internally.
+///
+/// # What "verified: true" actually means on this atl-core version (0.23.2)
+///
+/// Steps 3-5 of the spec are: (3) decode `token_der`, (4) verify the TSA's
+/// cryptographic signature over the token, (5) verify the token's
+/// `messageImprint` matches `anchor.target_hash`. `verify_rfc3161_anchor_impl`
+/// in `atl-core` 0.23.2 (see `core::verify::anchors::rfc3161::{parse_rfc3161_token,
+/// verify_rfc3161_hash}`) only performs steps 3 and 5 - it parses the CMS
+/// `SignedData`/`TSTInfo` structure and compares `messageImprint` against
+/// `expected_root`. **It never verifies the CMS signature, so step 4 does
+/// not happen at all on this dependency version.** Full signature
+/// verification (certificate chain, RSA/ECDSA signature over the signed
+/// content) is implemented in `atl-core` 0.25, which is not yet published to
+/// crates.io - this crate is pinned to the published `0.23` line (see
+/// `Cargo.toml`) and cannot pull it in without a major-version bump.
+///
+/// Practically: a `verified: true` result for an RFC 3161 anchor here means
+/// "the token is well-formed and its claimed hash is pinned to our Data Tree
+/// root" - it does **not** mean "an independent TSA cryptographically
+/// attests to this timestamp". A forged/self-signed token with the right
+/// `messageImprint` would currently also verify. Do not present this as full
+/// TSA trust in output or documentation until `atl-core` 0.25 ships and this
+/// crate can depend on it.
 fn verify_rfc3161(
     target: &str,
     target_hash: &str,
@@ -198,10 +224,14 @@ fn verify_rfc3161(
         format!("base64:{}", token_der)
     };
 
-    // STEPS 3-5: CALL atl-core function, passing the receipt's own root
-    // hash (now proven equal to the anchor's claim) as the expected hash -
-    // not the anchor's claim itself, so a future refactor here can't
-    // accidentally drop the pinning check above and still "work".
+    // STEPS 3 and 5 (NOT step 4 - see the "What verified: true actually
+    // means" section of this function's doc comment): parses `token_der`
+    // and checks its `messageImprint` against `expected_root`. Does NOT
+    // verify the TSA's cryptographic signature on atl-core 0.23.x. We pass
+    // the receipt's own root hash (now proven equal to the anchor's claim)
+    // as the expected hash - not the anchor's claim itself, so a future
+    // refactor here can't accidentally drop the pinning check above and
+    // still "work".
     let result = verify_rfc3161_anchor_impl(timestamp, &token_with_prefix, &expected_root);
 
     AnchorVerificationResult {
@@ -475,6 +505,57 @@ mod tests {
     const OTHER_HASH: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
+    // `decode_hash_hex` delegates entirely to `atl_core::core::checkpoint::
+    // parse_hash` (see its doc comment); these tests pin that its observable
+    // behavior actually matches atl-core's parser, since this crate accepts
+    // no hash format atl-core itself would reject.
+
+    #[test]
+    fn test_decode_hash_hex_valid_lowercase() {
+        let result = decode_hash_hex(TEST_ROOT_HASH);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_decode_hash_hex_rejects_bare_hex_without_prefix() {
+        // No "sha256:" prefix at all - atl-core's `parse_hash` rejects this,
+        // and so must we (this is exactly the discrepancy this fix closes:
+        // the old bespoke decoder in this file used to accept this).
+        let bare = "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let result = decode_hash_hex(bare);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing sha256: prefix"));
+    }
+
+    #[test]
+    fn test_decode_hash_hex_rejects_uppercase_prefix() {
+        // "SHA256:" (uppercase) is a different, unrecognized prefix to
+        // atl-core's `parse_hash` - it does not case-fold the prefix.
+        let uppercase_prefix =
+            "SHA256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+        let result = decode_hash_hex(uppercase_prefix);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing sha256: prefix"));
+    }
+
+    #[test]
+    fn test_decode_hash_hex_accepts_mixed_case_hex_digits() {
+        // Unlike the prefix, the hex *digits* after it are case-insensitive
+        // in both `hex::decode` and atl-core's `parse_hash` (which uses the
+        // same `hex` crate) - "AbCd" and "abcd" decode to the same bytes.
+        let mixed_case = "sha256:1234567890ABCDEF1234567890abcdef1234567890ABCDEF1234567890abcdef";
+        let lower = decode_hash_hex(TEST_ROOT_HASH).expect("lowercase must parse");
+        let mixed = decode_hash_hex(mixed_case).expect("mixed-case hex digits must parse");
+        assert_eq!(lower, mixed);
+    }
+
+    #[test]
+    fn test_decode_hash_hex_rejects_empty_string() {
+        let result = decode_hash_hex("");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing sha256: prefix"));
+    }
+
     fn create_test_receipt() -> Receipt {
         // Use a fixed UUID for testing (v4 format)
         let test_uuid = "550e8400-e29b-41d4-a716-446655440000"
@@ -655,7 +736,8 @@ mod tests {
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hex"));
+        // Message now comes from `atl_core::parse_hash` via `decode_hash_hex`.
+        assert!(result.error.unwrap().contains("hex decode error"));
     }
 
     #[test]
@@ -669,7 +751,8 @@ mod tests {
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hash length"));
+        // Message now comes from `atl_core::parse_hash` via `decode_hash_hex`.
+        assert!(result.error.unwrap().contains("invalid hash length"));
     }
 
     #[test]
@@ -777,7 +860,8 @@ mod tests {
         .await;
         assert!(!result.verified);
         assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hex"));
+        // Message now comes from `atl_core::parse_hash` via `decode_hash_hex`.
+        assert!(result.error.unwrap().contains("hex decode error"));
     }
 
     #[tokio::test]
@@ -793,7 +877,8 @@ mod tests {
         .await;
         assert!(!result.verified);
         assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hash length"));
+        // Message now comes from `atl_core::parse_hash` via `decode_hash_hex`.
+        assert!(result.error.unwrap().contains("invalid hash length"));
     }
 
     #[test]
