@@ -7,11 +7,26 @@
 //! material must come from the caller, through an explicit interface, never
 //! from anything this binary ships with.
 //!
-//! This module is that interface for RFC 3161 anchors: `--tsa-trust-store
-//! <path>` (see [`crate::cli::VerifyArgs::tsa_trust_store`]) names a file or
-//! directory of certificates the caller has decided to trust through some
-//! external, trusted channel. Nothing here decides *which* certificates to
-//! trust -- it only parses what the caller already chose.
+//! This module is that interface for RFC 3161 anchors. Two flags feed it,
+//! and their roles are kept strictly apart:
+//!
+//! - `--tsa-trust-store <path>` (see
+//!   [`crate::cli::VerifyArgs::tsa_trust_store`]) names certificates the
+//!   caller has decided, through some external trusted channel, to treat as
+//!   **trust anchors**: a chain that reaches one of them terminates
+//!   successfully.
+//! - `--tsa-intermediates <path>` (see
+//!   [`crate::cli::VerifyArgs::tsa_intermediates`]) supplies certificates
+//!   merely used to **bridge a gap** in a token's own certificate set. They
+//!   confer no trust of their own: a chain walking through one still has to
+//!   reach an anchor.
+//!
+//! Keeping them apart matters. Sectigo and DigiCert tokens name a "root"
+//! that is itself cross-signed by a legacy root absent from the token; the
+//! only way to complete such a chain used to be feeding the missing issuer
+//! in as an *anchor*, which silently moves the trust boundary outward.
+//! Nothing here decides *which* certificates to trust -- it only parses what
+//! the caller already chose, and files each under the role the caller named.
 
 use std::path::{Path, PathBuf};
 
@@ -21,32 +36,59 @@ use x509_cert::Certificate;
 
 use crate::error::{CliError, CliResult};
 
-/// Load a [`TrustStore`] of RFC 3161 trust anchors from `path`.
+/// Load RFC 3161 trust **anchors** from `path` into a fresh [`TrustStore`].
 ///
 /// `path` may be:
 /// - a single file containing one or more PEM-encoded certificates
 ///   (concatenated, as in a typical CA bundle), or a single DER-encoded
 ///   certificate;
-/// - a directory, in which every regular, non-hidden file is loaded the
-///   same way and all resulting certificates become anchors.
+/// - a directory, in which every non-hidden regular file is loaded the same
+///   way (not recursive -- see [`list_certificate_files`] for how symlinks
+///   are treated).
 ///
-/// Every certificate found is registered as a trust **anchor**
-/// (`TrustStore::with_anchor_certificate`), matching the flag's purpose:
-/// naming roots the caller already trusts, not intermediates to bridge a
-/// gap. A trust anchor need not be self-signed -- see [`TrustStore`]'s own
-/// docs for why (Sectigo/DigiCert cross-signed roots).
+/// Every certificate found is registered with
+/// [`TrustStore::with_anchor_certificate`]. A trust anchor need not be
+/// self-signed -- see [`TrustStore`]'s own docs for why.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::TrustStoreError`] if `path` does not exist, cannot
 /// be read, contains no certificates, or contains a file that fails to
-/// parse as a PEM certificate chain or a single DER certificate. Malformed
-/// trust material is refused rather than silently skipped: a mistyped path
-/// or a corrupted file should produce an error, not a trust store quietly
-/// missing an anchor the caller meant to configure.
+/// parse. Malformed trust material is refused rather than silently skipped:
+/// a mistyped path or a corrupted file must produce an error, not a trust
+/// store quietly missing an anchor the caller meant to configure.
 pub fn load_tsa_trust_store(path: &Path) -> CliResult<TrustStore> {
+    let certs = load_certificates(path, "trust store")?;
+    Ok(certs
+        .into_iter()
+        .fold(TrustStore::new(), TrustStore::with_anchor_certificate))
+}
+
+/// Add **intermediate** certificates from `path` to `store`.
+///
+/// Same file/directory rules as [`load_tsa_trust_store`], but every
+/// certificate is registered with
+/// [`TrustStore::with_intermediate_certificate`]: chain construction may
+/// walk through them, and they never terminate a chain by themselves. This
+/// is what lets a cross-signed Sectigo/DigiCert chain be completed without
+/// promoting the missing issuer to a trust anchor.
+///
+/// # Errors
+///
+/// As [`load_tsa_trust_store`].
+pub fn load_tsa_intermediates(store: TrustStore, path: &Path) -> CliResult<TrustStore> {
+    let certs = load_certificates(path, "intermediates")?;
+    Ok(certs
+        .into_iter()
+        .fold(store, TrustStore::with_intermediate_certificate))
+}
+
+/// Parse every certificate under `path`, which may be a file or a directory.
+///
+/// `role` names the flag being loaded, for error messages only.
+fn load_certificates(path: &Path, role: &str) -> CliResult<Vec<Certificate>> {
     let files = if path.is_dir() {
-        list_certificate_files(path)?
+        list_certificate_files(path, role)?
     } else {
         vec![path.to_path_buf()]
     };
@@ -58,35 +100,62 @@ pub fn load_tsa_trust_store(path: &Path) -> CliResult<TrustStore> {
 
     if certs.is_empty() {
         return Err(CliError::TrustStoreError(format!(
-            "no certificates found under trust store path: {}",
+            "no certificates found under {role} path: {}",
             path.display()
         )));
     }
 
-    Ok(certs
-        .into_iter()
-        .fold(TrustStore::new(), TrustStore::with_anchor_certificate))
+    Ok(certs)
 }
 
-/// List regular, non-hidden files directly inside `dir` (not recursive),
-/// sorted for deterministic loading order.
-fn list_certificate_files(dir: &Path) -> CliResult<Vec<PathBuf>> {
-    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| CliError::file_read_error(dir, e))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|p| p.is_file())
-        .filter(|p| {
-            !p.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'))
-        })
-        .collect();
+/// List the certificate files directly inside `dir`, sorted for
+/// deterministic loading order.
+///
+/// # What is included
+///
+/// Non-hidden entries that resolve to a regular file. `Path::is_file`
+/// follows symlinks, and that is deliberate: a symlink placed in the
+/// directory pointing at a certificate elsewhere is an explicit instruction
+/// from the caller to load that certificate, exactly like a copy of it would
+/// be. Symlinks pointing at directories are skipped, as are real
+/// subdirectories -- loading is never recursive, so a symlinked directory
+/// cannot smuggle in a tree of certificates (or a symlink loop).
+///
+/// # Errors
+///
+/// Returns [`CliError::TrustStoreError`] if the directory holds no
+/// candidate files, and [`CliError::FileReadError`] if the directory cannot
+/// be read **or if any individual entry cannot be read**. A failed
+/// `DirEntry` used to be dropped silently here, which could load a trust
+/// store missing an anchor without a word of warning; for trust material,
+/// partial success is not success.
+fn list_certificate_files(dir: &Path, role: &str) -> CliResult<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|e| CliError::file_read_error(dir, e))? {
+        let entry = entry.map_err(|e| CliError::file_read_error(dir, e))?;
+        let path = entry.path();
+
+        let hidden = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with('.'));
+        if hidden {
+            continue;
+        }
+
+        // `is_file` follows symlinks; a broken symlink or a directory both
+        // answer `false` and are skipped. See this function's doc comment.
+        if !path.is_file() {
+            continue;
+        }
+
+        entries.push(path);
+    }
     entries.sort();
 
     if entries.is_empty() {
         return Err(CliError::TrustStoreError(format!(
-            "no certificate files found in directory: {}",
+            "no certificate files found in {role} directory: {}",
             dir.display()
         )));
     }
@@ -249,5 +318,89 @@ Z8tQnULzKpK5V3331Z4vAMn1FDvwtg==
     fn looks_like_pem_detects_boundary_marker() {
         assert!(looks_like_pem(b"-----BEGIN CERTIFICATE-----\nabc\n"));
         assert!(!looks_like_pem(&[0x30, 0x82, 0x01, 0x0a]));
+    }
+
+    #[test]
+    fn intermediates_load_from_file_and_directory() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("inter.pem");
+        std::fs::write(&file, TEST_CERT_PEM).unwrap();
+
+        let store =
+            load_tsa_intermediates(TrustStore::new(), &file).expect("intermediates file must load");
+        // Intermediates compose with anchors rather than replacing them.
+        let combined = load_tsa_intermediates(store, dir.path());
+        assert!(
+            combined.is_ok(),
+            "directory of intermediates must load: {combined:?}"
+        );
+    }
+
+    #[test]
+    fn intermediates_reject_bad_material_loudly() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("not-a-cert.txt");
+        std::fs::write(&file, b"garbage").unwrap();
+
+        assert!(load_tsa_intermediates(TrustStore::new(), &file).is_err());
+        assert!(load_tsa_intermediates(TrustStore::new(), Path::new("/nonexistent/x")).is_err());
+    }
+
+    /// A symlink pointing at a certificate outside the directory IS loaded:
+    /// placing it there is an explicit instruction from the caller. See
+    /// `list_certificate_files`.
+    #[test]
+    #[cfg(unix)]
+    fn directory_follows_symlinks_to_files() {
+        let outside = TempDir::new().unwrap();
+        let real_cert = outside.path().join("real-root.pem");
+        std::fs::write(&real_cert, TEST_CERT_PEM).unwrap();
+
+        let dir = TempDir::new().unwrap();
+        std::os::unix::fs::symlink(&real_cert, dir.path().join("link.pem")).unwrap();
+
+        let store = load_tsa_trust_store(dir.path());
+        assert!(
+            store.is_ok(),
+            "symlink to a certificate must be loaded: {store:?}"
+        );
+    }
+
+    /// A symlink pointing at a directory is skipped, exactly like a real
+    /// subdirectory: loading is never recursive.
+    #[test]
+    #[cfg(unix)]
+    fn directory_skips_symlinks_to_directories() {
+        let nested = TempDir::new().unwrap();
+        // Contents that would fail to parse if they were ever loaded.
+        std::fs::write(nested.path().join("junk.pem"), b"not a certificate").unwrap();
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("root.pem"), TEST_CERT_PEM).unwrap();
+        std::os::unix::fs::symlink(nested.path(), dir.path().join("nested")).unwrap();
+        std::fs::create_dir(dir.path().join("real-subdir")).unwrap();
+
+        let store = load_tsa_trust_store(dir.path());
+        assert!(
+            store.is_ok(),
+            "directory symlinks must be skipped, not descended into: {store:?}"
+        );
+    }
+
+    /// A broken symlink resolves to neither file nor directory and is
+    /// skipped rather than aborting the load.
+    #[test]
+    #[cfg(unix)]
+    fn directory_skips_broken_symlinks() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("root.pem"), TEST_CERT_PEM).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("does-not-exist.pem"),
+            dir.path().join("dangling.pem"),
+        )
+        .unwrap();
+
+        let store = load_tsa_trust_store(dir.path());
+        assert!(store.is_ok(), "broken symlink must be skipped: {store:?}");
     }
 }

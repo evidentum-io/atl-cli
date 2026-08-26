@@ -8,12 +8,17 @@ use atl_core::TrustStore;
 use crate::error::{CliError, CliResult};
 use crate::verify::consistency::{verify_consistency, ConsistencyResult};
 use crate::verify::single::{verify_single, SingleVerificationResult};
+use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
 
 /// Result of a single file in batch mode
 #[derive(Debug)]
 pub enum BatchItemResult {
-    /// Verification succeeded
+    /// Verification succeeded (including unanchored Receipt-Lite items,
+    /// which carry [`Status::Pending`])
     Valid(SingleVerificationResult),
+    /// Nothing refuted, but the item's anchors did not reach a configured
+    /// trust root
+    Untrusted(SingleVerificationResult),
     /// Verification failed (cryptographic or hash)
     Invalid(SingleVerificationResult),
     /// Error during verification
@@ -38,6 +43,8 @@ pub struct BatchVerificationResult {
     pub consistency: Option<ConsistencyResult>,
     /// Count of valid files
     pub valid_count: usize,
+    /// Count of files whose anchors reached no configured trust root
+    pub untrusted_count: usize,
     /// Count of invalid files
     pub invalid_count: usize,
     /// Count of errors
@@ -47,12 +54,73 @@ pub struct BatchVerificationResult {
 }
 
 impl BatchVerificationResult {
+    /// The batch's aggregate verdict, derived from the same per-receipt
+    /// classification every item used — never re-derived here.
+    ///
+    /// A single refuted item makes the whole batch refuted. Failing that, a
+    /// single item lacking trust material makes the batch untrusted: a batch
+    /// is only accepted when every item was accepted.
+    #[must_use]
+    pub fn verdict(&self) -> ReceiptVerdict {
+        if self.invalid_count > 0 || self.error_count > 0 {
+            return ReceiptVerdict::invalid(ReasonCode::BatchItemsInvalid);
+        }
+        if self.consistency.as_ref().is_some_and(|c| !c.is_valid()) {
+            return ReceiptVerdict::invalid(ReasonCode::LogConsistencyFailed);
+        }
+        if self.untrusted_count > 0 {
+            return ReceiptVerdict::untrusted(ReasonCode::BatchItemsUntrusted);
+        }
+        ReceiptVerdict::VALID
+    }
+
     /// Check if overall batch is valid (all files valid + consistent)
     #[must_use]
+    #[allow(dead_code)] // exercised by unit tests; kept as the readable predicate
     pub fn is_valid(&self) -> bool {
-        self.invalid_count == 0
-            && self.error_count == 0
-            && self.consistency.as_ref().is_none_or(|c| c.is_valid())
+        matches!(self.verdict().status, Status::Valid | Status::Pending)
+    }
+
+    /// Re-bucket every verified item and recompute the counts from each
+    /// item's current [`SingleVerificationResult::verdict`].
+    ///
+    /// Called after the online pass has upgraded `bitcoin_ots` anchors in
+    /// place: an item that was `Untrusted` only because no block had been
+    /// fetched becomes `Valid` (or `Invalid`) once it has been. `error_count`
+    /// and the unmatched items are untouched -- going online cannot change
+    /// whether a file could be read or matched.
+    pub fn reclassify(&mut self) {
+        let mut valid_count = 0;
+        let mut untrusted_count = 0;
+        let mut invalid_count = 0;
+
+        let items = std::mem::take(&mut self.items);
+        self.items = items
+            .into_iter()
+            .map(|item| match item {
+                BatchItemResult::Valid(result)
+                | BatchItemResult::Untrusted(result)
+                | BatchItemResult::Invalid(result) => match result.verdict().status {
+                    Status::Valid | Status::Pending => {
+                        valid_count += 1;
+                        BatchItemResult::Valid(result)
+                    }
+                    Status::Untrusted => {
+                        untrusted_count += 1;
+                        BatchItemResult::Untrusted(result)
+                    }
+                    Status::Invalid => {
+                        invalid_count += 1;
+                        BatchItemResult::Invalid(result)
+                    }
+                },
+                other => other,
+            })
+            .collect();
+
+        self.valid_count = valid_count;
+        self.untrusted_count = untrusted_count;
+        self.invalid_count = invalid_count;
     }
 }
 
@@ -187,22 +255,31 @@ pub fn verify_batch(
     let mut items = Vec::new();
     let mut valid_results = Vec::new();
     let mut valid_count = 0;
+    let mut untrusted_count = 0;
     let mut invalid_count = 0;
     let mut error_count = 0;
 
     // Verify each matched pair
     for (source_path, receipt_path) in matched {
         match verify_single(&source_path, &receipt_path, trust_store) {
-            Ok(result) => {
-                if result.is_valid() {
+            Ok(result) => match result.verdict().status {
+                Status::Valid | Status::Pending => {
                     valid_count += 1;
                     valid_results.push(result.clone());
                     items.push(BatchItemResult::Valid(result));
-                } else {
+                }
+                Status::Untrusted => {
+                    untrusted_count += 1;
+                    // Still a structurally sound receipt from this log, so
+                    // it takes part in cross-receipt consistency checking.
+                    valid_results.push(result.clone());
+                    items.push(BatchItemResult::Untrusted(result));
+                }
+                Status::Invalid => {
                     invalid_count += 1;
                     items.push(BatchItemResult::Invalid(result));
                 }
-            }
+            },
             Err(e) => {
                 error_count += 1;
                 items.push(BatchItemResult::Error {
@@ -243,6 +320,7 @@ pub fn verify_batch(
         items,
         consistency,
         valid_count,
+        untrusted_count,
         invalid_count,
         error_count,
         unmatched_count,
@@ -314,6 +392,7 @@ mod tests {
             items: vec![],
             consistency: None,
             valid_count: 5,
+            untrusted_count: 0,
             invalid_count: 0,
             error_count: 0,
             unmatched_count: 0,
@@ -327,6 +406,7 @@ mod tests {
             items: vec![],
             consistency: None,
             valid_count: 3,
+            untrusted_count: 0,
             invalid_count: 2,
             error_count: 0,
             unmatched_count: 0,
@@ -340,6 +420,7 @@ mod tests {
             items: vec![],
             consistency: None,
             valid_count: 3,
+            untrusted_count: 0,
             invalid_count: 0,
             error_count: 1,
             unmatched_count: 0,

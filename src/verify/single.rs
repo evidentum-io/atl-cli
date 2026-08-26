@@ -3,11 +3,14 @@
 use std::path::Path;
 
 use atl_core::{
-    verify_receipt_with_options, Receipt, TrustStore, VerificationResult, VerifyOptions,
+    verify_receipt_with_options, Receipt, TrustStore, VerificationError, VerificationResult,
+    VerifyOptions,
 };
 
 use crate::error::{CliError, CliResult};
+use crate::verify::anchor::{verify_anchors_offline, AnchorVerdict, AnchorVerificationResult};
 use crate::verify::file::{compare_hash, hash_file, MAX_RECEIPT_SIZE};
+use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
 
 /// Super-Tree proof verdict — only constructible (and only exists at all)
 /// when the receipt actually carries a `super_proof`.
@@ -107,33 +110,93 @@ pub struct SingleVerificationResult {
     pub file_hash_valid: bool,
     /// Core verification result from atl-core
     pub core_result: VerificationResult,
+    /// Per-anchor verdicts, computed by this crate rather than collapsed to
+    /// `atl-core`'s `is_valid: bool` — this is what makes the difference
+    /// between "refuted" and "no trust root configured" visible.
+    ///
+    /// RFC 3161 anchors are judged completely here (their verification is
+    /// pure computation). `bitcoin_ots` anchors carry their network-free
+    /// verdict until [`crate::verify::online`] upgrades them in place.
+    pub anchor_results: Vec<AnchorVerificationResult>,
 }
 
 impl SingleVerificationResult {
-    /// Check if all verifications passed
+    /// The single classification authority for one receipt.
     ///
-    /// Verification is valid if:
-    /// - File hash matches payload_hash
-    /// - Core cryptographic proofs are valid (inclusion, super_proof if present)
+    /// Every consumer — `is_valid`, both renderers, the batch aggregate and
+    /// the process exit code — derives from this method. Nothing re-derives
+    /// a status of its own.
     ///
-    /// Note: `NoTrustAnchor` error is NOT considered a failure for genuinely
-    /// unanchored (Receipt-Lite) receipts -- see [`Self::is_lite_valid`] for
-    /// exactly what "genuinely unanchored" means and why `receipt.anchors`
-    /// must be empty, not just "no anchor happened to verify".
+    /// # Order of judgement
+    ///
+    /// 1. A source file whose hash does not match the receipt refutes
+    ///    everything downstream, so it is checked first.
+    /// 2. Structural failures `atl-core` reported (bad inclusion proof,
+    ///    checkpoint mismatch, malformed receipt, …) are refutations.
+    ///    `NoTrustAnchor` is not one of them: it only means "zero anchors
+    ///    ended up valid", which this method decides for itself, with more
+    ///    information, in step 4.
+    /// 3. A receipt with no anchors at all is [`Status::Pending`].
+    /// 4. Otherwise the anchors decide: any refuted anchor makes the receipt
+    ///    [`Status::Invalid`]; failing that, any anchor missing trust
+    ///    material makes it [`Status::Untrusted`]; only if every anchor is
+    ///    accepted is the receipt [`Status::Valid`].
     #[must_use]
-    pub fn is_valid(&self) -> bool {
+    pub fn verdict(&self) -> ReceiptVerdict {
         if !self.file_hash_valid {
-            return false;
+            return ReceiptVerdict::invalid(ReasonCode::FileHashMismatch);
         }
 
-        // Check if core verification passed
-        if self.core_result.is_valid {
-            return true;
+        if let Some(reason) = self.core_result.errors.iter().find_map(map_core_error) {
+            return ReceiptVerdict::invalid(reason);
         }
 
-        // If not valid, the only carve-out is a genuinely unanchored
-        // (Receipt-Lite) receipt whose only "error" is NoTrustAnchor.
-        self.is_lite_valid()
+        // Defence in depth: `atl-core` reports each of these as an error
+        // too, but a proof flag must never be able to be false while the
+        // receipt is reported as anything but refuted.
+        let proofs = self.proof_verdict();
+        if !proofs.inclusion_valid {
+            return ReceiptVerdict::invalid(ReasonCode::InclusionProofInvalid);
+        }
+        if let Some(super_proof) = proofs.super_proof {
+            if !super_proof.inclusion_valid {
+                return ReceiptVerdict::invalid(ReasonCode::SuperInclusionProofInvalid);
+            }
+            if !super_proof.consistency_valid {
+                return ReceiptVerdict::invalid(ReasonCode::SuperConsistencyProofInvalid);
+            }
+        }
+
+        if self.receipt.anchors.is_empty() {
+            return ReceiptVerdict::pending();
+        }
+
+        // A refutation anywhere outranks missing trust material everywhere.
+        if let Some(reason) = self.anchor_results.iter().find_map(|a| match a.verdict {
+            AnchorVerdict::Invalid(code) => Some(code),
+            _ => None,
+        }) {
+            return ReceiptVerdict::invalid(reason);
+        }
+        if let Some(reason) = self.anchor_results.iter().find_map(|a| match a.verdict {
+            AnchorVerdict::Untrusted(code) => Some(code),
+            _ => None,
+        }) {
+            return ReceiptVerdict::untrusted(reason);
+        }
+
+        ReceiptVerdict::VALID
+    }
+
+    /// Check if all verifications passed.
+    ///
+    /// `true` only for [`Status::Valid`] and [`Status::Pending`] — never for
+    /// [`Status::Untrusted`], which is not an acceptable outcome however
+    /// sound the cryptography behind it is.
+    #[must_use]
+    #[allow(dead_code)] // exercised by unit tests; kept as the readable predicate
+    pub fn is_valid(&self) -> bool {
+        matches!(self.verdict().status, Status::Valid | Status::Pending)
     }
 
     /// Compute the canonical cryptographic-proof verdict for this result.
@@ -146,64 +209,53 @@ impl SingleVerificationResult {
         ProofVerdict::compute(&self.core_result, self.receipt.super_proof.is_some())
     }
 
-    /// Check if this is a valid "lite" receipt (no anchors)
+    /// Check if this is a valid "lite" receipt: cryptographically sound and
+    /// carrying no anchors at all.
     ///
-    /// Returns true if:
-    /// - The receipt carries NO anchors at all (genuinely Receipt-Lite --
-    ///   see below for why this is required, not just "no anchor verified")
-    /// - File hash matches
-    /// - Basic inclusion proof is valid
-    /// - If super_proof exists: super proofs are valid
-    /// - If super_proof is None: super proof checks are skipped
-    /// - The only "error" is NoTrustAnchor
-    ///
-    /// # Why `receipt.anchors.is_empty()` is required
+    /// # Why "no anchors at all" is required
     ///
     /// `atl-core`'s `NoTrustAnchor` error fires whenever zero anchors ended
-    /// up valid -- which is also exactly what happens for a receipt that
-    /// DOES carry an RFC 3161 anchor whose crypto is sound but whose
-    /// terminal certificate is merely `Assumed` (no `--tsa-trust-store`
-    /// supplied, or it didn't name that root). Without this guard, such a
-    /// receipt would be misreported as "PENDING (unanchored)" -- structurally
-    /// dishonest: it isn't unanchored, its anchor's root just isn't trusted.
-    /// Per the ATL trust-model decisions, `Assumed` must never be presented
-    /// as an acceptable outcome, including this soft "lite" one; it must
-    /// surface as `INVALID` alongside the anchor's own diagnostic.
+    /// up valid — which is also what happens for a receipt that DOES carry
+    /// an RFC 3161 anchor whose cryptography is sound but whose terminal
+    /// certificate nobody vouches for. Reporting that as "PENDING
+    /// (unanchored)" would be dishonest: the receipt is anchored, its
+    /// anchor's root simply isn't trusted. That case is
+    /// [`Status::Untrusted`], and this method is `false` for it.
     #[must_use]
+    #[allow(dead_code)] // exercised by unit tests; kept as the readable predicate
     pub fn is_lite_valid(&self) -> bool {
-        use atl_core::VerificationError;
+        matches!(self.verdict().status, Status::Pending)
+    }
+}
 
-        if !self.receipt.anchors.is_empty() {
-            return false;
+/// Map an `atl-core` verification error to a stable reason code, or `None`
+/// for errors that are not, by themselves, refutations of the evidence.
+///
+/// `NoTrustAnchor` and `AnchorFailed` are deliberately `None`: they report
+/// the *aggregate* anchor outcome, which [`SingleVerificationResult::verdict`]
+/// computes itself from the richer per-anchor verdicts. Mapping them here
+/// would collapse "root not trusted" back into "refuted", which is precisely
+/// the conflation this design removes.
+fn map_core_error(error: &VerificationError) -> Option<ReasonCode> {
+    match error {
+        VerificationError::NoTrustAnchor | VerificationError::AnchorFailed { .. } => None,
+        VerificationError::SignatureFailed => Some(ReasonCode::CheckpointSignatureInvalid),
+        VerificationError::InclusionProofFailed { .. } => Some(ReasonCode::InclusionProofInvalid),
+        VerificationError::SuperInclusionFailed { .. } => {
+            Some(ReasonCode::SuperInclusionProofInvalid)
         }
-
-        if !self.file_hash_valid {
-            return false;
+        VerificationError::ConsistencyProofFailed { .. }
+        | VerificationError::SuperConsistencyFailed { .. } => {
+            Some(ReasonCode::SuperConsistencyProofInvalid)
         }
-
-        // Basic inclusion proof MUST be valid
-        if !self.core_result.inclusion_valid {
-            return false;
-        }
-
-        // Super proof checks depend on whether super_proof exists
-        // When super_proof is None, atl-core returns super_inclusion_valid=false
-        // and super_consistency_valid=false - this is expected, not a failure
-        if self.receipt.super_proof.is_some() {
-            // If super_proof exists, it must be valid
-            if !self.core_result.super_inclusion_valid || !self.core_result.super_consistency_valid
-            {
-                return false;
-            }
-        }
-        // If super_proof is None, we skip these checks entirely
-
-        // Check if the only "error" is NoTrustAnchor
-        self.core_result.errors.len() == 1
-            && matches!(
-                self.core_result.errors.first(),
-                Some(VerificationError::NoTrustAnchor)
-            )
+        VerificationError::RootHashMismatch => Some(ReasonCode::CheckpointRootHashMismatch),
+        VerificationError::TreeSizeMismatch => Some(ReasonCode::CheckpointTreeSizeMismatch),
+        VerificationError::MetadataHashMismatch { .. } => Some(ReasonCode::MetadataHashMismatch),
+        VerificationError::InvalidReceipt(_)
+        | VerificationError::InvalidHash { .. }
+        | VerificationError::SuperDataMismatch { .. }
+        | VerificationError::MissingSuperProof
+        | VerificationError::UnsupportedVersion(_) => Some(ReasonCode::ReceiptMalformed),
     }
 }
 
@@ -279,13 +331,11 @@ pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
 /// - File exceeds size limits
 ///
 /// `trust_store` carries whatever RFC 3161 trust material the caller passed
-/// via `--tsa-trust-store` (or `None` if they passed nothing). RFC 3161
-/// certificate-chain verification is pure computation (no network access),
-/// so it runs here in the offline pass too -- an anchor's chain terminating
-/// `Assumed` (no matching trust store) is why `core_result.is_valid` can be
-/// `false` here even for an otherwise cryptographically sound receipt; see
-/// [`SingleVerificationResult::is_lite_valid`] for why that must NOT be
-/// reported as the softer "unanchored" outcome.
+/// via `--tsa-trust-store` / `--tsa-intermediates` (or `None` if they passed
+/// nothing). RFC 3161 certificate-chain verification is pure computation --
+/// no network access -- so every anchor is judged here, in this one pass,
+/// and the result is identical whether or not the CLI later goes online.
+/// Only `bitcoin_ots` anchors have anything left to do online.
 pub fn verify_single(
     source_path: &Path,
     receipt_path: &Path,
@@ -300,17 +350,22 @@ pub fn verify_single(
     // Compare hash with receipt
     let file_hash_valid = compare_hash(&file_hash, &receipt.entry.payload_hash);
 
-    // Verify cryptographic proofs using anchor-only verification
-    // ATL Protocol v2.0: NO PUBLIC KEY REQUIRED - trust from anchors.
-    // `rfc3161_trust_store` is threaded straight from the CLI flag -- never
-    // derived from the receipt or the token itself (see the ATL trust-model
-    // decisions doc: no identity lives in the protocol implementation).
+    // Verify the receipt's structure and proofs with atl-core. Anchors are
+    // skipped here on purpose: `atl-core` collapses each one to a bare
+    // `is_valid: bool`, which cannot distinguish a refuted anchor from one
+    // whose root simply isn't in our trust store. This crate verifies them
+    // itself, below, keeping the full fact set.
     let options = VerifyOptions {
-        rfc3161_trust_store: trust_store.cloned(),
+        skip_anchors: true,
         ..Default::default()
     };
     let core_result = verify_receipt_with_options(&receipt, options)
         .map_err(|e| CliError::VerificationFailed(e.to_string()))?;
+
+    // `trust_store` is threaded straight from the CLI flags -- never derived
+    // from the receipt or the token itself (see the ATL trust-model
+    // decisions doc: no identity lives in the protocol implementation).
+    let anchor_results = verify_anchors_offline(&receipt, trust_store);
 
     Ok(SingleVerificationResult {
         source_path: source_path.to_path_buf(),
@@ -319,6 +374,7 @@ pub fn verify_single(
         receipt,
         file_hash_valid,
         core_result,
+        anchor_results,
     })
 }
 
@@ -369,6 +425,7 @@ mod tests {
             receipt: create_test_receipt(),
             file_hash_valid: true,
             core_result: create_test_verification_result(true),
+            anchor_results: vec![],
         };
 
         assert!(result.is_valid());
@@ -383,6 +440,7 @@ mod tests {
             receipt: create_test_receipt(),
             file_hash_valid: false,
             core_result: create_test_verification_result(true),
+            anchor_results: vec![],
         };
 
         assert!(!result.is_valid());
@@ -397,6 +455,7 @@ mod tests {
             receipt: create_test_receipt(),
             file_hash_valid: true,
             core_result: create_test_verification_result(false),
+            anchor_results: vec![],
         };
 
         assert!(!result.is_valid());
@@ -419,6 +478,7 @@ mod tests {
             receipt,
             file_hash_valid: true,
             core_result,
+            anchor_results: vec![],
         };
 
         // NoTrustAnchor alone should be treated as valid for offline mode
@@ -435,6 +495,7 @@ mod tests {
             receipt: create_test_receipt(),
             file_hash_valid: true,
             core_result: create_test_verification_result(true),
+            anchor_results: vec![],
         };
 
         let cloned = result.clone();
@@ -461,6 +522,7 @@ mod tests {
             file_hash_valid: true,
             receipt,
             core_result,
+            anchor_results: vec![],
         };
 
         assert!(result.is_lite_valid());
@@ -484,6 +546,7 @@ mod tests {
             file_hash_valid: false, // Hash mismatch
             receipt,
             core_result,
+            anchor_results: vec![],
         };
 
         assert!(!result.is_lite_valid());
@@ -508,6 +571,7 @@ mod tests {
             file_hash_valid: true,
             receipt,
             core_result,
+            anchor_results: vec![],
         };
 
         assert!(!result.is_lite_valid());
@@ -534,6 +598,7 @@ mod tests {
             file_hash_valid: true,
             receipt,
             core_result,
+            anchor_results: vec![],
         };
 
         assert!(!result.is_lite_valid());
@@ -745,6 +810,7 @@ mod tests {
             file_hash_valid: true,
             receipt: receipt.clone(),
             core_result: core_result.clone(),
+            anchor_results: vec![],
         };
         // With super_proof present, the broken super_inclusion must fail proofs_valid.
         assert!(!result_with_super.proof_verdict().proofs_valid());
@@ -757,6 +823,7 @@ mod tests {
             file_hash_valid: true,
             receipt,
             core_result,
+            anchor_results: vec![],
         };
         // With no super_proof, the (irrelevant) broken super fields are ignored.
         assert!(result_without_super.proof_verdict().proofs_valid());

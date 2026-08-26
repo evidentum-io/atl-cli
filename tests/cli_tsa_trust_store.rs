@@ -11,10 +11,10 @@
 //! -print_certs`, used here purely as *a* certificate to pin, not because
 //! it is specially trustworthy) is embedded below for `--tsa-trust-store`.
 //!
-//! This receipt carries no `bitcoin_ots` anchor, so `--online` here never
-//! makes a network call for anchor confirmation (RFC 3161 verification is
-//! pure computation) -- it only needs connectivity for the `--online` flag's
-//! own gate ([`VerifyArgs::determine_mode_for_receipt`]).
+//! This receipt carries no `bitcoin_ots` anchor, so nothing here needs the
+//! network at all: RFC 3161 verification is pure computation. These tests
+//! therefore pass no `--online` flag and make no connectivity probe -- and
+//! that is itself part of what they pin down.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -69,9 +69,13 @@ fn real_data_path(name: &str) -> PathBuf {
 /// Without `--tsa-trust-store`, a real RFC 3161 anchor whose chain
 /// terminates in a genuine self-signed (but un-pinned) root must NEVER be
 /// reported valid -- in the exit code, the JSON `status`/`verified`/
-/// `trust_state`, or the human-readable status line. This is the exact
-/// requirement the whole rewrite exists to enforce: `Assumed` is not a
-/// partial success.
+/// `trust_state`, or the human-readable status line.
+///
+/// It must also not be reported as *broken*. Every cryptographic fact about
+/// this token holds; the only thing missing is a root this verifier was
+/// configured to trust. That is `untrusted` (exit 3), never `invalid`
+/// (exit 1): a caller must be able to tell "your evidence is damaged" from
+/// "bring me the trust root" without parsing the JSON.
 #[test]
 fn assumed_root_without_trust_store_never_reports_valid() {
     let source = real_data_path("testfile2.txt");
@@ -84,17 +88,17 @@ fn assumed_root_without_trust_store_never_reports_valid() {
             "verify",
             source.to_str().unwrap(),
             receipt.to_str().unwrap(),
-            "--online",
             "--json",
         ])
         .assert()
-        .code(1) // INVALID -- never 0
+        .code(3) // UNTRUSTED -- never 0, and never 1 either
         .get_output()
         .stdout
         .clone();
 
     let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(json["status"], "invalid");
+    assert_eq!(json["status"], "untrusted");
+    assert_eq!(json["reason_code"], "tsa_root_not_trusted");
     let anchors = json["anchor_verification"]["results"]
         .as_array()
         .expect("must have anchor results");
@@ -120,22 +124,34 @@ fn assumed_root_without_trust_store_never_reports_valid() {
             "verify",
             source.to_str().unwrap(),
             receipt.to_str().unwrap(),
-            "--online",
             "--no-color",
         ])
         .assert()
-        .code(1)
+        .code(3)
         .get_output()
         .stdout
         .clone();
     let human = String::from_utf8(human_output).unwrap();
     assert!(
-        human.contains("ASSUMED"),
-        "human output must name the Assumed state explicitly:\n{human}"
+        human.contains("NOT VERIFIED: trust root unavailable"),
+        "human output must name the untrusted state explicitly:\n{human}"
+    );
+    assert!(
+        human.contains("tsa_root_not_trusted"),
+        "human output must carry the stable reason code:\n{human}"
     );
     assert!(
         !human.contains("Status: VALID") && !human.contains("Status: TRUSTED"),
         "human output must not claim the anchor (or overall result) is valid/trusted:\n{human}"
+    );
+    assert!(
+        !human.contains("INVALID"),
+        "an unvouched-for root must never be presented as damaged evidence:\n{human}"
+    );
+    // The remedy must be actionable: name the certificate to supply.
+    assert!(
+        human.contains("--tsa-trust-store"),
+        "human output must say what to supply:\n{human}"
     );
 }
 
@@ -158,7 +174,6 @@ fn trusted_root_via_flag_reports_valid() {
             "verify",
             source.to_str().unwrap(),
             receipt.to_str().unwrap(),
-            "--online",
             "--json",
             "--tsa-trust-store",
             trust_store_path.to_str().unwrap(),
@@ -184,7 +199,6 @@ fn trusted_root_via_flag_reports_valid() {
         "verify",
         source.to_str().unwrap(),
         receipt.to_str().unwrap(),
-        "--online",
         "--no-color",
         "--tsa-trust-store",
         trust_store_path.to_str().unwrap(),
@@ -212,7 +226,6 @@ fn trusted_root_via_directory_trust_store_reports_valid() {
         "verify",
         source.to_str().unwrap(),
         receipt.to_str().unwrap(),
-        "--online",
         "--json",
         "--tsa-trust-store",
         dir.path().to_str().unwrap(),

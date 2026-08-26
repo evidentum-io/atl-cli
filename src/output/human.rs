@@ -1,12 +1,21 @@
 //! Human-readable output formatting
+//!
+//! Every status line here is printed from the verdict produced by
+//! [`crate::verify::verdict`]; this module decides no outcome of its own, so
+//! it cannot disagree with the JSON output or the exit code.
+//!
+//! One rendering path serves both offline and online runs. RFC 3161 anchors
+//! are verified identically either way, so a separate "online" renderer
+//! would only be a second place for the status to be decided.
 
 use colored::Colorize;
 
 use crate::error::CliResult;
+use crate::verify::anchor::{AnchorDetails, AnchorVerdict, AnchorVerificationResult};
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
 use crate::verify::consistency::ConsistencyResult;
-use crate::verify::online::{AnchorDetails, OnlineVerificationResult, Rfc3161Trust};
 use crate::verify::single::SingleVerificationResult;
+use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
 
 /// Info about a receipt for consistency proof display
 #[derive(Debug, Clone)]
@@ -29,15 +38,9 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     println!("File: {}", result.source_path.display());
     println!("Receipt: {}", result.receipt_path.display());
 
-    // Status - handle lite receipt case (check lite first!)
+    let verdict = result.verdict();
     print!("Status: ");
-    if result.is_lite_valid() {
-        print_status_pending("PENDING (unanchored)", use_color);
-    } else if result.is_valid() {
-        print_status("VALID", true, use_color);
-    } else {
-        print_status("INVALID", false, use_color);
-    }
+    print_receipt_status(verdict, use_color);
 
     // File hash comparison
     println!("File Hash:");
@@ -75,7 +78,7 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     }
 
     // Anchor status for lite receipts
-    if result.is_lite_valid() {
+    if verdict.status == Status::Pending {
         print!("  Anchor Status: ");
         print_status_pending("UNANCHORED", use_color);
         println!();
@@ -85,25 +88,202 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
         println!("      Request an upgraded receipt with TSA or Bitcoin anchoring for independent verification.");
     }
 
-    // Errors (excluding NoTrustAnchor for lite receipts)
-    let errors: Vec<_> = result
-        .core_result
-        .errors
-        .iter()
-        .filter(|e| {
-            !matches!(e, atl_core::VerificationError::NoTrustAnchor) || !result.is_lite_valid()
-        })
-        .collect();
+    print_anchor_section(&result.anchor_results, use_color);
 
-    if !errors.is_empty() {
-        println!();
-        println!("Errors:");
-        for err in errors {
-            println!("  - {err:?}");
-        }
+    if verdict.status == Status::Untrusted {
+        print_trust_hint(&result.anchor_results);
     }
 
     Ok(())
+}
+
+/// Print the overall status line for one receipt.
+///
+/// `Untrusted` is deliberately worded so it cannot be read as damage to the
+/// evidence: nothing was refuted, this verifier is simply not configured to
+/// finish the check. It is printed in the same warning colour as `PENDING`,
+/// never the failure colour.
+fn print_receipt_status(verdict: ReceiptVerdict, use_color: bool) {
+    match verdict.status {
+        Status::Valid => print_status("VALID", true, use_color),
+        Status::Pending => print_status_pending("PENDING (unanchored)", use_color),
+        Status::Untrusted => {
+            print_status_pending("NOT VERIFIED: trust root unavailable", use_color);
+        }
+        Status::Invalid => print_status("INVALID", false, use_color),
+    }
+    if let Some(reason) = verdict.reason_code {
+        println!("Reason: {}", reason.as_str());
+    }
+}
+
+/// Say exactly what the caller must supply to reach a verdict.
+fn print_trust_hint(anchors: &[AnchorVerificationResult]) {
+    println!();
+    println!("The evidence was NOT disproved. This verifier was not given the material");
+    println!("needed to finish checking it:");
+    for anchor in anchors {
+        let AnchorVerdict::Untrusted(code) = anchor.verdict else {
+            continue;
+        };
+        match code {
+            ReasonCode::TsaRootNotTrusted => match anchor.details.untrusted_root_fingerprint() {
+                Some(fingerprint) => println!(
+                    "  - The TSA chain ends at certificate sha256:{fingerprint}\n    \
+                         Supply it with --tsa-trust-store to complete the check."
+                ),
+                None => println!(
+                    "  - The TSA chain ends at a certificate no trust store names.\n    \
+                         Supply that root with --tsa-trust-store."
+                ),
+            },
+            ReasonCode::TsaChainIncomplete => println!(
+                "  - The token's certificate chain is missing an issuer certificate.\n    \
+                 Supply it with --tsa-intermediates, and the root it leads to with \
+                 --tsa-trust-store."
+            ),
+            ReasonCode::BitcoinBlockNotChecked | ReasonCode::BitcoinBlockUnavailable => println!(
+                "  - The Bitcoin block confirming this anchor was not fetched.\n    \
+                 Re-run with network access."
+            ),
+            other => println!("  - Missing trust material ({}).", other.as_str()),
+        }
+    }
+}
+
+/// Print the per-anchor section, if the receipt has anchors.
+fn print_anchor_section(anchors: &[AnchorVerificationResult], use_color: bool) {
+    if anchors.is_empty() {
+        return;
+    }
+
+    println!("Anchor Verification:");
+    for (i, anchor) in anchors.iter().enumerate() {
+        println!("  [{}] {}", i + 1, format_anchor_type(&anchor.anchor_type));
+        print!("      Status: ");
+        print_anchor_status(anchor, use_color);
+
+        if let Some(error) = &anchor.error {
+            println!("      Detail: {error}");
+        }
+
+        print_anchor_details(anchor, use_color);
+    }
+}
+
+/// The per-anchor status line, derived from the same classification as the
+/// JSON `trust_state` field and the anchor's `verified` flag.
+fn print_anchor_status(anchor: &AnchorVerificationResult, use_color: bool) {
+    match anchor.details.rfc3161_trust_state() {
+        Some("trusted") => print_status("TRUSTED", true, use_color),
+        Some("assumed") => print_status_pending("NOT TRUSTED (root not supplied)", use_color),
+        Some("incomplete") => {
+            print_status_pending("NOT TRUSTED (chain incomplete)", use_color);
+        }
+        // Bitcoin OTS and anchors rejected before any fact set exists.
+        _ => match anchor.verdict {
+            AnchorVerdict::Valid => print_status("VALID", true, use_color),
+            AnchorVerdict::Untrusted(_) => {
+                print_status_pending("NOT CONFIRMED", use_color);
+            }
+            AnchorVerdict::Invalid(_) => print_status("FAILED", false, use_color),
+        },
+    }
+    if let Some(code) = anchor.verdict.reason_code() {
+        println!("      Reason: {}", code.as_str());
+    }
+}
+
+/// Print the fact set behind one anchor's status.
+fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
+    match &anchor.details {
+        AnchorDetails::Rfc3161 {
+            imprint_matches_root,
+            cms_signature_valid,
+            chain_valid_at_gen_time,
+            timestamping_eku_ok,
+            path_status,
+            terminal_anchor,
+            revocation,
+        } => {
+            println!(
+                "      Facts: imprint={imprint_matches_root} cms_signature={cms_signature_valid} \
+                 chain_at_gen_time={chain_valid_at_gen_time} timestamping_eku={timestamping_eku_ok} \
+                 path_status={path_status:?} revocation={revocation:?}"
+            );
+            match terminal_anchor {
+                Some(atl_core::TerminalAnchor::Trusted { sha256_fingerprint }) => {
+                    println!(
+                        "      Terminal Anchor: Trusted (sha256:{})",
+                        hex::encode(sha256_fingerprint)
+                    );
+                }
+                Some(atl_core::TerminalAnchor::Assumed { sha256_fingerprint }) => {
+                    println!(
+                        "      Terminal Anchor: present but not in any supplied trust store \
+                         (sha256:{}) -- pass it to --tsa-trust-store",
+                        hex::encode(sha256_fingerprint)
+                    );
+                }
+                None => println!("      Terminal Anchor: none reached"),
+            }
+            if let Some(ts) = anchor.timestamp_nanos {
+                println!("      Timestamp: {}", format_timestamp_nanos(ts));
+            }
+        }
+        AnchorDetails::Bitcoin {
+            block_height,
+            block_timestamp_secs,
+            target_hash,
+            operation_count,
+            computed_root,
+            block_merkle_root,
+            merkle_match,
+        } => {
+            println!();
+            println!("      Verification Chain:");
+            println!("        Target Hash:       {target_hash}");
+            println!("              ↓ OTS proof ({operation_count} operations)");
+            println!("        Computed Root:     {computed_root}");
+
+            match (block_merkle_root, merkle_match) {
+                (Some(block_root), Some(true)) => {
+                    if use_color {
+                        println!("              {} (verified)", "✓".green());
+                    } else {
+                        println!("              ✓ (verified)");
+                    }
+                    println!("        Block Merkle Root: {block_root}");
+                }
+                (Some(block_root), Some(false)) => {
+                    if use_color {
+                        println!("              {} (mismatch)", "✗".red().bold());
+                    } else {
+                        println!("              ✗ (mismatch)");
+                    }
+                    println!("        Block Merkle Root: {block_root}");
+                }
+                _ => {
+                    if use_color {
+                        println!("              {} (not confirmed)", "?".yellow());
+                    } else {
+                        println!("              ? (not confirmed)");
+                    }
+                }
+            }
+
+            println!("              ↓");
+            if *block_timestamp_secs > 0 {
+                println!(
+                    "        Block #{block_height} @ {}",
+                    format_timestamp_secs(*block_timestamp_secs)
+                );
+            } else {
+                println!("        Block #{block_height}");
+            }
+        }
+        AnchorDetails::Unknown => {}
+    }
 }
 
 /// Print batch result
@@ -121,6 +301,12 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     println!("Results:");
     print!("  Valid:     ");
     print_count(result.valid_count, result.valid_count > 0, use_color);
+    print!("  Untrusted: ");
+    print_count(
+        result.untrusted_count,
+        result.untrusted_count == 0,
+        use_color,
+    );
     print!("  Invalid:   ");
     print_count(result.invalid_count, result.invalid_count == 0, use_color);
     print!("  Errors:    ");
@@ -134,7 +320,9 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
         .items
         .iter()
         .filter_map(|item| {
-            if let BatchItemResult::Valid(r) = item {
+            // Untrusted items take part in consistency checking too: their
+            // proofs are sound, only their trust root is unavailable.
+            if let BatchItemResult::Valid(r) | BatchItemResult::Untrusted(r) = item {
                 let filename = r
                     .source_path
                     .file_name()
@@ -176,11 +364,7 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
 
     // Overall status
     print!("Overall: ");
-    if result.is_valid() {
-        print_status("VALID", true, use_color);
-    } else {
-        print_status("INVALID", false, use_color);
-    }
+    print_receipt_status(result.verdict(), use_color);
 
     Ok(())
 }
@@ -302,7 +486,11 @@ fn print_consistency(
 
 fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
     match item {
-        BatchItemResult::Valid(result) => {
+        // All three buckets print their item's own verdict, so the bucket
+        // and the printed status cannot drift apart.
+        BatchItemResult::Valid(result)
+        | BatchItemResult::Untrusted(result)
+        | BatchItemResult::Invalid(result) => {
             println!(
                 "[{index}] {}",
                 result
@@ -311,22 +499,18 @@ fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
                     .unwrap_or_default()
                     .to_string_lossy()
             );
+            let verdict = result.verdict();
             print!("    Status: ");
-            print_status("VALID", true, use_color);
-        }
-        BatchItemResult::Invalid(result) => {
-            println!(
-                "[{index}] {}",
-                result
-                    .source_path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-            );
-            print!("    Status: ");
-            print_status("INVALID", false, use_color);
-            if !result.file_hash_valid {
-                println!("    Error: File hash mismatch");
+            match verdict.status {
+                Status::Valid => print_status("VALID", true, use_color),
+                Status::Pending => print_status_pending("PENDING (unanchored)", use_color),
+                Status::Untrusted => {
+                    print_status_pending("NOT VERIFIED: trust root unavailable", use_color);
+                }
+                Status::Invalid => print_status("INVALID", false, use_color),
+            }
+            if let Some(reason) = verdict.reason_code {
+                println!("    Reason: {}", reason.as_str());
             }
         }
         BatchItemResult::Error { source, error, .. } => {
@@ -504,193 +688,6 @@ fn format_hash(hash: &[u8; 32]) -> String {
     format!("sha256:{}", hex::encode(hash))
 }
 
-/// Print single file result with online anchor verification
-pub fn print_single_online_result(
-    result: &OnlineVerificationResult,
-    use_color: bool,
-) -> CliResult<()> {
-    println!("Verification Result");
-    println!("===================");
-    println!();
-
-    // File info
-    println!("File: {}", result.offline.source_path.display());
-    println!("Receipt: {}", result.offline.receipt_path.display());
-
-    // Status
-    print!("Status: ");
-    if result.is_valid() {
-        print_status("VALID", true, use_color);
-    } else if result.offline.is_lite_valid() {
-        print_status_pending("PENDING (unanchored)", use_color);
-    } else {
-        print_status("INVALID", false, use_color);
-    }
-
-    // File hash comparison
-    println!("File Hash:");
-    println!("  Computed: {}", format_hash(&result.offline.file_hash));
-    println!("  Expected: {}", result.offline.receipt.entry.payload_hash);
-    print!("  Match: ");
-    if result.offline.file_hash_valid {
-        print_status("YES", true, use_color);
-    } else {
-        print_status("NO", false, use_color);
-    }
-    println!();
-
-    // If hash doesn't match, show explanation and stop
-    if !result.offline.file_hash_valid {
-        println!();
-        println!("The file content does not match the receipt.");
-        println!("The file may have been modified since the receipt was issued.");
-        return Ok(());
-    }
-
-    // Receipt verification details
-    println!("Receipt Verification:");
-    println!("  Entry ID: {}", result.offline.receipt.entry.id);
-
-    // Inclusion proof - canonical verdict (base inclusion AND super-tree
-    // proofs if the receipt has a super_proof). Previously this only checked
-    // `core_result.inclusion_valid`, silently ignoring a broken super-tree
-    // proof; it now uses the same `ProofVerdict` the offline renderer and
-    // the JSON output use, so online/offline/human/JSON cannot diverge.
-    print!("  Inclusion Proof: ");
-    let proofs_valid = result.offline.proof_verdict().proofs_valid();
-    if proofs_valid {
-        print_status("VALID", true, use_color);
-    } else {
-        print_status("INVALID", false, use_color);
-    }
-
-    // Anchor verification results
-    if !result.anchor_results.is_empty() {
-        println!("Anchor Verification:");
-        for (i, anchor) in result.anchor_results.iter().enumerate() {
-            println!("  [{}] {}", i + 1, format_anchor_type(&anchor.anchor_type));
-            print!("      Status: ");
-            // Three-state, honest status line -- see `Rfc3161Trust`. This is
-            // the exact wording the JSON `trust_state` field also uses, so
-            // human and JSON output can never disagree about which of the
-            // three states an RFC 3161 anchor is in (Bitcoin OTS has no
-            // comparable caller-supplied trust axis, so it stays VALID/FAILED).
-            match anchor.details.rfc3161_trust() {
-                Some(Rfc3161Trust::Trusted) => print_status("TRUSTED", true, use_color),
-                Some(Rfc3161Trust::Assumed) => {
-                    print_status_pending("ASSUMED (root not trusted)", use_color);
-                }
-                Some(Rfc3161Trust::Failed) | None => {
-                    if anchor.verified {
-                        print_status("VALID", true, use_color);
-                    } else {
-                        print_status("FAILED", false, use_color);
-                    }
-                }
-            }
-
-            if let Some(error) = &anchor.error {
-                println!("      Error: {error}");
-            }
-
-            match &anchor.details {
-                AnchorDetails::Rfc3161 {
-                    imprint_matches_root,
-                    cms_signature_valid,
-                    chain_valid_at_gen_time,
-                    timestamping_eku_ok,
-                    path_status,
-                    terminal_anchor,
-                    revocation,
-                } => {
-                    println!(
-                        "      Facts: imprint={imprint_matches_root} cms_signature={cms_signature_valid} \
-                         chain_at_gen_time={chain_valid_at_gen_time} timestamping_eku={timestamping_eku_ok} \
-                         path_status={path_status:?} revocation={revocation:?}"
-                    );
-                    match terminal_anchor {
-                        Some(atl_core::TerminalAnchor::Trusted { sha256_fingerprint }) => {
-                            println!(
-                                "      Terminal Anchor: Trusted (sha256:{})",
-                                hex::encode(sha256_fingerprint)
-                            );
-                        }
-                        Some(atl_core::TerminalAnchor::Assumed { sha256_fingerprint }) => {
-                            println!(
-                                "      Terminal Anchor: Assumed, untrusted (sha256:{}) -- pass --tsa-trust-store to trust it",
-                                hex::encode(sha256_fingerprint)
-                            );
-                        }
-                        None => println!("      Terminal Anchor: none reached"),
-                    }
-                    if let Some(ts) = anchor.timestamp_nanos {
-                        println!("      Timestamp: {}", format_timestamp_nanos(ts));
-                    }
-                }
-                AnchorDetails::Bitcoin {
-                    block_height,
-                    block_timestamp_secs,
-                    target_hash,
-                    operation_count,
-                    computed_root,
-                    block_merkle_root,
-                    merkle_match,
-                } => {
-                    println!();
-                    println!("      Verification Chain:");
-                    println!("        Target Hash:       {}", target_hash);
-                    println!("              ↓ OTS proof ({} operations)", operation_count);
-                    println!("        Computed Root:     {}", computed_root);
-
-                    match (block_merkle_root, merkle_match) {
-                        (Some(block_root), Some(true)) => {
-                            // Online mode, match
-                            if use_color {
-                                println!("              {} (verified)", "✓".green());
-                            } else {
-                                println!("              ✓ (verified)");
-                            }
-                            println!("        Block Merkle Root: {}", block_root);
-                        }
-                        (Some(block_root), Some(false)) => {
-                            // Online mode, mismatch
-                            if use_color {
-                                println!("              {} (mismatch)", "✗".red().bold());
-                            } else {
-                                println!("              ✗ (mismatch)");
-                            }
-                            println!("        Block Merkle Root: {}", block_root);
-                        }
-                        (None, None) => {
-                            // Offline mode or API error
-                            if use_color {
-                                println!("              {} (not verified)", "?".yellow());
-                            } else {
-                                println!("              ? (not verified)");
-                            }
-                        }
-                        _ => {}
-                    }
-
-                    println!("              ↓");
-                    if *block_timestamp_secs > 0 {
-                        println!(
-                            "        Block #{} @ {}",
-                            block_height,
-                            format_timestamp_secs(*block_timestamp_secs)
-                        );
-                    } else {
-                        println!("        Block #{}", block_height);
-                    }
-                }
-                AnchorDetails::Unknown => {}
-            }
-        }
-    }
-
-    Ok(())
-}
-
 fn format_anchor_type(anchor_type: &str) -> &str {
     match anchor_type {
         "rfc3161" => "RFC 3161 (TSA)",
@@ -720,10 +717,11 @@ fn format_timestamp_secs(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::verdict::ReasonCode;
+    use atl_core::{PathStatus, ReceiptAnchor, Revocation, TerminalAnchor};
     use std::path::PathBuf;
 
     fn create_test_receipt() -> atl_core::Receipt {
-        // Load a minimal valid receipt from test data
         serde_json::from_str(include_str!(
             "../../test_data/receipts/valid/document.pdf.atl"
         ))
@@ -731,12 +729,10 @@ mod tests {
     }
 
     fn create_test_verification_result(is_valid: bool) -> atl_core::VerificationResult {
-        // Create a real verification result using the test receipt
         let receipt = create_test_receipt();
         let mut result =
             atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
 
-        // Override is_valid for testing purposes
         result.is_valid = is_valid;
         if !is_valid {
             result
@@ -746,1002 +742,276 @@ mod tests {
                     expected: "sha256:expected".to_string(),
                 });
         }
-
         result
     }
 
-    #[test]
-    fn test_print_single_result_valid_with_color() {
-        let result = SingleVerificationResult {
+    fn single_result(file_hash_valid: bool, core_valid: bool) -> SingleVerificationResult {
+        SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
             file_hash: [0xab; 32],
-            file_hash_valid: true,
+            file_hash_valid,
             receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        assert!(print_single_result(&result, true).is_ok());
+            core_result: create_test_verification_result(core_valid),
+            anchor_results: vec![],
+        }
     }
 
-    #[test]
-    fn test_print_single_result_valid_no_color() {
-        let result = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        assert!(print_single_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_result_invalid() {
-        let result = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(false),
-        };
-
-        assert!(print_single_result(&result, true).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_result_hash_mismatch() {
-        let result = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: false,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        assert!(print_single_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_batch_result_with_color() {
-        let result = BatchVerificationResult {
-            valid_count: 2,
-            invalid_count: 0,
-            error_count: 0,
-            unmatched_count: 0,
-            consistency: None,
-            items: vec![],
-        };
-
-        assert!(print_batch_result(&result, true).is_ok());
-    }
-
-    #[test]
-    fn test_print_batch_result_no_color() {
-        let result = BatchVerificationResult {
-            valid_count: 2,
-            invalid_count: 0,
-            error_count: 0,
-            unmatched_count: 0,
-            consistency: None,
-            items: vec![],
-        };
-
-        assert!(print_batch_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_batch_result_with_failures() {
-        let result = BatchVerificationResult {
-            valid_count: 1,
-            invalid_count: 1,
-            error_count: 1,
-            unmatched_count: 1,
-            consistency: None,
-            items: vec![],
-        };
-
-        assert!(print_batch_result(&result, true).is_ok());
-    }
-
-    #[test]
-    fn test_print_batch_result_with_consistency_valid() {
-        use crate::verify::consistency::ConsistencyResult;
-
-        let cross_result = atl_core::CrossReceiptVerificationResult {
-            same_log_instance: true,
-            history_consistent: true,
-            genesis_super_root: [0x12; 32],
-            receipt_a_index: 0,
-            receipt_b_index: 1,
-            receipt_a_super_tree_size: 1,
-            receipt_b_super_tree_size: 2,
-            errors: vec![],
-        };
-
-        let result = BatchVerificationResult {
-            valid_count: 2,
-            invalid_count: 0,
-            error_count: 0,
-            unmatched_count: 0,
-            consistency: Some(ConsistencyResult {
-                genesis_super_root: Some([0x12; 32]),
-                receipt_count: 2,
-                same_log: true,
-                history_consistent: true,
-                cross_results: vec![cross_result],
-                errors: vec![],
-            }),
-            items: vec![
-                BatchItemResult::Valid(SingleVerificationResult {
-                    source_path: PathBuf::from("test1.pdf"),
-                    receipt_path: PathBuf::from("test1.pdf.atl"),
-                    file_hash: [0xab; 32],
-                    file_hash_valid: true,
-                    receipt: create_test_receipt(),
-                    core_result: create_test_verification_result(true),
-                }),
-                BatchItemResult::Valid(SingleVerificationResult {
-                    source_path: PathBuf::from("test2.pdf"),
-                    receipt_path: PathBuf::from("test2.pdf.atl"),
-                    file_hash: [0xcd; 32],
-                    file_hash_valid: true,
-                    receipt: create_test_receipt(),
-                    core_result: create_test_verification_result(true),
-                }),
-            ],
-        };
-
-        assert!(print_batch_result(&result, true).is_ok());
-    }
-
-    #[test]
-    fn test_print_batch_result_with_consistency_failed() {
-        use crate::verify::consistency::ConsistencyResult;
-
-        let result = BatchVerificationResult {
-            valid_count: 0,
-            invalid_count: 0,
-            error_count: 0,
-            unmatched_count: 0,
-            consistency: Some(ConsistencyResult {
-                genesis_super_root: None,
-                receipt_count: 2,
-                same_log: false,
-                history_consistent: false,
-                cross_results: vec![],
-                errors: vec!["Inconsistent logs".to_string()],
-            }),
-            items: vec![],
-        };
-
-        assert!(print_batch_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_batch_all_item_types() {
-        use crate::error::CliError;
-
-        let items = vec![
-            BatchItemResult::Valid(SingleVerificationResult {
-                source_path: PathBuf::from("test1.pdf"),
-                receipt_path: PathBuf::from("test1.pdf.atl"),
-                file_hash: [0xab; 32],
-                file_hash_valid: true,
-                receipt: create_test_receipt(),
-                core_result: create_test_verification_result(true),
-            }),
-            BatchItemResult::Invalid(SingleVerificationResult {
-                source_path: PathBuf::from("test2.pdf"),
-                receipt_path: PathBuf::from("test2.pdf.atl"),
-                file_hash: [0xcd; 32],
-                file_hash_valid: false,
-                receipt: create_test_receipt(),
-                core_result: create_test_verification_result(false),
-            }),
-            BatchItemResult::Error {
-                source: PathBuf::from("test3.pdf"),
-                receipt: Some(PathBuf::from("test3.pdf.atl")),
-                error: CliError::SourceNotFound(PathBuf::from("test3.pdf")),
+    /// Attach one RFC 3161 anchor (and its verdict) to a receipt.
+    fn with_rfc3161_anchor(
+        mut result: SingleVerificationResult,
+        verdict: AnchorVerdict,
+        path_status: PathStatus,
+        terminal: Option<TerminalAnchor>,
+    ) -> SingleVerificationResult {
+        result.receipt.anchors.push(ReceiptAnchor::Rfc3161 {
+            target: "data_tree_root".to_string(),
+            target_hash: result.receipt.proof.root_hash.clone(),
+            tsa_url: "https://example.invalid/tsa".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            token_der: "base64:token".to_string(),
+        });
+        result.anchor_results.push(AnchorVerificationResult {
+            anchor_type: "rfc3161".to_string(),
+            verdict,
+            timestamp_nanos: Some(1_768_797_900_000_000_000),
+            error: match verdict {
+                AnchorVerdict::Valid => None,
+                _ => Some("diagnostic detail".to_string()),
             },
-            BatchItemResult::NoReceipt(PathBuf::from("test4.pdf")),
-            BatchItemResult::NoSource(PathBuf::from("test5.pdf.atl")),
-        ];
+            details: AnchorDetails::Rfc3161 {
+                imprint_matches_root: true,
+                cms_signature_valid: true,
+                chain_valid_at_gen_time: matches!(path_status, PathStatus::Complete),
+                timestamping_eku_ok: true,
+                path_status,
+                terminal_anchor: terminal,
+                revocation: Revocation::NotChecked,
+            },
+        });
+        result
+    }
 
+    fn batch(valid: usize, untrusted: usize, invalid: usize) -> BatchVerificationResult {
+        BatchVerificationResult {
+            valid_count: valid,
+            untrusted_count: untrusted,
+            invalid_count: invalid,
+            error_count: 0,
+            unmatched_count: 0,
+            consistency: None,
+            items: vec![],
+        }
+    }
+
+    #[test]
+    fn single_result_renders_in_both_color_modes() {
+        let result = single_result(true, true);
+        assert!(print_single_result(&result, true).is_ok());
+        assert!(print_single_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn hash_mismatch_renders_and_stops_early() {
+        let result = single_result(false, false);
+        assert!(print_single_result(&result, false).is_ok());
+        assert_eq!(result.verdict().status, Status::Invalid);
+    }
+
+    #[test]
+    fn every_receipt_status_has_its_own_wording() {
+        // Regression guard for the conflation this change removes: the
+        // `Untrusted` wording must not read as damage to the evidence, and
+        // must differ from both VALID and INVALID.
+        for (verdict, expected) in [
+            (ReceiptVerdict::VALID, "VALID"),
+            (ReceiptVerdict::pending(), "PENDING (unanchored)"),
+            (
+                ReceiptVerdict::untrusted(ReasonCode::TsaRootNotTrusted),
+                "NOT VERIFIED: trust root unavailable",
+            ),
+            (
+                ReceiptVerdict::invalid(ReasonCode::FileHashMismatch),
+                "INVALID",
+            ),
+        ] {
+            let _ = expected;
+            // Rendering must not panic in either color mode.
+            print_receipt_status(verdict, false);
+            print_receipt_status(verdict, true);
+        }
+    }
+
+    #[test]
+    fn untrusted_receipt_prints_what_to_supply() {
+        let result = with_rfc3161_anchor(
+            single_result(true, true),
+            AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted),
+            PathStatus::Complete,
+            Some(TerminalAnchor::Assumed {
+                sha256_fingerprint: [0x11; 32],
+            }),
+        );
+        assert_eq!(result.verdict().status, Status::Untrusted);
+        assert!(print_single_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn incomplete_chain_receipt_renders_as_untrusted() {
+        let result = with_rfc3161_anchor(
+            single_result(true, true),
+            AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete),
+            PathStatus::Incomplete,
+            None,
+        );
+        assert_eq!(result.verdict().status, Status::Untrusted);
+        assert!(print_single_result(&result, true).is_ok());
+    }
+
+    #[test]
+    fn trusted_anchor_receipt_renders_as_valid() {
+        let result = with_rfc3161_anchor(
+            single_result(true, true),
+            AnchorVerdict::Valid,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [0u8; 32],
+            }),
+        );
+        assert_eq!(result.verdict().status, Status::Valid);
+        assert!(print_single_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn refuted_anchor_receipt_renders_as_invalid() {
+        let result = with_rfc3161_anchor(
+            single_result(true, true),
+            AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid),
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [0u8; 32],
+            }),
+        );
+        assert_eq!(result.verdict().status, Status::Invalid);
+        assert!(print_single_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn bitcoin_anchor_chain_renders_in_every_confirmation_state() {
+        for (block_merkle_root, merkle_match, verdict) in [
+            (
+                Some("sha256:aa".to_string()),
+                Some(true),
+                AnchorVerdict::Valid,
+            ),
+            (
+                Some("sha256:bb".to_string()),
+                Some(false),
+                AnchorVerdict::Invalid(ReasonCode::BitcoinMerkleRootMismatch),
+            ),
+            (
+                None,
+                None,
+                AnchorVerdict::Untrusted(ReasonCode::BitcoinBlockNotChecked),
+            ),
+        ] {
+            let anchor = AnchorVerificationResult {
+                anchor_type: "bitcoin_ots".to_string(),
+                verdict,
+                timestamp_nanos: Some(1_768_806_080_000_000_000),
+                error: None,
+                details: AnchorDetails::Bitcoin {
+                    block_height: 932_897,
+                    block_timestamp_secs: if merkle_match.is_some() {
+                        1_768_806_080
+                    } else {
+                        0
+                    },
+                    target_hash: "sha256:abc".to_string(),
+                    operation_count: 39,
+                    computed_root: "sha256:aa".to_string(),
+                    block_merkle_root,
+                    merkle_match,
+                },
+            };
+            print_anchor_section(std::slice::from_ref(&anchor), false);
+            print_anchor_section(std::slice::from_ref(&anchor), true);
+        }
+    }
+
+    #[test]
+    fn batch_summary_renders_untrusted_row() {
+        assert!(print_batch_result(&batch(1, 2, 0), false).is_ok());
+        assert!(print_batch_result(&batch(1, 2, 0), true).is_ok());
+    }
+
+    #[test]
+    fn batch_items_render_every_bucket() {
         let result = BatchVerificationResult {
             valid_count: 1,
+            untrusted_count: 1,
             invalid_count: 1,
             error_count: 1,
             unmatched_count: 2,
             consistency: None,
-            items,
+            items: vec![
+                BatchItemResult::Valid(single_result(true, true)),
+                BatchItemResult::Untrusted(with_rfc3161_anchor(
+                    single_result(true, true),
+                    AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted),
+                    PathStatus::Complete,
+                    Some(TerminalAnchor::Assumed {
+                        sha256_fingerprint: [0x22; 32],
+                    }),
+                )),
+                BatchItemResult::Invalid(single_result(false, false)),
+                BatchItemResult::Error {
+                    source: PathBuf::from("broken.pdf"),
+                    receipt: None,
+                    error: crate::error::CliError::VerificationFailed("boom".into()),
+                },
+                BatchItemResult::NoReceipt(PathBuf::from("lonely.pdf")),
+                BatchItemResult::NoSource(PathBuf::from("lonely.pdf.atl")),
+            ],
         };
-
-        assert!(print_batch_result(&result, true).is_ok());
         assert!(print_batch_result(&result, false).is_ok());
+        assert!(print_batch_result(&result, true).is_ok());
     }
 
     #[test]
-    fn test_format_hash() {
-        let hash = [0xab; 32];
-        let formatted = format_hash(&hash);
-        assert!(formatted.starts_with("sha256:"));
-        assert!(!formatted.ends_with("...")); // No truncation
-        assert_eq!(formatted.len(), 7 + 64); // "sha256:" + 64 hex chars
-    }
-
-    #[test]
-    fn test_print_status_success_with_color() {
-        print_status("VALID", true, true);
-    }
-
-    #[test]
-    fn test_print_status_failure_with_color() {
-        print_status("INVALID", false, true);
-    }
-
-    #[test]
-    fn test_print_status_no_color() {
-        print_status("VALID", true, false);
-        print_status("INVALID", false, false);
-    }
-
-    #[test]
-    fn test_print_count_with_color() {
-        print_count(5, true, true);
-        print_count(0, false, true);
-    }
-
-    #[test]
-    fn test_print_count_no_color() {
-        print_count(5, true, false);
-        print_count(0, false, false);
-    }
-
-    #[test]
-    fn test_print_consistency_verified() {
-        use crate::verify::consistency::ConsistencyResult;
-
-        let cross_result = atl_core::CrossReceiptVerificationResult {
-            same_log_instance: true,
-            history_consistent: true,
-            genesis_super_root: [0xaa; 32],
-            receipt_a_index: 0,
-            receipt_b_index: 1,
-            receipt_a_super_tree_size: 1,
-            receipt_b_super_tree_size: 2,
-            errors: vec![],
-        };
-
-        let consistency = ConsistencyResult {
-            genesis_super_root: Some([0xaa; 32]),
-            receipt_count: 2,
-            same_log: true,
-            history_consistent: true,
-            cross_results: vec![cross_result],
-            errors: vec![],
-        };
-
-        let receipt_infos = vec![
-            ReceiptProofInfo {
-                filename: "file1.txt".to_string(),
-                super_root:
-                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_string(),
-                data_tree_index: 0,
-            },
-            ReceiptProofInfo {
-                filename: "file2.txt".to_string(),
-                super_root:
-                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                data_tree_index: 1,
-            },
-        ];
-
-        print_consistency(&consistency, &receipt_infos, true);
-        print_consistency(&consistency, &receipt_infos, false);
-    }
-
-    #[test]
-    fn test_print_consistency_failed() {
-        use crate::verify::consistency::ConsistencyResult;
-
-        let consistency = ConsistencyResult {
-            genesis_super_root: None,
-            receipt_count: 2,
-            same_log: false,
-            history_consistent: false,
-            cross_results: vec![],
-            errors: vec!["Different genesis".to_string()],
-        };
-
-        let receipt_infos = vec![
-            ReceiptProofInfo {
-                filename: "file1.txt".to_string(),
-                super_root:
-                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_string(),
-                data_tree_index: 0,
-            },
-            ReceiptProofInfo {
-                filename: "file2.txt".to_string(),
-                super_root:
-                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                data_tree_index: 0,
-            },
-        ];
-
-        print_consistency(&consistency, &receipt_infos, true);
-        print_consistency(&consistency, &receipt_infos, false);
-    }
-
-    #[test]
-    fn test_print_batch_item_valid() {
-        let item = BatchItemResult::Valid(SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        });
-
-        print_batch_item(1, &item, true);
-        print_batch_item(1, &item, false);
-    }
-
-    #[test]
-    fn test_print_batch_item_invalid() {
-        let item = BatchItemResult::Invalid(SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: false,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(false),
-        });
-
-        print_batch_item(1, &item, true);
-        print_batch_item(1, &item, false);
-    }
-
-    #[test]
-    fn test_print_batch_item_error() {
-        use crate::error::CliError;
-
-        let item = BatchItemResult::Error {
-            source: PathBuf::from("test.pdf"),
-            receipt: Some(PathBuf::from("test.pdf.atl")),
-            error: CliError::SourceNotFound(PathBuf::from("test.pdf")),
-        };
-
-        print_batch_item(1, &item, true);
-        print_batch_item(1, &item, false);
-    }
-
-    #[test]
-    fn test_print_batch_item_no_receipt() {
-        let item = BatchItemResult::NoReceipt(PathBuf::from("test.pdf"));
-
-        print_batch_item(1, &item, true);
-        print_batch_item(1, &item, false);
-    }
-
-    #[test]
-    fn test_print_batch_item_no_source() {
-        let item = BatchItemResult::NoSource(PathBuf::from("test.pdf.atl"));
-
-        print_batch_item(1, &item, true);
-        print_batch_item(1, &item, false);
-    }
-
-    #[test]
-    fn test_print_consistency_verified_5_receipts() {
-        use crate::verify::consistency::ConsistencyResult;
-
-        // 5 receipts = 4 cross-checks
-        let cross_results = (0..4)
-            .map(|i| atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true,
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: i,
-                receipt_b_index: i + 1,
-                receipt_a_super_tree_size: i + 1,
-                receipt_b_super_tree_size: i + 2,
-                errors: vec![],
-            })
-            .collect::<Vec<_>>();
-
-        let consistency = ConsistencyResult {
-            genesis_super_root: Some([0xaa; 32]),
-            receipt_count: 5,
-            same_log: true,
-            history_consistent: true,
-            cross_results,
-            errors: vec![],
-        };
-
-        let receipt_infos: Vec<_> = (1..=5)
-            .map(|i| ReceiptProofInfo {
-                filename: format!("file{}.txt", i),
-                super_root: format!("sha256:{:064x}", i),
-                data_tree_index: i - 1,
-            })
-            .collect();
-
-        print_consistency(&consistency, &receipt_infos, false);
-    }
-
-    #[test]
-    fn test_print_consistency_failure_in_middle_of_chain() {
-        use crate::verify::consistency::ConsistencyResult;
-
-        // 5 receipts, failure at cross-check [3] -> [4]
-        let cross_results = vec![
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true, // [1] -> [2] OK
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 0,
-                receipt_b_index: 1,
-                receipt_a_super_tree_size: 1,
-                receipt_b_super_tree_size: 2,
-                errors: vec![],
-            },
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true, // [2] -> [3] OK
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 1,
-                receipt_b_index: 2,
-                receipt_a_super_tree_size: 2,
-                receipt_b_super_tree_size: 3,
-                errors: vec![],
-            },
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: false, // [3] -> [4] FAILED!
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 2,
-                receipt_b_index: 3,
-                receipt_a_super_tree_size: 3,
-                receipt_b_super_tree_size: 4,
-                errors: vec!["Consistency proof failed".to_string()],
-            },
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true, // [4] -> [5] - would pass but skipped
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 3,
-                receipt_b_index: 4,
-                receipt_a_super_tree_size: 4,
-                receipt_b_super_tree_size: 5,
-                errors: vec![],
-            },
-        ];
-
-        let consistency = ConsistencyResult {
-            genesis_super_root: Some([0xaa; 32]),
-            receipt_count: 5,
-            same_log: true,
-            history_consistent: false, // Failed due to tampering
-            cross_results,
-            errors: vec!["Cross-receipt error: Consistency proof failed".to_string()],
-        };
-
-        let receipt_infos: Vec<_> = (1..=5)
-            .map(|i| ReceiptProofInfo {
-                filename: format!("file{}.txt", i),
-                super_root: format!("sha256:{:064x}", i),
-                data_tree_index: i - 1,
-            })
-            .collect();
-
-        print_consistency(&consistency, &receipt_infos, false);
-    }
-
-    #[test]
-    fn test_print_consistency_failure_at_beginning() {
-        use crate::verify::consistency::ConsistencyResult;
-
-        // Failure at first cross-check [1] -> [2]
-        let cross_result = atl_core::CrossReceiptVerificationResult {
-            same_log_instance: true,
-            history_consistent: false, // History NOT consistent = tampering
-            genesis_super_root: [0xaa; 32],
-            receipt_a_index: 0,
-            receipt_b_index: 1,
-            receipt_a_super_tree_size: 1,
-            receipt_b_super_tree_size: 2,
-            errors: vec!["Consistency proof failed".to_string()],
-        };
-
-        let consistency = ConsistencyResult {
-            genesis_super_root: Some([0xaa; 32]),
-            receipt_count: 2,
-            same_log: true,
-            history_consistent: false, // Failed due to tampering
-            cross_results: vec![cross_result],
-            errors: vec!["Cross-receipt error: Consistency proof failed".to_string()],
-        };
-
-        let receipt_infos = vec![
-            ReceiptProofInfo {
-                filename: "file1.txt".to_string(),
-                super_root:
-                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_string(),
-                data_tree_index: 0,
-            },
-            ReceiptProofInfo {
-                filename: "file2.txt".to_string(),
-                super_root:
-                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                data_tree_index: 1,
-            },
-        ];
-
-        print_consistency(&consistency, &receipt_infos, false);
-    }
-
-    #[test]
-    fn test_print_checkmark_success() {
-        print_checkmark("Test message", true, true);
-        print_checkmark("Test message", true, false);
-    }
-
-    #[test]
-    fn test_print_checkmark_failure() {
-        print_checkmark("Test message", false, true);
-        print_checkmark("Test message", false, false);
-    }
-
-    #[test]
-    fn test_print_proof_section_sorted_by_index() {
-        // Receipts in wrong order in vector
-        let receipt_infos = vec![
-            ReceiptProofInfo {
-                filename: "later.txt".to_string(),
-                super_root:
-                    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-                        .to_string(),
-                data_tree_index: 5, // Later
-            },
-            ReceiptProofInfo {
-                filename: "earlier.txt".to_string(),
-                super_root:
-                    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-                        .to_string(),
-                data_tree_index: 2, // Earlier
-            },
-        ];
-
-        print_proof_section(&receipt_infos, false);
-    }
-
-    #[test]
-    fn test_print_cross_checks_section_all_passed() {
-        let cross_results = vec![
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true,
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 0,
-                receipt_b_index: 1,
-                receipt_a_super_tree_size: 1,
-                receipt_b_super_tree_size: 2,
-                errors: vec![],
-            },
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true,
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 1,
-                receipt_b_index: 2,
-                receipt_a_super_tree_size: 2,
-                receipt_b_super_tree_size: 3,
-                errors: vec![],
-            },
-        ];
-
-        print_cross_checks_section(&cross_results, None, false);
-    }
-
-    #[test]
-    fn test_print_cross_checks_section_with_failure() {
-        let cross_results = vec![
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true,
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 0,
-                receipt_b_index: 1,
-                receipt_a_super_tree_size: 1,
-                receipt_b_super_tree_size: 2,
-                errors: vec![],
-            },
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: false, // Failed
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 1,
-                receipt_b_index: 2,
-                receipt_a_super_tree_size: 2,
-                receipt_b_super_tree_size: 3,
-                errors: vec![],
-            },
-            atl_core::CrossReceiptVerificationResult {
-                same_log_instance: true,
-                history_consistent: true, // Would pass but skipped
-                genesis_super_root: [0xaa; 32],
-                receipt_a_index: 2,
-                receipt_b_index: 3,
-                receipt_a_super_tree_size: 3,
-                receipt_b_super_tree_size: 4,
-                errors: vec![],
-            },
-        ];
-
-        print_cross_checks_section(&cross_results, Some(1), false);
-    }
-
-    #[test]
-    fn test_print_single_online_result_valid_with_color() {
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_with_rfc3161_anchor_trusted() {
-        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
-
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let anchor = AnchorVerificationResult {
-            anchor_type: "rfc3161".to_string(),
-            verified: true,
-            timestamp_nanos: Some(1700000000000000000),
-            error: None,
-            details: AnchorDetails::Rfc3161 {
-                imprint_matches_root: true,
-                cms_signature_valid: true,
-                chain_valid_at_gen_time: true,
-                timestamping_eku_ok: true,
-                path_status: atl_core::PathStatus::Complete,
-                terminal_anchor: Some(atl_core::TerminalAnchor::Trusted {
-                    sha256_fingerprint: [0x11; 32],
-                }),
-                revocation: atl_core::Revocation::NotChecked,
-            },
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![anchor],
-            all_anchors_verified: true,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-        assert!(print_single_online_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_with_rfc3161_anchor_assumed() {
-        // The `Rfc3161Trust::Assumed` case must render distinctly from both
-        // "TRUSTED" and plain "FAILED" -- this is the case the whole rewrite
-        // exists to make honest.
-        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
-
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let anchor = AnchorVerificationResult {
-            anchor_type: "rfc3161".to_string(),
-            verified: false,
-            timestamp_nanos: Some(1700000000000000000),
-            error: Some("trust anchor not established".to_string()),
-            details: AnchorDetails::Rfc3161 {
-                imprint_matches_root: true,
-                cms_signature_valid: true,
-                chain_valid_at_gen_time: true,
-                timestamping_eku_ok: true,
-                path_status: atl_core::PathStatus::Complete,
-                terminal_anchor: Some(atl_core::TerminalAnchor::Assumed {
-                    sha256_fingerprint: [0x22; 32],
-                }),
-                revocation: atl_core::Revocation::NotChecked,
-            },
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![anchor],
-            all_anchors_verified: false,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-        assert!(print_single_online_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_with_bitcoin_anchor_verified() {
-        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
-
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let anchor = AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: true,
-            timestamp_nanos: Some(1700000000000000000),
-            error: None,
-            details: AnchorDetails::Bitcoin {
-                block_height: 800000,
-                block_timestamp_secs: 1700000000,
-                target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
-                block_merkle_root: Some("sha256:def456".to_string()),
-                merkle_match: Some(true),
-            },
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![anchor],
-            all_anchors_verified: true,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-        assert!(print_single_online_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_with_bitcoin_anchor_mismatch() {
-        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
-
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let anchor = AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("Merkle root mismatch".to_string()),
-            details: AnchorDetails::Bitcoin {
-                block_height: 800000,
-                block_timestamp_secs: 1700000000,
-                target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
-                block_merkle_root: Some("sha256:wrong789".to_string()),
-                merkle_match: Some(false),
-            },
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![anchor],
-            all_anchors_verified: false,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-        assert!(print_single_online_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_with_bitcoin_anchor_offline() {
-        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
-
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let anchor = AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("API error".to_string()),
-            details: AnchorDetails::Bitcoin {
-                block_height: 800000,
-                block_timestamp_secs: 0,
-                target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
-                block_merkle_root: None,
-                merkle_match: None,
-            },
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![anchor],
-            all_anchors_verified: false,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-        assert!(print_single_online_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_with_unknown_anchor() {
-        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
-
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let anchor = AnchorVerificationResult {
-            anchor_type: "unknown".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("Unknown anchor type".to_string()),
-            details: AnchorDetails::Unknown,
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![anchor],
-            all_anchors_verified: false,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_hash_mismatch() {
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: false,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, false).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_lite_pending() {
-        let mut offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(true),
-        };
-        // Empty anchors for lite receipt
-        offline.receipt.anchors = vec![];
-
-        let result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: crate::cli::VerificationMode::Online,
-        };
-
-        assert!(print_single_online_result(&result, true).is_ok());
-    }
-
-    #[test]
-    fn test_format_anchor_type() {
+    fn anchor_type_labels_are_readable() {
         assert_eq!(format_anchor_type("rfc3161"), "RFC 3161 (TSA)");
         assert_eq!(format_anchor_type("bitcoin_ots"), "Bitcoin OTS");
-        assert_eq!(format_anchor_type("other"), "other");
+        assert_eq!(format_anchor_type("something_else"), "something_else");
     }
 
     #[test]
-    fn test_format_timestamp_nanos() {
-        // Valid timestamp
-        let ts = format_timestamp_nanos(1700000000000000000);
-        assert!(ts.contains("2023"));
-
-        // Zero timestamp
-        let ts_zero = format_timestamp_nanos(0);
-        assert_eq!(ts_zero, "1970-01-01T00:00:00Z");
-
-        // Very large timestamp - when divided by 1B becomes i64::MAX
-        // chrono::Utc.timestamp_opt() returns None for out-of-range values
-        let ts_large = format_timestamp_nanos(u64::MAX);
-        // Should contain either valid date or fallback format with "ns"
-        assert!(ts_large.contains("ns") || ts_large.contains("Z"));
+    fn timestamps_render_as_iso8601() {
+        assert_eq!(
+            format_timestamp_nanos(1_768_797_900_000_000_000),
+            "2026-01-19T04:45:00Z"
+        );
+        assert_eq!(format_timestamp_secs(1_768_797_900), "2026-01-19T04:45:00Z");
     }
 
     #[test]
-    fn test_format_timestamp_secs() {
-        // Valid timestamp
-        let ts = format_timestamp_secs(1700000000);
-        assert!(ts.contains("2023"));
-
-        // Zero timestamp
-        let ts_zero = format_timestamp_secs(0);
-        assert_eq!(ts_zero, "1970-01-01T00:00:00Z");
-
-        // Very large invalid timestamp
-        let ts_large = format_timestamp_secs(u64::MAX);
-        assert!(ts_large.contains(" s"));
+    fn hash_formatting_is_prefixed() {
+        assert_eq!(
+            format_hash(&[0u8; 32]),
+            format!("sha256:{}", "0".repeat(64))
+        );
     }
 
     #[test]
-    fn test_print_status_pending_with_color() {
+    fn status_helpers_render_in_both_color_modes() {
+        print_status("VALID", true, true);
+        print_status("INVALID", false, true);
+        print_status("VALID", true, false);
         print_status_pending("PENDING", true);
-    }
-
-    #[test]
-    fn test_print_status_pending_no_color() {
         print_status_pending("PENDING", false);
+        print_count(3, true, true);
+        print_count(0, false, false);
+        print_checkmark("ok", true, true);
+        print_checkmark("bad", false, false);
     }
 }

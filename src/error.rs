@@ -1,9 +1,13 @@
 //! Error types and exit codes for atl-cli
 //!
 //! Exit codes:
-//! - 0 = VALID (verification passed)
-//! - 1 = INVALID (verification failed cryptographically)
+//! - 0 = VALID (verification passed; also PENDING, an unanchored receipt)
+//! - 1 = INVALID (the evidence was refuted)
 //! - 2 = ERROR (runtime error)
+//! - 3 = UNTRUSTED (nothing refuted; this verifier lacks the trust material)
+//!
+//! Codes 1 and 3 are deliberately distinct so a script can tell "this
+//! evidence is broken" from "bring me the trust root" without parsing JSON.
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -14,10 +18,14 @@ use thiserror::Error;
 pub enum ExitCode {
     /// All verifications passed
     Valid = 0,
-    /// One or more verifications failed (cryptographic/hash failure)
+    /// One or more verifications was refuted (cryptographic/hash failure)
     Invalid = 1,
     /// Runtime error (file not found, parse error, network, etc.)
     Error = 2,
+    /// Nothing was refuted, but at least one anchor did not reach a trust
+    /// root this verifier was configured with. The evidence stands; the
+    /// verifier is under-configured.
+    Untrusted = 3,
 }
 
 impl ExitCode {
@@ -129,6 +137,25 @@ pub enum CliError {
     #[error("Verification failed: {0}")]
     #[allow(dead_code)]
     VerificationFailed(String),
+
+    // ========================================================================
+    // Trust Material Missing (Exit Code 3: UNTRUSTED)
+    // ========================================================================
+    /// Every checkable fact holds, but no anchor reached a trust root this
+    /// verifier was configured with.
+    ///
+    /// This is NOT a verification failure: nothing about the evidence was
+    /// refuted. It is a statement about *this verifier's* configuration, and
+    /// it gets its own exit code so callers never have to guess which of the
+    /// two happened.
+    #[error("NOT VERIFIED: trust root unavailable ({reason_code}) -- {detail}")]
+    TrustNotEstablished {
+        /// Stable machine-readable reason (see
+        /// [`crate::verify::verdict::ReasonCode`]).
+        reason_code: &'static str,
+        /// What the caller needs to supply.
+        detail: String,
+    },
 
     // ========================================================================
     // Batch Mode Errors (Exit Codes vary)
@@ -267,6 +294,13 @@ impl CliError {
             | Self::TsaVerificationFailed(_)
             | Self::OtsVerificationFailed(_)
             | Self::NoTrustAnchor => ExitCode::Invalid,
+
+            // Nothing refuted, trust material missing -> UNTRUSTED (exit 3).
+            // Read straight off `Status` so the exit code for this state has
+            // exactly one definition.
+            Self::TrustNotEstablished { .. } => {
+                crate::verify::verdict::Status::Untrusted.exit_code()
+            }
 
             // Runtime errors -> ERROR (exit 2)
             Self::SourceNotFound(_)

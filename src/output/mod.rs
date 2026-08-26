@@ -1,4 +1,9 @@
 //! Output formatting
+//!
+//! There is one renderer per format, used for both offline and online runs.
+//! RFC 3161 anchors are verified identically either way, so a separate
+//! "online" rendering path would only be a second place for the status to
+//! be decided — exactly the drift this crate is built to avoid.
 
 pub mod human;
 pub mod json;
@@ -6,7 +11,6 @@ pub mod json;
 use crate::cli::{Args, VerificationMode};
 use crate::error::CliResult;
 use crate::verify::batch::BatchVerificationResult;
-use crate::verify::online::OnlineVerificationResult;
 use crate::verify::single::SingleVerificationResult;
 
 /// Print single file verification result
@@ -25,21 +29,6 @@ pub fn print_single_result(
         json::print_single_result(result, mode)
     } else {
         human::print_single_result(result, args.use_color())
-    }
-}
-
-/// Print single file result with online verification
-///
-/// Output format determined by Args (human-readable or JSON)
-pub fn print_single_online_result(result: &OnlineVerificationResult, args: &Args) -> CliResult<()> {
-    if args.is_quiet() {
-        return Ok(());
-    }
-
-    if args.use_json() {
-        json::print_single_online_result(result)
-    } else {
-        human::print_single_online_result(result, args.use_color())
     }
 }
 
@@ -69,7 +58,6 @@ mod tests {
     use super::*;
     use crate::cli::{Args, Command, InspectArgs};
     use crate::verify::batch::BatchVerificationResult;
-    use crate::verify::online::OnlineVerificationResult;
     use crate::verify::single::SingleVerificationResult;
     use std::path::PathBuf;
 
@@ -96,128 +84,74 @@ mod tests {
         atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt")
     }
 
-    #[test]
-    fn test_print_single_result_quiet_mode() {
-        let result = SingleVerificationResult {
+    fn create_test_result() -> SingleVerificationResult {
+        SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
             receipt_path: PathBuf::from("test.pdf.atl"),
             file_hash: [0xab; 32],
             file_hash_valid: true,
             receipt: create_test_receipt(),
             core_result: create_test_verification_result(),
-        };
-
-        let args = create_test_args(true, false);
-        assert!(print_single_result(&result, &args, VerificationMode::Offline).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_quiet_mode() {
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(),
-        };
-
-        let online_result = OnlineVerificationResult {
-            offline,
             anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: VerificationMode::Online,
-        };
-
-        let args = create_test_args(true, false);
-        assert!(print_single_online_result(&online_result, &args).is_ok());
+        }
     }
 
-    #[test]
-    fn test_print_batch_result_quiet_mode() {
-        use std::path::Path;
-
-        let result = BatchVerificationResult {
+    fn create_test_batch() -> BatchVerificationResult {
+        BatchVerificationResult {
             valid_count: 1,
+            untrusted_count: 0,
             invalid_count: 0,
             error_count: 0,
             unmatched_count: 0,
             consistency: None,
             items: vec![],
-        };
+        }
+    }
 
+    #[test]
+    fn quiet_mode_prints_nothing_and_still_succeeds() {
         let args = create_test_args(true, false);
-        let source_dir = Path::new("/test/source");
-        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_single_result(&create_test_result(), &args, VerificationMode::Offline).is_ok()
+        );
         assert!(print_batch_result(
-            &result,
+            &create_test_batch(),
             &args,
             VerificationMode::Offline,
-            source_dir,
-            receipt_dir
+            std::path::Path::new("/test/source"),
+            std::path::Path::new("/test/receipts")
         )
         .is_ok());
     }
 
     #[test]
-    fn test_print_single_result_json_mode() {
-        let result = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(),
-        };
-
+    fn json_mode_renders_single_and_batch() {
         let args = create_test_args(false, true);
-        assert!(print_single_result(&result, &args, VerificationMode::Offline).is_ok());
-    }
-
-    #[test]
-    fn test_print_single_online_result_json_mode() {
-        let offline = SingleVerificationResult {
-            source_path: PathBuf::from("test.pdf"),
-            receipt_path: PathBuf::from("test.pdf.atl"),
-            file_hash: [0xab; 32],
-            file_hash_valid: true,
-            receipt: create_test_receipt(),
-            core_result: create_test_verification_result(),
-        };
-
-        let online_result = OnlineVerificationResult {
-            offline,
-            anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: VerificationMode::Online,
-        };
-
-        let args = create_test_args(false, true);
-        assert!(print_single_online_result(&online_result, &args).is_ok());
-    }
-
-    #[test]
-    fn test_print_batch_result_json_mode() {
-        use std::path::Path;
-
-        let result = BatchVerificationResult {
-            valid_count: 1,
-            invalid_count: 0,
-            error_count: 0,
-            unmatched_count: 0,
-            consistency: None,
-            items: vec![],
-        };
-
-        let args = create_test_args(false, true);
-        let source_dir = Path::new("/test/source");
-        let receipt_dir = Path::new("/test/receipts");
+        assert!(
+            print_single_result(&create_test_result(), &args, VerificationMode::Offline).is_ok()
+        );
         assert!(print_batch_result(
-            &result,
+            &create_test_batch(),
             &args,
             VerificationMode::Offline,
-            source_dir,
-            receipt_dir
+            std::path::Path::new("/test/source"),
+            std::path::Path::new("/test/receipts")
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn human_mode_renders_single_and_batch() {
+        let args = create_test_args(false, false);
+        assert!(
+            print_single_result(&create_test_result(), &args, VerificationMode::Online).is_ok()
+        );
+        assert!(print_batch_result(
+            &create_test_batch(),
+            &args,
+            VerificationMode::Online,
+            std::path::Path::new("/test/source"),
+            std::path::Path::new("/test/receipts")
         )
         .is_ok());
     }
