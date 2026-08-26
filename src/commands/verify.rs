@@ -1,11 +1,14 @@
 //! Verify command implementation
 
+use atl_core::TrustStore;
+
 use crate::cli::{Args, VerificationMode, VerifyArgs};
 use crate::error::{CliError, CliResult};
 use crate::output;
 use crate::verify::batch::verify_batch;
 use crate::verify::online::{verify_single_online, OnlineConfig};
 use crate::verify::single::verify_single;
+use crate::verify::trust_store::load_tsa_trust_store;
 
 /// Execute the verify command
 ///
@@ -15,20 +18,40 @@ pub fn execute(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
     // Validate paths exist
     verify_args.validate()?;
 
+    // Load `--tsa-trust-store` once, up front, so both single- and
+    // batch-mode paths see the same trust material. Absent the flag this is
+    // `None` -- every RFC 3161 anchor then verifies at best to `Assumed`,
+    // never `Trusted` (see docs-md/atl-trust-model-decisions.md).
+    let trust_store = load_trust_store(verify_args)?;
+
     // Determine if batch mode
     let is_batch = verify_args.is_batch_mode();
 
     if is_batch {
-        execute_batch(verify_args, args)
+        execute_batch(verify_args, args, trust_store.as_ref())
     } else {
-        execute_single(verify_args, args)
+        execute_single(verify_args, args, trust_store.as_ref())
     }
 }
 
+/// Load the TSA trust store named by `--tsa-trust-store`, if the caller
+/// passed it. Never invents or falls back to any built-in material.
+fn load_trust_store(verify_args: &VerifyArgs) -> CliResult<Option<TrustStore>> {
+    verify_args
+        .tsa_trust_store
+        .as_deref()
+        .map(load_tsa_trust_store)
+        .transpose()
+}
+
 /// Execute single file verification
-fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
+fn execute_single(
+    verify_args: &VerifyArgs,
+    args: &Args,
+    trust_store: Option<&TrustStore>,
+) -> CliResult<()> {
     // Perform verification FIRST (loads receipt, hashes file)
-    let result = verify_single(&verify_args.source, &verify_args.receipt)?;
+    let result = verify_single(&verify_args.source, &verify_args.receipt, trust_store)?;
 
     // Determine mode AFTER we know if receipt has anchors
     // This avoids unnecessary network check for lite receipts
@@ -45,7 +68,7 @@ fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
             .build()
             .map_err(|e| CliError::NetworkError(format!("Failed to create runtime: {e}")))?;
 
-        let online_result = rt.block_on(verify_single_online(result, &config))?;
+        let online_result = rt.block_on(verify_single_online(result, &config, trust_store))?;
 
         // Output online result
         output::print_single_online_result(&online_result, args)?;
@@ -80,9 +103,13 @@ fn execute_single(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
 }
 
 /// Execute batch verification
-fn execute_batch(verify_args: &VerifyArgs, args: &Args) -> CliResult<()> {
+fn execute_batch(
+    verify_args: &VerifyArgs,
+    args: &Args,
+    trust_store: Option<&TrustStore>,
+) -> CliResult<()> {
     // Perform batch verification FIRST
-    let result = verify_batch(&verify_args.source, &verify_args.receipt)?;
+    let result = verify_batch(&verify_args.source, &verify_args.receipt, trust_store)?;
 
     // Check if ANY receipt has anchors
     let has_any_anchors = result.items.iter().any(|item| match item {
@@ -127,6 +154,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let args = Args {
             command: Command::Inspect(crate::cli::InspectArgs {
@@ -148,6 +176,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let args = Args {
             command: Command::Inspect(crate::cli::InspectArgs {
@@ -184,6 +213,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         let args = Args {
@@ -193,6 +223,7 @@ mod tests {
                 offline: false,
                 online: false,
                 verbose: false,
+                tsa_trust_store: None,
             }),
             quiet: true,
             json: false,

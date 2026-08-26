@@ -132,6 +132,21 @@ pub struct VerifyArgs {
     /// Useful for debugging verification failures.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Trusted TSA root certificates, for RFC 3161 anchor verification
+    ///
+    /// Path to a PEM file (one or more concatenated certificates), a single
+    /// DER-encoded certificate, or a directory containing such files.
+    ///
+    /// Per the ATL Protocol trust model, this tool ships with NO built-in
+    /// TSA roots: without this flag, an RFC 3161 anchor's certificate chain
+    /// can at best be reported "Assumed" (cryptographically sound, but
+    /// nobody vouches for the root) and NEVER counts toward a valid
+    /// verification result. Pass the root(s) you have obtained through some
+    /// trusted channel (e.g. the TSA operator's published root bundle) to
+    /// let matching anchors be reported "Trusted" instead.
+    #[arg(long, value_hint = ValueHint::AnyPath)]
+    pub tsa_trust_store: Option<PathBuf>,
 }
 
 /// Arguments for the inspect command
@@ -428,6 +443,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         assert!(args.is_batch_mode());
 
@@ -437,6 +453,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         assert!(!args2.is_batch_mode());
     }
@@ -449,6 +466,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: true,
+            tsa_trust_store: None,
         };
         assert!(args.is_verbose());
 
@@ -458,6 +476,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         assert!(!args2.is_verbose());
     }
@@ -470,6 +489,7 @@ mod tests {
             offline: true,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let mode = args.determine_mode().unwrap();
         assert_eq!(mode, VerificationMode::Offline);
@@ -484,6 +504,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let mode = args.determine_mode().unwrap();
         assert_eq!(mode, VerificationMode::Offline);
@@ -498,6 +519,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            tsa_trust_store: None,
         };
         let result = args.determine_mode();
         assert!(result.is_err());
@@ -511,6 +533,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let result = args.validate();
         assert!(result.is_err());
@@ -529,6 +552,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let result = args.validate();
         assert!(result.is_err());
@@ -550,6 +574,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let result = args.validate();
         assert!(result.is_err());
@@ -574,6 +599,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let result = args.validate();
         assert!(result.is_ok());
@@ -594,6 +620,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         let result = args.validate();
         assert!(result.is_ok());
@@ -614,6 +641,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
         // Should still succeed, just prints warning
         let result = args.validate();
@@ -628,6 +656,7 @@ mod tests {
             offline: true,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // --offline flag should return Offline regardless of anchors
@@ -649,6 +678,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // No anchors = should return Offline immediately without network check
@@ -665,6 +695,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // --online flag without online feature should error
@@ -681,6 +712,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // Has anchors but no online feature - should return Offline
@@ -697,6 +729,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // --online flag with online feature - result depends on actual internet
@@ -714,6 +747,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // Auto-detect with anchors and online feature
@@ -730,6 +764,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // --online flag with online feature
@@ -747,6 +782,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            tsa_trust_store: None,
         };
 
         // Auto-detect with online feature

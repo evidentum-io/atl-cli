@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::cli::VerificationMode;
 use crate::error::CliResult;
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
-use crate::verify::online::{AnchorDetails, OnlineVerificationResult};
+use crate::verify::online::{AnchorDetails, OnlineVerificationResult, Rfc3161Trust};
 use crate::verify::single::SingleVerificationResult;
 
 #[derive(Serialize)]
@@ -456,6 +456,39 @@ struct AnchorResultJson {
     block_merkle_root: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     merkle_match: Option<bool>,
+    // RFC 3161 facts (only for rfc3161 type) -- see `Rfc3161AnchorFacts` in
+    // atl-core. Reported as *facts*, not a collapsed verdict, matching the
+    // core API this is built from; `trust_state` is the single tri-state
+    // summary (`"trusted"` / `"assumed"` / `"failed"`) that the human
+    // renderer's status line is built from too, so the two can never
+    // disagree about which of the three states an anchor is in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust_state: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    imprint_matches_root: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cms_signature_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chain_valid_at_gen_time: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamping_eku_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    terminal_anchor: Option<TerminalAnchorJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revocation: Option<&'static str>,
+}
+
+#[derive(Serialize)]
+struct TerminalAnchorJson {
+    /// `"trusted"` if the fingerprint was matched against the caller's
+    /// `--tsa-trust-store`, `"assumed"` if the chain merely terminates in
+    /// an unverified self-signed certificate.
+    kind: &'static str,
+    /// SHA-256 fingerprint of the terminal certificate, with `sha256:`
+    /// prefix, regardless of `kind`.
+    sha256_fingerprint: String,
 }
 
 #[derive(Serialize)]
@@ -481,6 +514,48 @@ struct SingleOnlineResultJson {
     verification: Option<VerificationJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anchor_verification: Option<AnchorVerificationJson>,
+}
+
+/// `Rfc3161Trust` -> the JSON string used for `trust_state`, identical in
+/// spirit to the human renderer's status line ("TRUSTED" / "ASSUMED..." /
+/// "FAILED").
+fn trust_state_str(trust: Rfc3161Trust) -> &'static str {
+    match trust {
+        Rfc3161Trust::Trusted => "trusted",
+        Rfc3161Trust::Assumed => "assumed",
+        Rfc3161Trust::Failed => "failed",
+    }
+}
+
+/// `atl_core::PathStatus` -> a stable lowercase JSON string.
+fn path_status_str(status: atl_core::PathStatus) -> &'static str {
+    match status {
+        atl_core::PathStatus::Complete => "complete",
+        atl_core::PathStatus::Incomplete => "incomplete",
+        atl_core::PathStatus::Invalid => "invalid",
+    }
+}
+
+/// `atl_core::Revocation` -> a stable lowercase JSON string. Only
+/// `NotChecked` exists today (see the type's own docs), but this is written
+/// as a `match` so a future variant fails to compile here instead of
+/// silently falling through.
+fn revocation_str(revocation: atl_core::Revocation) -> &'static str {
+    match revocation {
+        atl_core::Revocation::NotChecked => "not_checked",
+    }
+}
+
+/// `atl_core::TerminalAnchor` -> its JSON representation.
+fn terminal_anchor_json(anchor: atl_core::TerminalAnchor) -> TerminalAnchorJson {
+    let (kind, fingerprint) = match anchor {
+        atl_core::TerminalAnchor::Trusted { sha256_fingerprint } => ("trusted", sha256_fingerprint),
+        atl_core::TerminalAnchor::Assumed { sha256_fingerprint } => ("assumed", sha256_fingerprint),
+    };
+    TerminalAnchorJson {
+        kind,
+        sha256_fingerprint: format!("sha256:{}", hex::encode(fingerprint)),
+    }
 }
 
 /// Format nanoseconds timestamp to ISO 8601 string
@@ -562,6 +637,43 @@ fn build_single_online_result_json(result: &OnlineVerificationResult) -> SingleO
                         _ => (None, None, None, None, None, None, None),
                     };
 
+                    // Extract RFC 3161 facts. `trust_state` is derived from
+                    // the very same `AnchorDetails::rfc3161_trust()` the
+                    // human renderer's status line uses (via `a.verified`,
+                    // which is `true` iff that method returns `Trusted`), so
+                    // JSON and human output are structurally unable to
+                    // disagree about which of the three states an anchor is
+                    // in.
+                    let (
+                        imprint_matches_root,
+                        cms_signature_valid,
+                        chain_valid_at_gen_time,
+                        timestamping_eku_ok,
+                        path_status,
+                        terminal_anchor,
+                        revocation,
+                    ) = match &a.details {
+                        AnchorDetails::Rfc3161 {
+                            imprint_matches_root,
+                            cms_signature_valid,
+                            chain_valid_at_gen_time,
+                            timestamping_eku_ok,
+                            path_status,
+                            terminal_anchor,
+                            revocation,
+                        } => (
+                            Some(*imprint_matches_root),
+                            Some(*cms_signature_valid),
+                            Some(*chain_valid_at_gen_time),
+                            Some(*timestamping_eku_ok),
+                            Some(path_status_str(*path_status)),
+                            terminal_anchor.map(terminal_anchor_json),
+                            Some(revocation_str(*revocation)),
+                        ),
+                        _ => (None, None, None, None, None, None, None),
+                    };
+                    let trust_state = a.details.rfc3161_trust().map(trust_state_str);
+
                     AnchorResultJson {
                         anchor_type: a.anchor_type.clone(),
                         verified: a.verified,
@@ -575,6 +687,14 @@ fn build_single_online_result_json(result: &OnlineVerificationResult) -> SingleO
                         computed_root,
                         block_merkle_root,
                         merkle_match,
+                        trust_state,
+                        imprint_matches_root,
+                        cms_signature_valid,
+                        chain_valid_at_gen_time,
+                        timestamping_eku_ok,
+                        path_status,
+                        terminal_anchor,
+                        revocation,
                     }
                 })
                 .collect(),
@@ -1131,6 +1251,14 @@ mod tests {
             computed_root: Some("sha256:def456".to_string()),
             block_merkle_root: Some("sha256:def456".to_string()),
             merkle_match: Some(true),
+            trust_state: None,
+            imprint_matches_root: None,
+            cms_signature_valid: None,
+            chain_valid_at_gen_time: None,
+            timestamping_eku_ok: None,
+            path_status: None,
+            terminal_anchor: None,
+            revocation: None,
         };
 
         // Act
@@ -1161,6 +1289,17 @@ mod tests {
             computed_root: None,
             block_merkle_root: None,
             merkle_match: None,
+            trust_state: Some("trusted"),
+            imprint_matches_root: Some(true),
+            cms_signature_valid: Some(true),
+            chain_valid_at_gen_time: Some(true),
+            timestamping_eku_ok: Some(true),
+            path_status: Some("complete"),
+            terminal_anchor: Some(TerminalAnchorJson {
+                kind: "trusted",
+                sha256_fingerprint: "sha256:00".to_string(),
+            }),
+            revocation: Some("not_checked"),
         };
 
         // Act
@@ -1171,6 +1310,119 @@ mod tests {
         assert!(!json_str.contains("operation_count"));
         assert!(!json_str.contains("merkle_match"));
         assert!(json_str.contains("timestamp"));
+        assert!(json_str.contains("\"trust_state\":\"trusted\""));
+    }
+
+    #[test]
+    fn assumed_rfc3161_anchor_never_reports_verified_or_trusted() {
+        // Direct regression test for the trust-model requirement: an anchor
+        // whose terminal certificate is `Assumed` must have `verified:
+        // false` and `trust_state: "assumed"` in the JSON, never
+        // `"trusted"` and never `verified: true`.
+        let online = online_result_with_rfc3161_anchor(
+            false,
+            crate::verify::online::AnchorDetails::Rfc3161 {
+                imprint_matches_root: true,
+                cms_signature_valid: true,
+                chain_valid_at_gen_time: true,
+                timestamping_eku_ok: true,
+                path_status: atl_core::PathStatus::Complete,
+                terminal_anchor: Some(atl_core::TerminalAnchor::Assumed {
+                    sha256_fingerprint: [0x33; 32],
+                }),
+                revocation: atl_core::Revocation::NotChecked,
+            },
+        );
+
+        let json = build_single_online_result_json(&online);
+        let value = serde_json::to_value(&json).unwrap();
+
+        assert_eq!(value["status"], "invalid");
+        let anchor = &value["anchor_verification"]["results"][0];
+        assert_eq!(anchor["verified"], false);
+        assert_eq!(anchor["trust_state"], "assumed");
+        assert_eq!(anchor["terminal_anchor"]["kind"], "assumed");
+        assert_eq!(value["anchor_verification"]["all_verified"], false);
+    }
+
+    #[test]
+    fn trusted_rfc3161_anchor_reports_verified_and_trusted_consistently() {
+        let online = online_result_with_rfc3161_anchor(
+            true,
+            crate::verify::online::AnchorDetails::Rfc3161 {
+                imprint_matches_root: true,
+                cms_signature_valid: true,
+                chain_valid_at_gen_time: true,
+                timestamping_eku_ok: true,
+                path_status: atl_core::PathStatus::Complete,
+                terminal_anchor: Some(atl_core::TerminalAnchor::Trusted {
+                    sha256_fingerprint: [0x44; 32],
+                }),
+                revocation: atl_core::Revocation::NotChecked,
+            },
+        );
+
+        let json = build_single_online_result_json(&online);
+        let value = serde_json::to_value(&json).unwrap();
+
+        assert_eq!(value["status"], "valid");
+        let anchor = &value["anchor_verification"]["results"][0];
+        assert_eq!(anchor["verified"], true);
+        assert_eq!(anchor["trust_state"], "trusted");
+        assert_eq!(anchor["terminal_anchor"]["kind"], "trusted");
+        assert_eq!(value["anchor_verification"]["all_verified"], true);
+    }
+
+    fn online_result_with_rfc3161_anchor(
+        verified: bool,
+        details: crate::verify::online::AnchorDetails,
+    ) -> OnlineVerificationResult {
+        use crate::verify::online::AnchorVerificationResult;
+
+        // `receipt.anchors` must be non-empty here -- as it always is in
+        // production, where `anchor_results` is derived directly from the
+        // receipt's own anchors (see `verify_single_online`) -- so
+        // `is_lite_valid()`'s "genuinely unanchored" guard does not
+        // mistake "has an anchor that isn't Trusted" for "has no anchor at
+        // all" and report `status: "pending"` instead of `"invalid"`.
+        let mut receipt = create_test_receipt();
+        receipt.anchors.push(atl_core::ReceiptAnchor::Rfc3161 {
+            target: "data_tree_root".to_string(),
+            target_hash: receipt.proof.root_hash.clone(),
+            tsa_url: "https://example.com/tsa".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            token_der: "base64:dGVzdA==".to_string(),
+        });
+        // `core_result` here only needs to agree with `verified` on
+        // `is_valid` -- its `errors`/`anchor_results` internals are not
+        // what these tests are exercising (that's covered by
+        // `verify::online::tests::rfc3161_trust_*`); what matters is that
+        // `OnlineVerificationResult::is_valid()` (offline AND all anchors)
+        // lands where the scenario says it should.
+        let mut core_result = real_unanchored_core_result();
+        core_result.is_valid = verified;
+        if verified {
+            core_result.errors.clear();
+        }
+        let offline = single_result_with(core_result, receipt);
+        let anchor = AnchorVerificationResult {
+            anchor_type: "rfc3161".to_string(),
+            verified,
+            timestamp_nanos: Some(1_700_000_000_000_000_000),
+            error: if verified {
+                None
+            } else {
+                Some("trust anchor not established".to_string())
+            },
+            details,
+        };
+
+        OnlineVerificationResult {
+            offline,
+            anchor_results: vec![anchor],
+            all_anchors_verified: verified,
+            mode: crate::cli::VerificationMode::Online,
+        }
     }
 
     // ========================================================================

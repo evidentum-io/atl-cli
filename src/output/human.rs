@@ -5,7 +5,7 @@ use colored::Colorize;
 use crate::error::CliResult;
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
 use crate::verify::consistency::ConsistencyResult;
-use crate::verify::online::{AnchorDetails, OnlineVerificationResult};
+use crate::verify::online::{AnchorDetails, OnlineVerificationResult, Rfc3161Trust};
 use crate::verify::single::SingleVerificationResult;
 
 /// Info about a receipt for consistency proof display
@@ -570,10 +570,23 @@ pub fn print_single_online_result(
         for (i, anchor) in result.anchor_results.iter().enumerate() {
             println!("  [{}] {}", i + 1, format_anchor_type(&anchor.anchor_type));
             print!("      Status: ");
-            if anchor.verified {
-                print_status("VALID", true, use_color);
-            } else {
-                print_status("FAILED", false, use_color);
+            // Three-state, honest status line -- see `Rfc3161Trust`. This is
+            // the exact wording the JSON `trust_state` field also uses, so
+            // human and JSON output can never disagree about which of the
+            // three states an RFC 3161 anchor is in (Bitcoin OTS has no
+            // comparable caller-supplied trust axis, so it stays VALID/FAILED).
+            match anchor.details.rfc3161_trust() {
+                Some(Rfc3161Trust::Trusted) => print_status("TRUSTED", true, use_color),
+                Some(Rfc3161Trust::Assumed) => {
+                    print_status_pending("ASSUMED (root not trusted)", use_color);
+                }
+                Some(Rfc3161Trust::Failed) | None => {
+                    if anchor.verified {
+                        print_status("VALID", true, use_color);
+                    } else {
+                        print_status("FAILED", false, use_color);
+                    }
+                }
             }
 
             if let Some(error) = &anchor.error {
@@ -581,7 +594,35 @@ pub fn print_single_online_result(
             }
 
             match &anchor.details {
-                AnchorDetails::Rfc3161 { .. } => {
+                AnchorDetails::Rfc3161 {
+                    imprint_matches_root,
+                    cms_signature_valid,
+                    chain_valid_at_gen_time,
+                    timestamping_eku_ok,
+                    path_status,
+                    terminal_anchor,
+                    revocation,
+                } => {
+                    println!(
+                        "      Facts: imprint={imprint_matches_root} cms_signature={cms_signature_valid} \
+                         chain_at_gen_time={chain_valid_at_gen_time} timestamping_eku={timestamping_eku_ok} \
+                         path_status={path_status:?} revocation={revocation:?}"
+                    );
+                    match terminal_anchor {
+                        Some(atl_core::TerminalAnchor::Trusted { sha256_fingerprint }) => {
+                            println!(
+                                "      Terminal Anchor: Trusted (sha256:{})",
+                                hex::encode(sha256_fingerprint)
+                            );
+                        }
+                        Some(atl_core::TerminalAnchor::Assumed { sha256_fingerprint }) => {
+                            println!(
+                                "      Terminal Anchor: Assumed, untrusted (sha256:{}) -- pass --tsa-trust-store to trust it",
+                                hex::encode(sha256_fingerprint)
+                            );
+                        }
+                        None => println!("      Terminal Anchor: none reached"),
+                    }
                     if let Some(ts) = anchor.timestamp_nanos {
                         println!("      Timestamp: {}", format_timestamp_nanos(ts));
                     }
@@ -1374,7 +1415,7 @@ mod tests {
     }
 
     #[test]
-    fn test_print_single_online_result_with_rfc3161_anchor() {
+    fn test_print_single_online_result_with_rfc3161_anchor_trusted() {
         use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
 
         let offline = SingleVerificationResult {
@@ -1392,7 +1433,15 @@ mod tests {
             timestamp_nanos: Some(1700000000000000000),
             error: None,
             details: AnchorDetails::Rfc3161 {
-                algorithm_oid: "2.16.840.1.101.3.4.2.1".to_string(),
+                imprint_matches_root: true,
+                cms_signature_valid: true,
+                chain_valid_at_gen_time: true,
+                timestamping_eku_ok: true,
+                path_status: atl_core::PathStatus::Complete,
+                terminal_anchor: Some(atl_core::TerminalAnchor::Trusted {
+                    sha256_fingerprint: [0x11; 32],
+                }),
+                revocation: atl_core::Revocation::NotChecked,
             },
         };
 
@@ -1400,6 +1449,51 @@ mod tests {
             offline,
             anchor_results: vec![anchor],
             all_anchors_verified: true,
+            mode: crate::cli::VerificationMode::Online,
+        };
+
+        assert!(print_single_online_result(&result, true).is_ok());
+        assert!(print_single_online_result(&result, false).is_ok());
+    }
+
+    #[test]
+    fn test_print_single_online_result_with_rfc3161_anchor_assumed() {
+        // The `Rfc3161Trust::Assumed` case must render distinctly from both
+        // "TRUSTED" and plain "FAILED" -- this is the case the whole rewrite
+        // exists to make honest.
+        use crate::verify::online::{AnchorDetails, AnchorVerificationResult};
+
+        let offline = SingleVerificationResult {
+            source_path: PathBuf::from("test.pdf"),
+            receipt_path: PathBuf::from("test.pdf.atl"),
+            file_hash: [0xab; 32],
+            file_hash_valid: true,
+            receipt: create_test_receipt(),
+            core_result: create_test_verification_result(true),
+        };
+
+        let anchor = AnchorVerificationResult {
+            anchor_type: "rfc3161".to_string(),
+            verified: false,
+            timestamp_nanos: Some(1700000000000000000),
+            error: Some("trust anchor not established".to_string()),
+            details: AnchorDetails::Rfc3161 {
+                imprint_matches_root: true,
+                cms_signature_valid: true,
+                chain_valid_at_gen_time: true,
+                timestamping_eku_ok: true,
+                path_status: atl_core::PathStatus::Complete,
+                terminal_anchor: Some(atl_core::TerminalAnchor::Assumed {
+                    sha256_fingerprint: [0x22; 32],
+                }),
+                revocation: atl_core::Revocation::NotChecked,
+            },
+        };
+
+        let result = OnlineVerificationResult {
+            offline,
+            anchor_results: vec![anchor],
+            all_anchors_verified: false,
             mode: crate::cli::VerificationMode::Online,
         };
 

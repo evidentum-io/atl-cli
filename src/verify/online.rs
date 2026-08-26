@@ -6,8 +6,12 @@ use crate::verify::single::SingleVerificationResult;
 use std::time::Duration;
 
 use atl_core::core::verify::anchors::bitcoin_ots::verify_ots_anchor_impl;
-use atl_core::core::verify::anchors::rfc3161::verify_rfc3161_anchor_impl;
-use atl_core::{ReceiptAnchor, ANCHOR_TARGET_DATA_TREE_ROOT, ANCHOR_TARGET_SUPER_ROOT};
+use atl_core::core::verify::anchors::rfc3161::verify_rfc3161_token;
+use atl_core::core::verify::iso8601::parse_iso8601_to_nanos;
+use atl_core::{
+    PathStatus, ReceiptAnchor, Revocation, Rfc3161AnchorFacts, TerminalAnchor, TrustStore,
+    ANCHOR_TARGET_DATA_TREE_ROOT, ANCHOR_TARGET_SUPER_ROOT,
+};
 use subtle::ConstantTimeEq;
 
 /// Configuration for online verification
@@ -28,17 +32,57 @@ impl Default for OnlineConfig {
 #[derive(Debug, Clone)]
 pub struct AnchorVerificationResult {
     pub anchor_type: String,
+    /// Full aggregate success for this anchor. For RFC 3161 anchors this is
+    /// [`Rfc3161AnchorFacts::is_fully_valid`] in disguise (equivalently,
+    /// `details.rfc3161_trust() == Some(Rfc3161Trust::Trusted)`): a chain
+    /// that terminates in [`TerminalAnchor::Assumed`] is cryptographically
+    /// sound but this is `false` regardless, by construction — see
+    /// [`AnchorDetails::rfc3161_trust`].
     pub verified: bool,
     pub timestamp_nanos: Option<u64>,
     pub error: Option<String>,
     pub details: AnchorDetails,
 }
 
+/// Tri-state trust outcome for an RFC 3161 anchor, computed once (in
+/// [`AnchorDetails::rfc3161_trust`]) so the human-readable and JSON
+/// renderers can never disagree about which state a receipt is in — see the
+/// ATL trust-model doc's requirement that these three states are reported
+/// honestly and identically everywhere.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rfc3161Trust {
+    /// Every fact holds (`MessageImprint` match, CMS signature, chain
+    /// validity at `genTime`, exclusive critical timeStamping EKU, complete
+    /// path) AND the chain terminates at a certificate the caller's
+    /// `--tsa-trust-store` names. This is the only state that contributes
+    /// to `verified` / `all_anchors_verified` / `status: valid`.
+    Trusted,
+    /// Every cryptographic/structural fact holds, but the chain terminates
+    /// in an unverified self-signed certificate nobody vouches for
+    /// (`TerminalAnchor::Assumed`) — no `--tsa-trust-store` was supplied, or
+    /// it didn't name this root. Per the ATL trust-model decisions, this
+    /// NEVER satisfies aggregate success, however sound the math is.
+    Assumed,
+    /// Some fact failed outright (bad signature, broken chain, wrong
+    /// imprint, missing EKU) or no terminal anchor was reached at all.
+    Failed,
+}
+
 #[derive(Debug, Clone)]
 pub enum AnchorDetails {
+    /// The complete fact set from `atl-core`'s RFC 3161 verifier (see
+    /// [`Rfc3161AnchorFacts`]), carried through unmodified rather than
+    /// collapsed to a single `is_valid: bool` — this is what lets the CLI
+    /// tell "Trusted" apart from "Assumed" instead of reporting both as one
+    /// undifferentiated failure/success.
     Rfc3161 {
-        #[allow(dead_code)]
-        algorithm_oid: String,
+        imprint_matches_root: bool,
+        cms_signature_valid: bool,
+        chain_valid_at_gen_time: bool,
+        timestamping_eku_ok: bool,
+        path_status: PathStatus,
+        terminal_anchor: Option<TerminalAnchor>,
+        revocation: Revocation,
     },
     Bitcoin {
         block_height: u64,
@@ -57,11 +101,56 @@ pub enum AnchorDetails {
     Unknown,
 }
 
+impl AnchorDetails {
+    /// Classify an RFC 3161 anchor's facts into [`Rfc3161Trust`]. Returns
+    /// `None` for any other anchor type (Bitcoin OTS has no comparable
+    /// caller-supplied trust material — its trust comes entirely from the
+    /// Bitcoin blockchain itself).
+    ///
+    /// This is the single place that decides what counts as "Trusted" vs
+    /// "Assumed" vs "Failed"; [`AnchorVerificationResult::verified`], the
+    /// human renderer, and the JSON renderer all derive their state from
+    /// this method (directly or via `verified`) instead of re-deriving the
+    /// classification, so they cannot drift apart.
+    #[must_use]
+    pub fn rfc3161_trust(&self) -> Option<Rfc3161Trust> {
+        let Self::Rfc3161 {
+            imprint_matches_root,
+            cms_signature_valid,
+            chain_valid_at_gen_time,
+            timestamping_eku_ok,
+            path_status,
+            terminal_anchor,
+            ..
+        } = self
+        else {
+            return None;
+        };
+
+        let facts_sound = *imprint_matches_root
+            && *cms_signature_valid
+            && *chain_valid_at_gen_time
+            && *timestamping_eku_ok
+            && matches!(path_status, PathStatus::Complete);
+
+        Some(match (facts_sound, terminal_anchor) {
+            (true, Some(TerminalAnchor::Trusted { .. })) => Rfc3161Trust::Trusted,
+            (true, Some(TerminalAnchor::Assumed { .. })) => Rfc3161Trust::Assumed,
+            _ => Rfc3161Trust::Failed,
+        })
+    }
+}
+
 /// Extended verification result with online checks
 #[derive(Debug)]
 pub struct OnlineVerificationResult {
     pub offline: SingleVerificationResult,
     pub anchor_results: Vec<AnchorVerificationResult>,
+    /// `true` only if every anchor in `anchor_results` has `verified ==
+    /// true`. Per the ATL trust-model decisions, an RFC 3161 anchor stuck at
+    /// `Rfc3161Trust::Assumed` never counts here, no matter how sound its
+    /// cryptography is — this is the field that used to (wrongly) go `true`
+    /// for an anchor nobody vouched for.
     pub all_anchors_verified: bool,
     #[allow(dead_code)]
     pub mode: VerificationMode,
@@ -82,11 +171,7 @@ impl OnlineVerificationResult {
 ///
 /// This delegates to [`atl_core::core::checkpoint::parse_hash`] rather than
 /// reimplementing hash-string parsing, so this crate's notion of "a valid
-/// hash string" can never drift from what `atl-core` itself accepts. An
-/// earlier version of this function had its own hex decoder that (unlike
-/// `atl_core::parse_hash`) also accepted a bare hex string with no
-/// `sha256:` prefix - a protocol-level discrepancy from `atl-core`, since
-/// fixed by reusing the core parser instead of re-deriving its rules.
+/// hash string" can never drift from what `atl-core` itself accepts.
 /// `atl_core::parse_hash` requires the prefix to be exactly `"sha256:"`
 /// (lowercase); it rejects `"SHA256:"`, any other case, and a missing
 /// prefix, matching `hex::decode`'s existing case-insensitivity for the hex
@@ -99,10 +184,61 @@ fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
 ///
 /// `target_hash` values compared here are not secret (they are published
 /// inside the receipt itself), but we still compare them in constant time
-/// to match `atl-core`'s own `verify_anchor` implementation and this
-/// project's general policy of never using `==` on hash/digest values.
+/// to match `atl-core`'s own internal pinning and this project's general
+/// policy of never using `==` on hash/digest values.
 fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     a.ct_eq(b).into()
+}
+
+/// Render a compact, human-readable summary of why an RFC 3161 anchor's
+/// facts did not reach [`Rfc3161Trust::Trusted`], for
+/// [`AnchorVerificationResult::error`].
+///
+/// This mirrors the shape of `atl-core`'s own (private) diagnostic text —
+/// duplicated here only as *prose formatting*, not as a re-derivation of
+/// any trust decision: every fact it reads was already computed by
+/// `atl-core`'s `verify_rfc3161_token`, this function only describes them.
+fn summarize_rfc3161(facts: &Rfc3161AnchorFacts) -> String {
+    let mut reasons = Vec::new();
+    if !facts.imprint_matches_root {
+        reasons.push("messageImprint does not match the receipt's Data Tree root".to_string());
+    }
+    if !facts.cms_signature_valid {
+        reasons.push(match &facts.diagnostic {
+            Some(detail) => format!("CMS signature invalid: {detail}"),
+            None => "CMS signature invalid".to_string(),
+        });
+    }
+    if !facts.chain_valid_at_gen_time {
+        reasons.push(format!(
+            "certificate chain invalid at genTime (path_status: {:?})",
+            facts.path_status
+        ));
+    }
+    if !facts.timestamping_eku_ok {
+        reasons.push(
+            "signer certificate lacks the exclusive critical id-kp-timeStamping EKU".to_string(),
+        );
+    }
+    match &facts.terminal_anchor {
+        Some(TerminalAnchor::Assumed { sha256_fingerprint }) => {
+            reasons.push(format!(
+                "trust anchor not established: chain terminates in an unverified self-signed \
+                 certificate (sha256:{}); this NEVER counts as valid — pass --tsa-trust-store \
+                 to trust it",
+                hex::encode(sha256_fingerprint)
+            ));
+        }
+        None => {
+            reasons.push("no terminal anchor reached (incomplete certificate chain)".to_string())
+        }
+        Some(TerminalAnchor::Trusted { .. }) => {}
+    }
+    if reasons.is_empty() {
+        "verification did not reach aggregate success".to_string()
+    } else {
+        reasons.join("; ")
+    }
 }
 
 /// Verify RFC 3161 anchor using atl-core
@@ -118,47 +254,41 @@ fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 /// it says nothing about whether that hash has anything to do with the
 /// receipt being verified.
 ///
-/// `atl-core` 0.23.x performs exactly this pinning internally, in
-/// `core::verify::helpers::verify_anchor` (using the public
-/// [`atl_core::AnchorVerificationContext`] type plus a constant-time
-/// compare). That function is declared `pub(in crate::core)`, so it is not
-/// reachable from this crate - only `verify_receipt_anchor_only` (used by
+/// `atl-core` performs exactly this pinning internally, in
+/// `core::verify::helpers::verify_rfc3161_anchor` (reachable through the
+/// public [`atl_core::AnchorVerificationContext`] / `VerifyOptions` path).
+/// That helper module is declared `pub(in crate::core)`, so it is not
+/// reachable from this crate directly - only the whole-receipt convenience
+/// functions (`verify_receipt_anchor_only` and friends, used by
 /// [`crate::verify::single::verify_single`] for the offline pass) can reach
-/// it. This online path re-verifies anchors itself (to add TSA/OTS detail
-/// fields such as `algorithm_oid` and Bitcoin block info that the offline
-/// `VerificationResult` does not carry), so it has to duplicate the target
-/// pinning check rather than call into `atl-core` for it. We keep the
-/// duplication to the two lines below and use the same `subtle`
-/// constant-time comparison `atl-core` uses internally.
+/// it, and those collapse each anchor down to a bare `is_valid: bool` with
+/// no TSA/OTS detail fields. This online path re-verifies anchors itself
+/// (to add the rich [`Rfc3161AnchorFacts`] fields and Bitcoin block info
+/// that the offline `VerificationResult` does not carry), so it has to
+/// duplicate the target/`target_hash` pinning check rather than call into
+/// `atl-core` for it. We keep the duplication to the lines below and use
+/// the same `subtle` constant-time comparison `atl-core` uses internally.
 ///
-/// # What "verified: true" actually means on this atl-core version (0.23.2)
+/// # Trust
 ///
 /// Steps 3-5 of the spec are: (3) decode `token_der`, (4) verify the TSA's
 /// cryptographic signature over the token, (5) verify the token's
-/// `messageImprint` matches `anchor.target_hash`. `verify_rfc3161_anchor_impl`
-/// in `atl-core` 0.23.2 (see `core::verify::anchors::rfc3161::{parse_rfc3161_token,
-/// verify_rfc3161_hash}`) only performs steps 3 and 5 - it parses the CMS
-/// `SignedData`/`TSTInfo` structure and compares `messageImprint` against
-/// `expected_root`. **It never verifies the CMS signature, so step 4 does
-/// not happen at all on this dependency version.** Full signature
-/// verification (certificate chain, RSA/ECDSA signature over the signed
-/// content) is implemented in `atl-core` 0.25, which is not yet published to
-/// crates.io - this crate is pinned to the published `0.23` line (see
-/// `Cargo.toml`) and cannot pull it in without a major-version bump.
-///
-/// Practically: a `verified: true` result for an RFC 3161 anchor here means
-/// "the token is well-formed and its claimed hash is pinned to our Data Tree
-/// root" - it does **not** mean "an independent TSA cryptographically
-/// attests to this timestamp". A forged/self-signed token with the right
-/// `messageImprint` would currently also verify. Do not present this as full
-/// TSA trust in output or documentation until `atl-core` 0.25 ships and this
-/// crate can depend on it.
+/// `messageImprint` matches `anchor.target_hash`. All three, plus
+/// certificate-chain construction/validation and Extended Key Usage
+/// checking, are performed by `atl_core::verify_rfc3161_token`, which
+/// returns the full [`Rfc3161AnchorFacts`] rather than a verdict. Per the
+/// ATL trust model (see `docs-md/atl-trust-model-decisions.md`), this crate
+/// ships no TSA roots: without a caller-supplied `trust_store` (from
+/// `--tsa-trust-store`), the best any anchor can reach is
+/// [`Rfc3161Trust::Assumed`] — cryptographically sound, but nobody vouches
+/// for the root — which never counts as `verified: true`.
 fn verify_rfc3161(
     target: &str,
     target_hash: &str,
     timestamp: &str,
     token_der: &str,
     data_tree_root: &str,
+    trust_store: Option<&TrustStore>,
 ) -> AnchorVerificationResult {
     // STEP 1: Validate target
     if target != ANCHOR_TARGET_DATA_TREE_ROOT {
@@ -224,23 +354,43 @@ fn verify_rfc3161(
         format!("base64:{}", token_der)
     };
 
-    // STEPS 3 and 5 (NOT step 4 - see the "What verified: true actually
-    // means" section of this function's doc comment): parses `token_der`
-    // and checks its `messageImprint` against `expected_root`. Does NOT
-    // verify the TSA's cryptographic signature on atl-core 0.23.x. We pass
-    // the receipt's own root hash (now proven equal to the anchor's claim)
-    // as the expected hash - not the anchor's claim itself, so a future
-    // refactor here can't accidentally drop the pinning check above and
-    // still "work".
-    let result = verify_rfc3161_anchor_impl(timestamp, &token_with_prefix, &expected_root);
-
-    AnchorVerificationResult {
-        anchor_type: "rfc3161".to_string(),
-        verified: result.is_valid,
-        timestamp_nanos: result.timestamp,
-        error: result.error,
-        details: AnchorDetails::Rfc3161 {
-            algorithm_oid: "2.16.840.1.101.3.4.2.1".to_string(), // SHA-256
+    // STEPS 3-5 plus trust (see the "Trust" section of this function's doc
+    // comment). We pass the receipt's own root hash (now proven equal to
+    // the anchor's claim) as the expected hash - not the anchor's claim
+    // itself, so a future refactor here can't accidentally drop the
+    // pinning check above and still "work". `trust_store` comes only from
+    // `--tsa-trust-store`, never from anything inside the receipt or token.
+    match verify_rfc3161_token(&token_with_prefix, &expected_root, trust_store) {
+        Ok(facts) => {
+            let details = AnchorDetails::Rfc3161 {
+                imprint_matches_root: facts.imprint_matches_root,
+                cms_signature_valid: facts.cms_signature_valid,
+                chain_valid_at_gen_time: facts.chain_valid_at_gen_time,
+                timestamping_eku_ok: facts.timestamping_eku_ok,
+                path_status: facts.path_status,
+                terminal_anchor: facts.terminal_anchor,
+                revocation: facts.revocation,
+            };
+            let verified = details.rfc3161_trust() == Some(Rfc3161Trust::Trusted);
+            let error = if verified {
+                None
+            } else {
+                Some(summarize_rfc3161(&facts))
+            };
+            AnchorVerificationResult {
+                anchor_type: "rfc3161".to_string(),
+                verified,
+                timestamp_nanos: facts.gen_time.or_else(|| parse_iso8601_to_nanos(timestamp)),
+                error,
+                details,
+            }
+        }
+        Err(e) => AnchorVerificationResult {
+            anchor_type: "rfc3161".to_string(),
+            verified: false,
+            timestamp_nanos: parse_iso8601_to_nanos(timestamp),
+            error: Some(e.to_string()),
+            details: AnchorDetails::Unknown,
         },
     }
 }
@@ -444,9 +594,15 @@ async fn verify_bitcoin_ots(
 }
 
 /// Verify anchors online for single file
+///
+/// `trust_store` carries whatever RFC 3161 trust material the caller passed
+/// via `--tsa-trust-store` (or `None` if they passed nothing); it is
+/// forwarded to every RFC 3161 anchor's verification unchanged and is never
+/// derived from the receipt itself.
 pub async fn verify_single_online(
     result: SingleVerificationResult,
     config: &OnlineConfig,
+    trust_store: Option<&TrustStore>,
 ) -> CliResult<OnlineVerificationResult> {
     let mut anchor_results = Vec::new();
 
@@ -465,7 +621,14 @@ pub async fn verify_single_online(
                 timestamp,
                 token_der,
                 ..
-            } => verify_rfc3161(target, target_hash, timestamp, token_der, data_tree_root),
+            } => verify_rfc3161(
+                target,
+                target_hash,
+                timestamp,
+                token_der,
+                data_tree_root,
+                trust_store,
+            ),
             ReceiptAnchor::BitcoinOts {
                 target,
                 target_hash,
@@ -645,7 +808,13 @@ mod tests {
     #[test]
     fn test_anchor_details_variants() {
         let rfc = AnchorDetails::Rfc3161 {
-            algorithm_oid: "2.16.840.1.101.3.4.2.1".to_string(),
+            imprint_matches_root: true,
+            cms_signature_valid: true,
+            chain_valid_at_gen_time: true,
+            timestamping_eku_ok: true,
+            path_status: PathStatus::Complete,
+            terminal_anchor: None,
+            revocation: Revocation::NotChecked,
         };
         let bitcoin = AnchorDetails::Bitcoin {
             block_height: 800000,
@@ -660,8 +829,11 @@ mod tests {
 
         // Just ensure variants construct properly
         match rfc {
-            AnchorDetails::Rfc3161 { algorithm_oid } => {
-                assert_eq!(algorithm_oid, "2.16.840.1.101.3.4.2.1");
+            AnchorDetails::Rfc3161 {
+                imprint_matches_root,
+                ..
+            } => {
+                assert!(imprint_matches_root);
             }
             _ => panic!("Wrong variant"),
         }
@@ -692,6 +864,96 @@ mod tests {
     }
 
     #[test]
+    fn rfc3161_trust_is_none_for_non_rfc3161_details() {
+        assert_eq!(AnchorDetails::Unknown.rfc3161_trust(), None);
+        let bitcoin = AnchorDetails::Bitcoin {
+            block_height: 1,
+            block_timestamp_secs: 1,
+            target_hash: String::new(),
+            operation_count: 0,
+            computed_root: String::new(),
+            block_merkle_root: None,
+            merkle_match: None,
+        };
+        assert_eq!(bitcoin.rfc3161_trust(), None);
+    }
+
+    #[test]
+    fn rfc3161_trust_is_trusted_only_when_sound_and_caller_trusted() {
+        let sound_and_trusted = AnchorDetails::Rfc3161 {
+            imprint_matches_root: true,
+            cms_signature_valid: true,
+            chain_valid_at_gen_time: true,
+            timestamping_eku_ok: true,
+            path_status: PathStatus::Complete,
+            terminal_anchor: Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [0u8; 32],
+            }),
+            revocation: Revocation::NotChecked,
+        };
+        assert_eq!(
+            sound_and_trusted.rfc3161_trust(),
+            Some(Rfc3161Trust::Trusted)
+        );
+    }
+
+    #[test]
+    fn rfc3161_trust_is_assumed_when_sound_but_terminal_anchor_unverified() {
+        // THE regression test for the bug this rewrite closes: a token can
+        // be entirely cryptographically sound (imprint, CMS signature,
+        // chain, EKU all valid) and STILL never be `Trusted` if nobody
+        // vouches for the terminal certificate.
+        let sound_but_assumed = AnchorDetails::Rfc3161 {
+            imprint_matches_root: true,
+            cms_signature_valid: true,
+            chain_valid_at_gen_time: true,
+            timestamping_eku_ok: true,
+            path_status: PathStatus::Complete,
+            terminal_anchor: Some(TerminalAnchor::Assumed {
+                sha256_fingerprint: [0u8; 32],
+            }),
+            revocation: Revocation::NotChecked,
+        };
+        assert_eq!(
+            sound_but_assumed.rfc3161_trust(),
+            Some(Rfc3161Trust::Assumed)
+        );
+    }
+
+    #[test]
+    fn rfc3161_trust_is_failed_when_any_fact_is_false_even_if_trusted_anchor() {
+        // A `Trusted` terminal anchor does not paper over a broken fact
+        // elsewhere in the chain (e.g. EKU missing) — a trusted root signing
+        // a certificate that is not fit for timestamping must not verify.
+        let broken_eku = AnchorDetails::Rfc3161 {
+            imprint_matches_root: true,
+            cms_signature_valid: true,
+            chain_valid_at_gen_time: true,
+            timestamping_eku_ok: false,
+            path_status: PathStatus::Complete,
+            terminal_anchor: Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [0u8; 32],
+            }),
+            revocation: Revocation::NotChecked,
+        };
+        assert_eq!(broken_eku.rfc3161_trust(), Some(Rfc3161Trust::Failed));
+    }
+
+    #[test]
+    fn rfc3161_trust_is_failed_when_no_terminal_anchor_reached() {
+        let no_anchor = AnchorDetails::Rfc3161 {
+            imprint_matches_root: true,
+            cms_signature_valid: true,
+            chain_valid_at_gen_time: false,
+            timestamping_eku_ok: true,
+            path_status: PathStatus::Incomplete,
+            terminal_anchor: None,
+            revocation: Revocation::NotChecked,
+        };
+        assert_eq!(no_anchor.rfc3161_trust(), Some(Rfc3161Trust::Failed));
+    }
+
+    #[test]
     fn test_anchor_verification_result_creation() {
         let result = AnchorVerificationResult {
             anchor_type: "rfc3161".to_string(),
@@ -699,7 +961,15 @@ mod tests {
             timestamp_nanos: Some(1234567890),
             error: None,
             details: AnchorDetails::Rfc3161 {
-                algorithm_oid: "test".to_string(),
+                imprint_matches_root: true,
+                cms_signature_valid: true,
+                chain_valid_at_gen_time: true,
+                timestamping_eku_ok: true,
+                path_status: PathStatus::Complete,
+                terminal_anchor: Some(TerminalAnchor::Trusted {
+                    sha256_fingerprint: [0u8; 32],
+                }),
+                revocation: Revocation::NotChecked,
             },
         };
         assert_eq!(result.anchor_type, "rfc3161");
@@ -716,6 +986,7 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "base64:token",
             TEST_ROOT_HASH,
+            None,
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
@@ -733,6 +1004,7 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "base64:token",
             TEST_ROOT_HASH,
+            None,
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
@@ -748,6 +1020,7 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "base64:token",
             TEST_ROOT_HASH,
+            None,
         );
         assert!(!result.verified);
         assert!(result.error.is_some());
@@ -757,18 +1030,19 @@ mod tests {
 
     #[test]
     fn test_verify_rfc3161_target_hash_mismatch_fails() {
-        // THE regression test for the bug this fix closes: a well-formed
-        // `target_hash` that simply does not match `proof.root_hash` MUST
-        // be rejected before any TSA token verification is attempted.
-        // Previously this anchor would have been checked only against its
-        // own (unpinned) `target_hash` claim and could report `verified:
-        // true` for a token minted for a completely unrelated hash.
+        // THE regression test for the anchor-pinning bug this fix preserves:
+        // a well-formed `target_hash` that simply does not match
+        // `proof.root_hash` MUST be rejected before any TSA token
+        // verification is attempted, regardless of trust store. A genuine
+        // timestamp token minted for a completely unrelated hash must never
+        // be reported as proof for THIS receipt.
         let result = verify_rfc3161(
             "data_tree_root",
             OTHER_HASH, // does NOT match TEST_ROOT_HASH
             "2024-01-01T00:00:00Z",
             "base64:token",
             TEST_ROOT_HASH,
+            None,
         );
         assert!(!result.verified);
         let error = result.error.expect("mismatch must produce an error");
@@ -788,6 +1062,7 @@ mod tests {
             "2024-01-01T00:00:00Z",
             "base64:token",
             "sha256:not-valid-hex",
+            None,
         );
         assert!(!result.verified);
         let error = result
@@ -797,6 +1072,23 @@ mod tests {
             error.contains("invalid proof.root_hash"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn test_verify_rfc3161_garbage_token_without_trust_store_fails() {
+        // A token that doesn't even parse must fail closed (not panic, not
+        // silently verify) with no trust store supplied.
+        let result = verify_rfc3161(
+            "data_tree_root",
+            TEST_ROOT_HASH,
+            "2024-01-01T00:00:00Z",
+            "base64:c29tZXRva2Vu", // "sometoken", not valid CMS/DER
+            TEST_ROOT_HASH,
+            None,
+        );
+        assert!(!result.verified);
+        assert!(result.error.is_some());
+        assert_eq!(result.details.rfc3161_trust(), None);
     }
 
     #[tokio::test]
@@ -925,7 +1217,7 @@ mod tests {
         let single = create_test_single_result(true);
 
         let config = OnlineConfig::default();
-        let result = verify_single_online(single, &config).await;
+        let result = verify_single_online(single, &config, None).await;
         assert!(result.is_ok());
         let online = result.unwrap();
         assert!(online.anchor_results.is_empty());
@@ -944,7 +1236,7 @@ mod tests {
         });
 
         let config = OnlineConfig::default();
-        let result = verify_single_online(single, &config).await;
+        let result = verify_single_online(single, &config, None).await;
         assert!(result.is_ok());
         let online = result.unwrap();
         assert_eq!(online.anchor_results.len(), 1);
@@ -973,7 +1265,7 @@ mod tests {
         });
 
         let config = OnlineConfig::default();
-        let online = verify_single_online(single, &config)
+        let online = verify_single_online(single, &config, None)
             .await
             .expect("verify_single_online must not error on a structurally valid receipt");
 
@@ -1007,7 +1299,7 @@ mod tests {
         });
 
         let config = OnlineConfig::default();
-        let result = verify_single_online(single, &config).await;
+        let result = verify_single_online(single, &config, None).await;
         assert!(result.is_ok());
         let online = result.unwrap();
         assert_eq!(online.anchor_results.len(), 1);
@@ -1099,7 +1391,13 @@ mod tests {
     #[test]
     fn test_anchor_details_clone() {
         let rfc = AnchorDetails::Rfc3161 {
-            algorithm_oid: "test".to_string(),
+            imprint_matches_root: true,
+            cms_signature_valid: true,
+            chain_valid_at_gen_time: true,
+            timestamping_eku_ok: true,
+            path_status: PathStatus::Complete,
+            terminal_anchor: None,
+            revocation: Revocation::NotChecked,
         };
         let bitcoin = AnchorDetails::Bitcoin {
             block_height: 1,
@@ -1115,7 +1413,10 @@ mod tests {
         let bitcoin_cloned = bitcoin.clone();
 
         match rfc_cloned {
-            AnchorDetails::Rfc3161 { algorithm_oid } => assert_eq!(algorithm_oid, "test"),
+            AnchorDetails::Rfc3161 {
+                imprint_matches_root,
+                ..
+            } => assert!(imprint_matches_root),
             _ => panic!("Wrong variant"),
         }
 
@@ -1147,8 +1448,9 @@ mod tests {
             "data_tree_root",
             TEST_ROOT_HASH,
             "2024-01-01T00:00:00Z",
-            "base64:sometoken",
+            "base64:c29tZXRva2Vu",
             TEST_ROOT_HASH,
+            None,
         );
         // Will fail verification but should not fail on prefix handling
         assert!(!result.verified);
@@ -1163,8 +1465,9 @@ mod tests {
             "data_tree_root",
             TEST_ROOT_HASH,
             "2024-01-01T00:00:00Z",
-            "sometoken",
+            "c29tZXRva2Vu",
             TEST_ROOT_HASH,
+            None,
         );
         // Will fail verification but should not fail on prefix handling
         assert!(!result.verified);

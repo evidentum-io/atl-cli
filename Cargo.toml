@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.6.14"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.92.0"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ path = "test_data/fixtures/generate_test_data.rs"
 
 [dependencies]
 # Core - always required (with online features)
-atl-core = { version = "0.23", features = ["rfc3161-verify", "bitcoin-ots"] }
+atl-core = { version = "0.25", features = ["rfc3161-verify", "bitcoin-ots"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +27,12 @@ thiserror = "2"
 hex = "0.4"
 # Constant-time comparison for anchor target_hash pinning (see src/verify/online.rs)
 subtle = "2"
+# Parsing caller-supplied PEM/DER certificates for `--tsa-trust-store`
+# (src/verify/trust_store.rs). Pinned to the same "0.2" line atl-core itself
+# depends on so `x509_cert::Certificate` is the same type on both sides of
+# the `atl_core::TrustStore::with_anchor_certificate` API.
+x509-cert = "0.2"
+der = "0.7"
 
 # File hashing
 sha2 = "0.10"

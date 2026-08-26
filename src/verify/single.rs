@@ -2,7 +2,9 @@
 
 use std::path::Path;
 
-use atl_core::{verify_receipt_anchor_only, Receipt, VerificationResult};
+use atl_core::{
+    verify_receipt_with_options, Receipt, TrustStore, VerificationResult, VerifyOptions,
+};
 
 use crate::error::{CliError, CliResult};
 use crate::verify::file::{compare_hash, hash_file, MAX_RECEIPT_SIZE};
@@ -114,14 +116,12 @@ impl SingleVerificationResult {
     /// - File hash matches payload_hash
     /// - Core cryptographic proofs are valid (inclusion, super_proof if present)
     ///
-    /// Note: `NoTrustAnchor` error is NOT considered a failure for Receipt-Lite.
-    /// This allows verification of receipts without external anchors (offline mode).
-    ///
-    /// When `super_proof` is None, super proof checks are skipped (nothing to verify).
+    /// Note: `NoTrustAnchor` error is NOT considered a failure for genuinely
+    /// unanchored (Receipt-Lite) receipts -- see [`Self::is_lite_valid`] for
+    /// exactly what "genuinely unanchored" means and why `receipt.anchors`
+    /// must be empty, not just "no anchor happened to verify".
     #[must_use]
     pub fn is_valid(&self) -> bool {
-        use atl_core::VerificationError;
-
         if !self.file_hash_valid {
             return false;
         }
@@ -131,33 +131,9 @@ impl SingleVerificationResult {
             return true;
         }
 
-        // If not valid, check if the only error is NoTrustAnchor
-        // In that case, consider it valid for Receipt-Lite (offline) verification
-        if self.core_result.errors.len() == 1
-            && matches!(
-                self.core_result.errors.first(),
-                Some(VerificationError::NoTrustAnchor)
-            )
-        {
-            // NoTrustAnchor alone is OK - Receipt-Lite verification passed
-            // Check basic inclusion proof
-            if !self.core_result.inclusion_valid {
-                return false;
-            }
-
-            // Super proof checks depend on whether super_proof exists
-            // When super_proof is None, atl-core returns super_inclusion_valid=false
-            // and super_consistency_valid=false - this is expected, not a failure
-            if self.receipt.super_proof.is_some() {
-                return self.core_result.super_inclusion_valid
-                    && self.core_result.super_consistency_valid;
-            }
-
-            // No super_proof = skip super checks
-            return true;
-        }
-
-        false
+        // If not valid, the only carve-out is a genuinely unanchored
+        // (Receipt-Lite) receipt whose only "error" is NoTrustAnchor.
+        self.is_lite_valid()
     }
 
     /// Compute the canonical cryptographic-proof verdict for this result.
@@ -173,14 +149,33 @@ impl SingleVerificationResult {
     /// Check if this is a valid "lite" receipt (no anchors)
     ///
     /// Returns true if:
+    /// - The receipt carries NO anchors at all (genuinely Receipt-Lite --
+    ///   see below for why this is required, not just "no anchor verified")
     /// - File hash matches
     /// - Basic inclusion proof is valid
     /// - If super_proof exists: super proofs are valid
     /// - If super_proof is None: super proof checks are skipped
-    /// - The only "error" is NoTrustAnchor (no external anchors)
+    /// - The only "error" is NoTrustAnchor
+    ///
+    /// # Why `receipt.anchors.is_empty()` is required
+    ///
+    /// `atl-core`'s `NoTrustAnchor` error fires whenever zero anchors ended
+    /// up valid -- which is also exactly what happens for a receipt that
+    /// DOES carry an RFC 3161 anchor whose crypto is sound but whose
+    /// terminal certificate is merely `Assumed` (no `--tsa-trust-store`
+    /// supplied, or it didn't name that root). Without this guard, such a
+    /// receipt would be misreported as "PENDING (unanchored)" -- structurally
+    /// dishonest: it isn't unanchored, its anchor's root just isn't trusted.
+    /// Per the ATL trust-model decisions, `Assumed` must never be presented
+    /// as an acceptable outcome, including this soft "lite" one; it must
+    /// surface as `INVALID` alongside the anchor's own diagnostic.
     #[must_use]
     pub fn is_lite_valid(&self) -> bool {
         use atl_core::VerificationError;
+
+        if !self.receipt.anchors.is_empty() {
+            return false;
+        }
 
         if !self.file_hash_valid {
             return false;
@@ -282,9 +277,19 @@ pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
 /// - Files cannot be read
 /// - Receipt cannot be parsed
 /// - File exceeds size limits
+///
+/// `trust_store` carries whatever RFC 3161 trust material the caller passed
+/// via `--tsa-trust-store` (or `None` if they passed nothing). RFC 3161
+/// certificate-chain verification is pure computation (no network access),
+/// so it runs here in the offline pass too -- an anchor's chain terminating
+/// `Assumed` (no matching trust store) is why `core_result.is_valid` can be
+/// `false` here even for an otherwise cryptographically sound receipt; see
+/// [`SingleVerificationResult::is_lite_valid`] for why that must NOT be
+/// reported as the softer "unanchored" outcome.
 pub fn verify_single(
     source_path: &Path,
     receipt_path: &Path,
+    trust_store: Option<&TrustStore>,
 ) -> CliResult<SingleVerificationResult> {
     // Load receipt first (fast fail if invalid)
     let receipt = load_receipt(receipt_path)?;
@@ -296,8 +301,15 @@ pub fn verify_single(
     let file_hash_valid = compare_hash(&file_hash, &receipt.entry.payload_hash);
 
     // Verify cryptographic proofs using anchor-only verification
-    // ATL Protocol v2.0: NO PUBLIC KEY REQUIRED - trust from anchors
-    let core_result = verify_receipt_anchor_only(&receipt)
+    // ATL Protocol v2.0: NO PUBLIC KEY REQUIRED - trust from anchors.
+    // `rfc3161_trust_store` is threaded straight from the CLI flag -- never
+    // derived from the receipt or the token itself (see the ATL trust-model
+    // decisions doc: no identity lives in the protocol implementation).
+    let options = VerifyOptions {
+        rfc3161_trust_store: trust_store.cloned(),
+        ..Default::default()
+    };
+    let core_result = verify_receipt_with_options(&receipt, options)
         .map_err(|e| CliError::VerificationFailed(e.to_string()))?;
 
     Ok(SingleVerificationResult {

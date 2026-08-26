@@ -213,6 +213,11 @@ pub enum CliError {
     #[allow(dead_code)]
     OtsVerificationFailed(String),
 
+    /// Failed to load `--tsa-trust-store` material (bad path or unparsable
+    /// certificate)
+    #[error("Failed to load TSA trust store: {0}")]
+    TrustStoreError(String),
+
     /// No trust anchor available (ATL Protocol v2.0)
     ///
     /// Per ATL Protocol v2.0, trust is established through external anchors
@@ -278,6 +283,7 @@ impl CliError {
             | Self::EmptyReceiptDirectory(_)
             | Self::NoInternetConnection
             | Self::NetworkError(_)
+            | Self::TrustStoreError(_)
             | Self::Io(_)
             | Self::Json(_)
             | Self::HexDecode(_) => ExitCode::Error,

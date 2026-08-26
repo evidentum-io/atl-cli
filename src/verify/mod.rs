@@ -4,6 +4,7 @@ pub mod batch;
 pub mod consistency;
 pub mod file;
 pub mod single;
+pub mod trust_store;
 
 #[cfg(feature = "online")]
 pub mod online;
@@ -18,3 +19,5 @@ pub use consistency::{verify_consistency, ConsistencyResult};
 pub use file::{compare_hash, format_hash, hash_file, MAX_RECEIPT_SIZE, MAX_SOURCE_FILE_SIZE};
 #[allow(unused_imports)]
 pub use single::{load_receipt, verify_single, ProofVerdict, SingleVerificationResult};
+#[allow(unused_imports)]
+pub use trust_store::load_tsa_trust_store;

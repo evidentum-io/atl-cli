@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use atl_core::TrustStore;
+
 use crate::error::{CliError, CliResult};
 use crate::verify::consistency::{verify_consistency, ConsistencyResult};
 use crate::verify::single::{verify_single, SingleVerificationResult};
@@ -169,7 +171,15 @@ pub fn match_files_to_receipts(
 /// Returns error if:
 /// - Directories cannot be read
 /// - No files or receipts found
-pub fn verify_batch(source_dir: &Path, receipt_dir: &Path) -> CliResult<BatchVerificationResult> {
+///
+/// `trust_store` is forwarded unchanged to every [`verify_single`] call --
+/// see its docs for why RFC 3161 trust verification runs even in this
+/// (offline) batch path.
+pub fn verify_batch(
+    source_dir: &Path,
+    receipt_dir: &Path,
+    trust_store: Option<&TrustStore>,
+) -> CliResult<BatchVerificationResult> {
     // Match files to receipts
     let (matched, unmatched_sources, unmatched_receipts) =
         match_files_to_receipts(source_dir, receipt_dir)?;
@@ -182,7 +192,7 @@ pub fn verify_batch(source_dir: &Path, receipt_dir: &Path) -> CliResult<BatchVer
 
     // Verify each matched pair
     for (source_path, receipt_path) in matched {
-        match verify_single(&source_path, &receipt_path) {
+        match verify_single(&source_path, &receipt_path, trust_store) {
             Ok(result) => {
                 if result.is_valid() {
                     valid_count += 1;
