@@ -16,6 +16,16 @@ pub struct ConsistencyResult {
     pub genesis_super_root: Option<[u8; 32]>,
     /// Number of receipts checked
     pub receipt_count: usize,
+    /// The receipts that took part, by source file name, in the order the
+    /// pairwise checks walked them.
+    ///
+    /// Carried here rather than reconstructed by each renderer. Both
+    /// renderers used to rebuild this list from the batch items with a
+    /// different filter and a different sort key than the check itself used,
+    /// so the `[i] -> [j]` rows named files by positional coincidence rather
+    /// than identity — and dropped names entirely when the two lists
+    /// differed in length.
+    pub participants: Vec<String>,
     /// Cross-receipt verification results
     pub cross_results: Vec<CrossReceiptVerificationResult>,
     /// Specific errors
@@ -63,6 +73,16 @@ pub fn verify_consistency(results: &[SingleVerificationResult]) -> CliResult<Con
                 .and_then(|r| r.receipt.super_proof.as_ref())
                 .map(|sp| parse_hash(&sp.genesis_super_root)),
             receipt_count: results.len(),
+            participants: results
+                .iter()
+                .map(|r| {
+                    r.source_path
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect(),
             cross_results: vec![],
             errors: vec![],
         });
@@ -106,6 +126,19 @@ pub fn verify_consistency(results: &[SingleVerificationResult]) -> CliResult<Con
             .map_or(0, |sp| sp.super_tree_size)
     });
 
+    // Recorded in this order, so a renderer naming the pairs is naming the
+    // receipts that were actually compared.
+    let participants: Vec<String> = sorted
+        .iter()
+        .map(|r| {
+            r.source_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+
     // Verify consecutive pairs
     for window in sorted.windows(2) {
         let (a, b) = (window[0], window[1]);
@@ -126,6 +159,7 @@ pub fn verify_consistency(results: &[SingleVerificationResult]) -> CliResult<Con
         history_consistent,
         genesis_super_root,
         receipt_count: results.len(),
+        participants,
         cross_results,
         errors,
     })

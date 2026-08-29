@@ -18,18 +18,47 @@
 //!
 //! # The dividing line
 //!
-//! [`Status::Invalid`] means at least one fact about the evidence is FALSE:
-//! `imprint_matches_root == false`, `cms_signature_valid == false`,
-//! `timestamping_eku_ok == false`, a certificate path that was found and
-//! failed validation, `target_hash != proof.root_hash`, a broken inclusion
-//! or Super-Tree proof, or a source file whose hash does not match the
-//! receipt.
+//! [`Status::Invalid`] means at least one fact about the evidence was
+//! CHECKED and is FALSE: `message_imprint` is `Mismatch` or `Malformed`,
+//! `cms_signature == Refuted`, `timestamping_eku` names a *checked* EKU
+//! failure (`Absent`/`Malformed`/`NotCritical`/`NotExclusive` — but never
+//! `NotChecked`), a certificate path that was found and failed validation,
+//! `target_hash != proof.root_hash`, a broken inclusion or Super-Tree proof,
+//! or a source file whose hash does not match the receipt.
 //!
-//! [`Status::Untrusted`] means every checkable fact holds, but the chain did
-//! not reach a trust root this verifier was configured with. Both
-//! `TerminalAnchor::Assumed` (a self-signed terminal nobody vouched for) and
-//! `PathStatus::Incomplete` (an issuer certificate is simply missing) land
-//! here: nothing is refuted, material is missing on the verifier's side.
+//! Note that `timestamping_eku_ok == false` is NOT sufficient: that boolean
+//! is also `false` for `TimestampingEku::NotChecked`, where the check never
+//! ran. Branch on the enum, not the boolean.
+//!
+//! [`Status::Untrusted`] means **nothing was refuted** and this verifier
+//! could not finish the check. Note the wording: it does *not* mean every
+//! fact holds — a fact may have been impossible to evaluate at all. Several
+//! distinct situations land here, and only the first two are about missing
+//! trust material:
+//!
+//! - `TerminalAnchor::Assumed` — a self-issued terminal nobody vouched for;
+//! - `PathStatus::Incomplete` — an issuer certificate is simply missing;
+//! - `PathStatus::Indeterminate` — the chain could not be *evaluated* at all
+//!   (a signature algorithm, public-key algorithm or curve `atl-core` does
+//!   not implement — a SHA-1-self-signed root is the common case — or the
+//!   path-exploration depth limit);
+//! - `CmsSignature::Indeterminate` — the token's own CMS signature could not
+//!   be evaluated, for the same class of reason (P-521 and RSA-PSS are not
+//!   implemented);
+//! - `MessageImprint::Indeterminate` — the token's `messageImprint` names a
+//!   hash algorithm `atl-core` does not implement, so it was never compared
+//!   with the receipt's root at all;
+//! - `TimestampingEku::NotChecked` — no signer certificate could be
+//!   established, so its EKU was never examined;
+//! - a `bitcoin_ots` anchor whose confirming block was not fetched
+//!   (`BitcoinBlockNotChecked`) or could not be fetched
+//!   (`BitcoinBlockUnavailable`).
+//!
+//! The `Indeterminate` cases are why `untrusted` may not be described to the
+//! user as "trust material is missing" and nothing more: there the missing
+//! thing may be an algorithm implementation, and telling the user to go find
+//! an intermediate certificate would send them after something that does not
+//! exist. What unites every case is that nothing was refuted.
 //!
 //! [`Status::Pending`] is a receipt with no anchors at all (Receipt-Lite).
 //!
@@ -38,11 +67,15 @@
 //! # `PathStatus::Incomplete` and `chain_valid_at_gen_time`
 //!
 //! `atl-core` reports `chain_valid_at_gen_time == false` whenever the path
-//! is `Incomplete`, because no complete path was validated. That flag being
-//! `false` is therefore NOT by itself evidence that anything is wrong — it
-//! is only a refutation when a candidate path was found and rejected, which
-//! `atl-core` reports distinctly as `PathStatus::Invalid`. The classifier
-//! below inspects `path_status` first for exactly this reason.
+//! is `Incomplete` or `Indeterminate`, because no complete path was
+//! validated. That flag being `false` is therefore NOT by itself evidence
+//! that anything is wrong — it is only a refutation when a candidate path
+//! was found and rejected, which `atl-core` reports distinctly as
+//! `PathStatus::Invalid`. The classifier that applies this rule is
+//! [`crate::verify::anchor::AnchorDetails::rfc3161_verdict`], not anything
+//! in this file: it gathers every refutation before forming a verdict, and
+//! reads `chain_valid_at_gen_time` only for a `Complete` path, where a
+//! `false` really would be a contradiction.
 
 use crate::error::ExitCode;
 
@@ -90,11 +123,20 @@ pub enum ReasonCode {
     TsaTokenUnparsable,
     /// The token's `MessageImprint` does not match the receipt's root hash.
     TsaImprintMismatch,
-    /// The CMS `SignerInfo` signature did not verify.
+    /// The CMS `SignerInfo` signature was checked and did not verify, or a
+    /// required signed attribute is missing, duplicated, malformed or
+    /// mismatched.
     CmsSignatureInvalid,
     /// The signer certificate lacks the exclusive critical
-    /// `id-kp-timeStamping` EKU.
+    /// `id-kp-timeStamping` EKU: the extension is absent, malformed,
+    /// non-critical, or names other purposes. All four were *checked*.
     TsaTimestampingEkuInvalid,
+    /// The token's `messageImprint` is structurally broken — its hash length
+    /// contradicts the algorithm it names. A refutation, but deliberately
+    /// not `tsa_imprint_mismatch`: no comparison could be attempted, so
+    /// calling it a mismatch would explain a proven defect with a cause that
+    /// is not true of it.
+    TsaImprintMalformed,
     /// A certificate path was found and rejected (bad signature, expired at
     /// `genTime`, `BasicConstraints`/`KeyUsage`/path-length violation, or an
     /// unrecognized critical extension).
@@ -108,13 +150,45 @@ pub enum ReasonCode {
     /// The OTS proof's computed Merkle root does not match the real block's.
     BitcoinMerkleRootMismatch,
 
-    // --- Trust material missing (Untrusted) ---
+    // --- Nothing refuted, check not finished (Untrusted) ---
+    //
+    // Two shapes live here: material genuinely missing on this side, and
+    // facts that could not be evaluated at all. Only the former can be
+    // fixed by supplying something.
     /// Every fact holds, but the chain terminates in a certificate no
     /// caller-supplied trust store names.
     TsaRootNotTrusted,
     /// Every fact holds, but chain construction ran out of certificates
     /// before reaching any terminal — an issuer certificate is missing.
     TsaChainIncomplete,
+    /// The signer certificate's timestamping EKU was never examined,
+    /// because no signer certificate could be established in the first
+    /// place. Distinct from `tsa_timestamping_eku_invalid`, which reports a
+    /// check that ran and failed: an unexamined fact may be neither passed
+    /// nor failed.
+    TsaTimestampingEkuNotChecked,
+    /// The token's `messageImprint` could not be *compared* with the
+    /// receipt's root hash: it names a hash algorithm `atl-core` does not
+    /// implement, so no comparison took place. ATL mandates a *minimum* of
+    /// algorithm support, not a prohibition on the rest, so this is the
+    /// verifier's limitation rather than the token's defect — never a
+    /// refutation.
+    TsaImprintIndeterminate,
+    /// The CMS `SignerInfo` signature could not be *evaluated*: it uses a
+    /// signature, digest or public-key algorithm (or an ESS binding hash)
+    /// `atl-core` does not implement — P-521 and RSA-PSS are the concrete
+    /// cases today. Nothing about the signature is asserted, so this is
+    /// never a refutation; it fails closed like any other `untrusted`.
+    CmsSignatureIndeterminate,
+    /// Nothing was refuted and nothing is missing from the token: the
+    /// certificate path could not be *evaluated*. Either a signature on it
+    /// uses cryptography `atl-core` does not implement (an unsupported
+    /// signature algorithm, public-key algorithm or curve — a
+    /// SHA-1-self-signed root is the case that motivated this code), or
+    /// path exploration hit its depth limit. Supplying more certificates
+    /// does not necessarily help; see the anchor's `error` text for what
+    /// actually stopped the check.
+    TsaChainIndeterminate,
     /// The OTS proof is structurally sound but no Bitcoin block was fetched,
     /// so its Merkle root was never confirmed against the chain.
     BitcoinBlockNotChecked,
@@ -127,8 +201,49 @@ pub enum ReasonCode {
     ReceiptUnanchored,
     /// At least one batch item was refuted.
     BatchItemsInvalid,
-    /// No batch item was refuted, but at least one lacks a trust root.
+    /// At least one batch item could not be processed at all — an unreadable
+    /// source file, or a receipt that would not parse.
+    ///
+    /// Maps to [`Status::Error`] and exit code 2, the same outcome
+    /// single-file mode produces for the same input. It used to map to
+    /// `Invalid`, which asserted that the *evidence was refuted* when the
+    /// tool had merely failed to read a file — and made the exit code depend
+    /// on whether the caller passed a file or a directory.
+    ///
+    /// The bucket deliberately does not distinguish "could not open" from
+    /// "would not parse": single-file mode does not either, and matching it
+    /// is the whole point.
+    BatchItemsErrored,
+    /// No batch item was refuted, but at least one could not be verified to
+    /// completion — a missing trust root, or a check that could not be
+    /// performed. See that item's own reason code for which.
     BatchItemsUntrusted,
+    /// At least one batch item carries no anchors at all (Receipt-Lite), so
+    /// the batch as a whole makes no external-time claim.
+    ///
+    /// Never folded into the valid count: [`Status::Valid`] is defined as
+    /// "every anchor reached a configured trust root", and an item with no
+    /// anchors has no such anchor to reach one. A batch of Receipt-Lites
+    /// reported `valid` while single-file mode called the very same receipt
+    /// `pending` — the same word changing meaning with the calling
+    /// convention.
+    BatchItemsPending,
+    /// At least one path the caller named was never verified at all: a
+    /// source file with no matching receipt, or a receipt with no matching
+    /// source file.
+    ///
+    /// This is not cosmetic bookkeeping. The caller pointed at those files
+    /// and asked about them; answering `valid` while silently skipping them
+    /// would report success for work that was never done. Nothing about them
+    /// is refuted — they were simply not checked — so this is `Untrusted`,
+    /// but it must reach the aggregate verdict and the exit code, not just a
+    /// summary line.
+    BatchItemsUnmatched,
+    /// A non-empty batch in which **no** file was verified. A backstop: with
+    /// the buckets above routed correctly this should be unreachable, and it
+    /// exists so that a future change to the counts cannot resurrect a
+    /// `valid` verdict backed by zero verifications.
+    BatchNothingVerified,
     /// Cross-receipt log consistency verification failed.
     LogConsistencyFailed,
 }
@@ -156,16 +271,25 @@ impl ReasonCode {
             Self::CmsSignatureInvalid => "cms_signature_invalid",
             Self::TsaTimestampingEkuInvalid => "tsa_timestamping_eku_invalid",
             Self::TsaChainInvalidAtGenTime => "tsa_chain_invalid_at_gen_time",
+            Self::TsaImprintMalformed => "tsa_imprint_malformed",
+            Self::TsaTimestampingEkuNotChecked => "tsa_timestamping_eku_not_checked",
             Self::SuperProofMissing => "super_proof_missing",
             Self::BitcoinOtsProofInvalid => "bitcoin_ots_proof_invalid",
             Self::BitcoinMerkleRootMismatch => "bitcoin_merkle_root_mismatch",
             Self::TsaRootNotTrusted => "tsa_root_not_trusted",
             Self::TsaChainIncomplete => "tsa_chain_incomplete",
+            Self::TsaImprintIndeterminate => "tsa_imprint_indeterminate",
+            Self::CmsSignatureIndeterminate => "cms_signature_indeterminate",
+            Self::TsaChainIndeterminate => "tsa_chain_indeterminate",
             Self::BitcoinBlockNotChecked => "bitcoin_block_not_checked",
             Self::BitcoinBlockUnavailable => "bitcoin_block_unavailable",
             Self::ReceiptUnanchored => "receipt_unanchored",
             Self::BatchItemsInvalid => "batch_items_invalid",
             Self::BatchItemsUntrusted => "batch_items_untrusted",
+            Self::BatchItemsPending => "batch_items_pending",
+            Self::BatchItemsUnmatched => "batch_items_unmatched",
+            Self::BatchNothingVerified => "batch_nothing_verified",
+            Self::BatchItemsErrored => "batch_items_errored",
             Self::LogConsistencyFailed => "log_consistency_failed",
         }
     }
@@ -177,9 +301,16 @@ impl std::fmt::Display for ReasonCode {
     }
 }
 
-/// The four terminal states a verification can end in.
+/// The five terminal states a verification can end in.
 ///
-/// Ordered by severity so aggregation over a batch is a `max`.
+/// Ordered by severity so aggregation over a batch is a `max`: a refutation
+/// outranks a runtime failure, which outranks an unfinished check, which
+/// outranks an unanchored receipt, which outranks acceptance.
+///
+/// `Error` is deliberately *below* `Invalid`. A neighbouring file that could
+/// not be opened must never conceal a receipt that was checked and refuted —
+/// the same refutations-before-inabilities rule that governs every other
+/// aggregate in this crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Status {
     /// Accepted: every fact holds and every anchor reached a configured
@@ -188,9 +319,23 @@ pub enum Status {
     /// No anchors at all (Receipt-Lite). The proofs may still be sound; the
     /// receipt simply makes no external-time claim.
     Pending,
-    /// Not refuted, not accepted: material is missing on the verifier's
-    /// side (an untrusted terminal root, or an incomplete certificate path).
+    /// Not refuted, not accepted. Either material is missing on the
+    /// verifier's side (an untrusted terminal root, an incomplete
+    /// certificate path, an unfetched Bitcoin block) **or** a fact could not
+    /// be evaluated at all (an imprint, CMS signature or certificate
+    /// signature using cryptography this verifier does not implement). The
+    /// reason code says which; what unites them is that nothing was refuted.
     Untrusted,
+    /// Could not be processed: a file that would not open, or a receipt that
+    /// would not parse. Not a statement about the evidence at all — the tool
+    /// never got far enough to make one.
+    ///
+    /// Exists so that batch mode can report the same thing single-file mode
+    /// does for the same input. Single mode returns a `CliError` (exit 2)
+    /// and never reaches a `Status`; batch mode must still describe the run,
+    /// and calling an unreadable file "refuted" made the contract depend on
+    /// how the tool was invoked.
+    Error,
     /// Refuted: at least one checkable fact is false.
     Invalid,
 }
@@ -203,6 +348,7 @@ impl Status {
             Self::Valid => "valid",
             Self::Pending => "pending",
             Self::Untrusted => "untrusted",
+            Self::Error => "error",
             Self::Invalid => "invalid",
         }
     }
@@ -210,13 +356,22 @@ impl Status {
     /// The process exit code for this status.
     ///
     /// `Untrusted` gets its own code (3) precisely so a script can tell
-    /// "this evidence is broken" (1) from "bring me the trust root" (3)
-    /// without parsing JSON. `Pending` keeps the historical code 0.
+    /// "this evidence is broken" (1) from "I could not finish checking it"
+    /// (3) without parsing JSON. Code 3 covers both missing trust material
+    /// and a check that could not be performed at all — read the reason code
+    /// before telling a user to go and supply something. `Error` is the
+    /// operational code (2): the tool failed to process an input, which says
+    /// nothing about the evidence. `Pending` keeps the historical code 0.
     #[must_use]
     pub const fn exit_code(self) -> ExitCode {
         match self {
             Self::Valid | Self::Pending => ExitCode::Valid,
             Self::Untrusted => ExitCode::Untrusted,
+            // Exit 2, exactly as single-file mode returns for the same
+            // input. A retry system reading 1 as "the evidence is bad" and 2
+            // as "something went wrong on this run" must not be told
+            // different stories by the two modes.
+            Self::Error => ExitCode::Error,
             Self::Invalid => ExitCode::Invalid,
         }
     }
@@ -273,6 +428,16 @@ impl ReceiptVerdict {
         }
     }
 
+    /// A verdict with an explicit status and reason, for aggregates that
+    /// need a state the convenience constructors above do not cover.
+    #[must_use]
+    pub const fn new(status: Status, reason: ReasonCode) -> Self {
+        Self {
+            status,
+            reason_code: Some(reason),
+        }
+    }
+
     /// `true` only for [`Status::Valid`]. Nothing else — in particular not
     /// [`Status::Untrusted`] — may ever be presented as a verified receipt.
     #[must_use]
@@ -322,9 +487,23 @@ mod tests {
 
     #[test]
     fn severity_ordering_makes_invalid_dominate() {
-        assert!(Status::Invalid > Status::Untrusted);
+        assert!(Status::Invalid > Status::Error);
+        assert!(Status::Error > Status::Untrusted);
         assert!(Status::Untrusted > Status::Pending);
         assert!(Status::Pending > Status::Valid);
+    }
+
+    /// A runtime failure exits 2 in every mode, and never claims the
+    /// evidence was refuted.
+    #[test]
+    fn error_status_is_operational_not_a_refutation() {
+        let verdict = ReceiptVerdict::new(Status::Error, ReasonCode::BatchItemsErrored);
+        assert_eq!(verdict.exit_code(), ExitCode::Error);
+        assert_eq!(verdict.exit_code().code(), 2);
+        assert!(!verdict.is_valid());
+        assert_eq!(verdict.status.as_str(), "error");
+        // And it must not be mistaken for the refutation code.
+        assert_ne!(verdict.exit_code(), ExitCode::Invalid);
     }
 
     #[test]
@@ -353,10 +532,19 @@ mod tests {
             ReasonCode::BitcoinMerkleRootMismatch,
             ReasonCode::TsaRootNotTrusted,
             ReasonCode::TsaChainIncomplete,
+            ReasonCode::TsaImprintMalformed,
+            ReasonCode::TsaTimestampingEkuNotChecked,
+            ReasonCode::TsaImprintIndeterminate,
+            ReasonCode::CmsSignatureIndeterminate,
+            ReasonCode::TsaChainIndeterminate,
             ReasonCode::BitcoinBlockNotChecked,
             ReasonCode::BitcoinBlockUnavailable,
             ReasonCode::ReceiptUnanchored,
             ReasonCode::BatchItemsInvalid,
+            ReasonCode::BatchItemsErrored,
+            ReasonCode::BatchItemsPending,
+            ReasonCode::BatchItemsUnmatched,
+            ReasonCode::BatchNothingVerified,
             ReasonCode::BatchItemsUntrusted,
             ReasonCode::LogConsistencyFailed,
         ];

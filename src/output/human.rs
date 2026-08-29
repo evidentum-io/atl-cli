@@ -97,6 +97,30 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     Ok(())
 }
 
+/// The headline for an `untrusted` outcome.
+///
+/// "Trust root unavailable" is simply false for the reasons where the check
+/// could not be *performed*: the root may be present and the obstacle an
+/// unimplemented algorithm. Shared by the single-receipt and batch renderers
+/// so a reader who only skims the headline is told the same thing either way.
+fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
+    match verdict.reason_code {
+        // A pairing problem, not a trust problem: pointing the reader at
+        // --tsa-trust-store here would waste their time entirely.
+        Some(ReasonCode::BatchItemsUnmatched) => {
+            "NOT VERIFIED: some named files were never checked"
+        }
+        Some(ReasonCode::BatchNothingVerified) => "NOT VERIFIED: nothing in this batch was checked",
+        Some(
+            ReasonCode::TsaChainIndeterminate
+            | ReasonCode::CmsSignatureIndeterminate
+            | ReasonCode::TsaImprintIndeterminate
+            | ReasonCode::TsaTimestampingEkuNotChecked,
+        ) => "NOT VERIFIED: the check could not be completed (nothing was refuted)",
+        _ => "NOT VERIFIED: trust root unavailable",
+    }
+}
+
 /// Print the overall status line for one receipt.
 ///
 /// `Untrusted` is deliberately worded so it cannot be read as damage to the
@@ -107,9 +131,17 @@ fn print_receipt_status(verdict: ReceiptVerdict, use_color: bool) {
     match verdict.status {
         Status::Valid => print_status("VALID", true, use_color),
         Status::Pending => print_status_pending("PENDING (unanchored)", use_color),
+        // "Trust root unavailable" is right for the reasons where material
+        // really is missing, and wrong for `TsaChainIndeterminate`, where
+        // the check could not be *performed*. Saying the root is
+        // unavailable there would send the reader looking for a file that
+        // is not the problem.
         Status::Untrusted => {
-            print_status_pending("NOT VERIFIED: trust root unavailable", use_color);
+            print_status_pending(untrusted_headline(verdict), use_color);
         }
+        // Not a statement about the evidence: the tool failed to process an
+        // input and never got far enough to make one.
+        Status::Error => print_status("ERROR: some items could not be processed", false, use_color),
         Status::Invalid => print_status("INVALID", false, use_color),
     }
     if let Some(reason) = verdict.reason_code {
@@ -117,11 +149,16 @@ fn print_receipt_status(verdict: ReceiptVerdict, use_color: bool) {
     }
 }
 
-/// Say exactly what the caller must supply to reach a verdict.
+/// Say exactly why the check could not be finished, and what — if anything
+/// — would finish it.
+///
+/// Not every `Untrusted` reason has a remedy: for the `*_indeterminate` and
+/// `*_not_checked` reasons the obstacle is cryptography this build does not
+/// implement, and those arms say so rather than sending the reader after a
+/// certificate that would not help.
 fn print_trust_hint(anchors: &[AnchorVerificationResult]) {
     println!();
-    println!("The evidence was NOT disproved. This verifier was not given the material");
-    println!("needed to finish checking it:");
+    println!("The evidence was NOT disproved. This verifier could not finish checking it:");
     for anchor in anchors {
         let AnchorVerdict::Untrusted(code) = anchor.verdict else {
             continue;
@@ -141,6 +178,47 @@ fn print_trust_hint(anchors: &[AnchorVerificationResult]) {
                 "  - The token's certificate chain is missing an issuer certificate.\n    \
                  Supply it with --tsa-intermediates, and the root it leads to with \
                  --tsa-trust-store."
+            ),
+            // Deliberately NOT "supply an intermediate or a root": the
+            // chain could not be evaluated, most often because a
+            // certificate on it is signed with cryptography this verifier
+            // does not implement. The anchor's own Detail line names the
+            // actual cause; repeating the certificate advice here would
+            // send the reader after a file that would not help.
+            // Same reasoning as TsaChainIndeterminate below: no certificate
+            // the caller could supply implements a missing algorithm.
+            // A file the caller named and this tool never checked. The
+            // remedy is a naming/pairing fix, not trust material.
+            ReasonCode::BatchItemsUnmatched => println!(
+                "  - One or more files you named were never verified: a source file with\n    \
+                 no matching receipt, or a receipt with no matching source file. The\n    \
+                 convention is <name> alongside <name>.atl. See the Unmatched rows above."
+            ),
+            ReasonCode::BatchNothingVerified => println!(
+                "  - Nothing in this batch was verified. No file reached a verification\n    \
+                 result at all, so there is no evidence to report either way."
+            ),
+            ReasonCode::TsaTimestampingEkuNotChecked => println!(
+                "  - The signer certificate's timestamping EKU was never examined, because\n    \
+                 no signer certificate could be established for this token. Nothing about\n    \
+                 the EKU was refuted."
+            ),
+            ReasonCode::TsaImprintIndeterminate => println!(
+                "  - The token's messageImprint could NOT be compared with this receipt's\n    \
+                 root hash -- nothing about it was refuted. It names a hash algorithm this\n    \
+                 verifier does not implement. No additional certificate will help."
+            ),
+            ReasonCode::CmsSignatureIndeterminate => println!(
+                "  - The token's own CMS signature could NOT be checked -- nothing about it\n    \
+                 was refuted. It uses cryptography this verifier does not implement\n    \
+                 (see the Detail line above). No additional certificate will help."
+            ),
+            ReasonCode::TsaChainIndeterminate => println!(
+                "  - The token's certificate chain could NOT be checked -- nothing about it\n    \
+                 was refuted. See the Detail line above for what stopped the check\n    \
+                 (commonly a signature algorithm this verifier does not implement, such\n    \
+                 as SHA-1 on a long-lived root). If you trust the terminal certificate\n    \
+                 from an external source, naming it with --tsa-trust-store settles it."
             ),
             ReasonCode::BitcoinBlockNotChecked | ReasonCode::BitcoinBlockUnavailable => println!(
                 "  - The Bitcoin block confirming this anchor was not fetched.\n    \
@@ -180,7 +258,13 @@ fn print_anchor_status(anchor: &AnchorVerificationResult, use_color: bool) {
         Some("incomplete") => {
             print_status_pending("NOT TRUSTED (chain incomplete)", use_color);
         }
-        // Bitcoin OTS and anchors rejected before any fact set exists.
+        Some("indeterminate") => {
+            print_status_pending("NOT TRUSTED (could not be checked)", use_color);
+        }
+        // Everything without an RFC 3161 trust-state label: Bitcoin OTS
+        // anchors, anchors rejected before any fact set exists, and RFC 3161
+        // anchors whose label is "failed" (a refuted fact set, printed as
+        // FAILED via the verdict below).
         _ => match anchor.verdict {
             AnchorVerdict::Valid => print_status("VALID", true, use_color),
             AnchorVerdict::Untrusted(_) => {
@@ -198,19 +282,36 @@ fn print_anchor_status(anchor: &AnchorVerificationResult, use_color: bool) {
 fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
     match &anchor.details {
         AnchorDetails::Rfc3161 {
-            imprint_matches_root,
-            cms_signature_valid,
+            message_imprint,
+            cms_signature,
             chain_valid_at_gen_time,
             timestamping_eku_ok,
+            timestamping_eku,
             path_status,
             terminal_anchor,
             revocation,
+            chain_diagnostic,
         } => {
+            let _ = timestamping_eku_ok; // the three-state field below says more
             println!(
-                "      Facts: imprint={imprint_matches_root} cms_signature={cms_signature_valid} \
-                 chain_at_gen_time={chain_valid_at_gen_time} timestamping_eku={timestamping_eku_ok} \
+                "      Facts: imprint={message_imprint:?} cms_signature={cms_signature:?} \
+                 chain_at_gen_time={chain_valid_at_gen_time} timestamping_eku={timestamping_eku:?} \
                  path_status={path_status:?} revocation={revocation:?}"
             );
+            // What stopped the path, in atl-core's own words. Printed for
+            // every non-complete status, including the two that are not
+            // refutations, so a reader can tell "could not check" from
+            // "checked and wrong" without decoding the status name.
+            //
+            // Suppressed on a Complete path: diagnostics can survive from
+            // an alternative path that failed while another succeeded, and
+            // printing those under a TRUSTED heading would read as a
+            // problem where none remains.
+            if !matches!(path_status, atl_core::PathStatus::Complete) {
+                if let Some(detail) = chain_diagnostic {
+                    println!("      Chain: {detail}");
+                }
+            }
             match terminal_anchor {
                 Some(atl_core::TerminalAnchor::Trusted { sha256_fingerprint }) => {
                     println!(
@@ -218,17 +319,36 @@ fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
                         hex::encode(sha256_fingerprint)
                     );
                 }
-                Some(atl_core::TerminalAnchor::Assumed { sha256_fingerprint }) => {
+                Some(atl_core::TerminalAnchor::Assumed {
+                    sha256_fingerprint,
+                    self_signature,
+                }) => {
+                    let self_signature = match self_signature {
+                        atl_core::SelfSignature::Verified => "self-signature verified",
+                        atl_core::SelfSignature::Unverifiable => {
+                            "self-signature NOT checkable here"
+                        }
+                    };
                     println!(
                         "      Terminal Anchor: present but not in any supplied trust store \
-                         (sha256:{}) -- pass it to --tsa-trust-store",
+                         (sha256:{}, {self_signature}) -- pass it to --tsa-trust-store",
                         hex::encode(sha256_fingerprint)
                     );
                 }
                 None => println!("      Terminal Anchor: none reached"),
             }
+            // The number a reader is most likely to lift straight out of
+            // this block, and the whole product promise behind it. Label it
+            // for what it is: only an accepted anchor establishes a time,
+            // and an unqualified "Timestamp:" line under a NOT TRUSTED
+            // status would be read as one anyway.
             if let Some(ts) = anchor.timestamp_nanos {
-                println!("      Timestamp: {}", format_timestamp_nanos(ts));
+                let formatted = format_timestamp_nanos(ts);
+                if anchor.verified() {
+                    println!("      Timestamp: {formatted}");
+                } else {
+                    println!("      Claimed genTime (not established): {formatted}");
+                }
             }
         }
         AnchorDetails::Bitcoin {
@@ -292,15 +412,20 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     println!("==========================");
     println!();
 
-    // Summary
-    let total =
-        result.valid_count + result.invalid_count + result.error_count + result.unmatched_count;
+    // `total_count()` is the single source of truth for the total. Summing
+    // the buckets inline here once omitted `untrusted_count` and printed a
+    // "Files: N total" that did not equal the rows listed underneath it.
+    let total = result.total_count();
     println!("Files: {total} total");
     println!();
 
     println!("Results:");
     print!("  Valid:     ");
     print_count(result.valid_count, result.valid_count > 0, use_color);
+    // Its own row: an unanchored receipt is neither accepted nor a problem,
+    // and folding it into "Valid" made a batch of them read as accepted.
+    print!("  Pending:   ");
+    print_count(result.pending_count, true, use_color);
     print!("  Untrusted: ");
     print_count(
         result.untrusted_count,
@@ -316,41 +441,51 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     println!();
 
     // Collect receipt proof info for display (using super_root, not genesis!)
+    // The receipts that took part, taken from the consistency result rather
+    // than rebuilt here: this list used to apply a different filter and a
+    // different sort key than the check itself, so it named files by
+    // positional coincidence.
     let receipt_infos: Vec<ReceiptProofInfo> = result
-        .items
-        .iter()
-        .filter_map(|item| {
-            // Untrusted items take part in consistency checking too: their
-            // proofs are sound, only their trust root is unavailable.
-            if let BatchItemResult::Valid(r) | BatchItemResult::Untrusted(r) = item {
-                let filename = r
-                    .source_path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                // Get super_root (NOT genesis!) and data_tree_index from receipt
-                let (super_root, data_tree_index) = r
-                    .receipt
-                    .super_proof
-                    .as_ref()
-                    .map(|sp| (sp.super_root.clone(), sp.data_tree_index))
-                    .unwrap_or_else(|| ("none".to_string(), 0));
-
-                Some(ReceiptProofInfo {
-                    filename,
-                    super_root,
-                    data_tree_index,
+        .consistency
+        .as_ref()
+        .map(|c| {
+            c.participants
+                .iter()
+                .map(|name| {
+                    let matching = result.items.iter().find_map(|item| match item {
+                        BatchItemResult::Valid(r)
+                        | BatchItemResult::Pending(r)
+                        | BatchItemResult::Untrusted(r)
+                            if r.source_path
+                                .file_name()
+                                .is_some_and(|f| f == name.as_str()) =>
+                        {
+                            r.receipt.super_proof.as_ref()
+                        }
+                        _ => None,
+                    });
+                    let (super_root, data_tree_index) = matching.map_or_else(
+                        || ("none".to_string(), 0),
+                        |sp| (sp.super_root.clone(), sp.data_tree_index),
+                    );
+                    ReceiptProofInfo {
+                        filename: name.clone(),
+                        super_root,
+                        data_tree_index,
+                    }
                 })
-            } else {
-                None
-            }
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
 
     // Consistency (now with full proof!)
     if let Some(consistency) = &result.consistency {
-        print_consistency(consistency, &receipt_infos, use_color);
+        print_consistency(
+            consistency,
+            &receipt_infos,
+            result.valid_count > 0,
+            use_color,
+        );
     }
 
     // Individual results
@@ -372,6 +507,7 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
 fn print_consistency(
     consistency: &ConsistencyResult,
     receipt_infos: &[ReceiptProofInfo],
+    any_item_accepted: bool,
     use_color: bool,
 ) {
     print!("Log Consistency: ");
@@ -381,6 +517,17 @@ fn print_consistency(
             true,
             use_color,
         );
+        // Consistency is a statement about the log's append-only history
+        // among the receipts listed below -- not about whether any of them
+        // was accepted. A batch where nothing was accepted still prints this
+        // block in green, and a reader skimming for the first coloured word
+        // would take it as reassurance it does not carry.
+        if !any_item_accepted {
+            println!(
+                "  (log history only -- no receipt in this batch was accepted; see the \
+                 status above)"
+            );
+        }
         // Two-part proof explanation
         let cross_count = consistency.cross_results.len();
         print_checkmark("Same log origin (genesis match)", true, use_color);
@@ -486,9 +633,10 @@ fn print_consistency(
 
 fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
     match item {
-        // All three buckets print their item's own verdict, so the bucket
-        // and the printed status cannot drift apart.
+        // Every verified bucket prints its item's own verdict, so the
+        // bucket and the printed status cannot drift apart.
         BatchItemResult::Valid(result)
+        | BatchItemResult::Pending(result)
         | BatchItemResult::Untrusted(result)
         | BatchItemResult::Invalid(result) => {
             println!(
@@ -504,9 +652,14 @@ fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
             match verdict.status {
                 Status::Valid => print_status("VALID", true, use_color),
                 Status::Pending => print_status_pending("PENDING (unanchored)", use_color),
+                // Same split as `print_receipt_status`: "trust root
+                // unavailable" is false for a check that could not be
+                // performed, and a batch row is exactly where a reader skims
+                // the headline without reading the reason code.
                 Status::Untrusted => {
-                    print_status_pending("NOT VERIFIED: trust root unavailable", use_color);
+                    print_status_pending(untrusted_headline(verdict), use_color);
                 }
+                Status::Error => print_status("ERROR (could not be processed)", false, use_color),
                 Status::Invalid => print_status("INVALID", false, use_color),
             }
             if let Some(reason) = verdict.reason_code {
@@ -780,10 +933,12 @@ mod tests {
                 _ => Some("diagnostic detail".to_string()),
             },
             details: AnchorDetails::Rfc3161 {
-                imprint_matches_root: true,
-                cms_signature_valid: true,
+                chain_diagnostic: None,
+                message_imprint: atl_core::MessageImprint::Verified,
+                cms_signature: atl_core::CmsSignature::Verified,
                 chain_valid_at_gen_time: matches!(path_status, PathStatus::Complete),
                 timestamping_eku_ok: true,
+                timestamping_eku: atl_core::TimestampingEku::Ok,
                 path_status,
                 terminal_anchor: terminal,
                 revocation: Revocation::NotChecked,
@@ -795,6 +950,7 @@ mod tests {
     fn batch(valid: usize, untrusted: usize, invalid: usize) -> BatchVerificationResult {
         BatchVerificationResult {
             valid_count: valid,
+            pending_count: 0,
             untrusted_count: untrusted,
             invalid_count: invalid,
             error_count: 0,
@@ -816,6 +972,37 @@ mod tests {
         let result = single_result(false, false);
         assert!(print_single_result(&result, false).is_ok());
         assert_eq!(result.verdict().status, Status::Invalid);
+    }
+
+    /// The two `untrusted` headlines must stay distinct, and both renderers
+    /// must use the same helper: a batch row is exactly where a reader skims
+    /// the headline and never reaches the reason code, so "trust root
+    /// unavailable" there for a check that could not be performed would be
+    /// the last place this rework's defect could survive.
+    #[test]
+    fn untrusted_headline_distinguishes_missing_material_from_unfinishable() {
+        let missing = untrusted_headline(ReceiptVerdict::untrusted(ReasonCode::TsaChainIncomplete));
+        assert!(
+            missing.contains("trust root unavailable"),
+            "genuinely missing material keeps the actionable wording: {missing}"
+        );
+
+        for reason in [
+            ReasonCode::TsaChainIndeterminate,
+            ReasonCode::CmsSignatureIndeterminate,
+            ReasonCode::TsaImprintIndeterminate,
+            ReasonCode::TsaTimestampingEkuNotChecked,
+        ] {
+            let headline = untrusted_headline(ReceiptVerdict::untrusted(reason));
+            assert!(
+                !headline.contains("trust root unavailable"),
+                "{reason:?} is not a missing root: {headline}"
+            );
+            assert!(
+                headline.contains("nothing was refuted"),
+                "{reason:?} must still say nothing was refuted: {headline}"
+            );
+        }
     }
 
     #[test]
@@ -850,6 +1037,7 @@ mod tests {
             PathStatus::Complete,
             Some(TerminalAnchor::Assumed {
                 sha256_fingerprint: [0x11; 32],
+                self_signature: atl_core::SelfSignature::Verified,
             }),
         );
         assert_eq!(result.verdict().status, Status::Untrusted);
@@ -949,6 +1137,7 @@ mod tests {
     fn batch_items_render_every_bucket() {
         let result = BatchVerificationResult {
             valid_count: 1,
+            pending_count: 0,
             untrusted_count: 1,
             invalid_count: 1,
             error_count: 1,
@@ -962,6 +1151,7 @@ mod tests {
                     PathStatus::Complete,
                     Some(TerminalAnchor::Assumed {
                         sha256_fingerprint: [0x22; 32],
+                        self_signature: atl_core::SelfSignature::Verified,
                     }),
                 )),
                 BatchItemResult::Invalid(single_result(false, false)),

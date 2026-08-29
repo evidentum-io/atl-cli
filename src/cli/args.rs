@@ -38,10 +38,13 @@ pub struct Args {
     /// Use the exit code to determine verification result:
     /// - 0: VALID (also PENDING, an unanchored Receipt-Lite)
     /// - 1: INVALID (the evidence was refuted)
-    /// - 2: ERROR (runtime error)
-    /// - 3: UNTRUSTED (nothing refuted; this verifier lacks the trust
-    ///   material -- supply --tsa-trust-store / --tsa-intermediates, or
-    ///   network access for a Bitcoin anchor)
+    /// - 2: ERROR (an input could not be processed -- says nothing about
+    ///   the evidence)
+    /// - 3: UNTRUSTED (nothing refuted; the check could not be finished --
+    ///   either trust material is missing on this side, or the certificate
+    ///   path could not be evaluated at all. See reason_code and the
+    ///   anchor's error text before assuming a certificate is what is
+    ///   needed)
     #[arg(short, long, global = true)]
     pub quiet: bool,
 
@@ -80,9 +83,13 @@ pub enum Command {
     /// 4. Verify Merkle inclusion proof
     /// 5. Verify Super-Tree proofs
     ///
-    /// **Additional steps (online):**
-    /// 6. Verify RFC 3161 TSA anchor (certificate chain)
-    /// 7. Verify Bitcoin OTS anchor (blockchain confirmation)
+    /// 6. Verify RFC 3161 TSA anchors: token decoding, CMS signature,
+    ///    certificate chain, validity at genTime, EKU. This is pure
+    ///    computation and needs no network.
+    ///
+    /// **Additional step (online):**
+    /// 7. Verify Bitcoin OTS anchors by fetching the block whose Merkle
+    ///    root confirms the proof. The only step that needs the network.
     ///
     /// **Batch mode also verifies:**
     /// - Log consistency (all receipts from same append-only log)
@@ -112,10 +119,13 @@ pub struct VerifyArgs {
     #[arg(value_hint = ValueHint::AnyPath)]
     pub receipt: PathBuf,
 
-    /// Force offline mode (skip online verification)
+    /// Force offline mode (skip the Bitcoin block lookup)
     ///
-    /// Even if internet is available, only perform cryptographic
-    /// proof verification without checking external anchors.
+    /// Even if internet is available, perform no network access. RFC 3161
+    /// anchors are still verified in full -- that is pure computation. What
+    /// is skipped is fetching the Bitcoin block that confirms an OTS proof,
+    /// so a bitcoin_ots anchor can at best report "not confirmed" and the
+    /// receipt cannot reach "valid" through it.
     ///
     /// Useful for:
     /// - Faster verification
@@ -124,13 +134,17 @@ pub struct VerifyArgs {
     #[arg(long)]
     pub offline: bool,
 
-    /// Force online mode (fail if no internet)
+    /// Require connectivity for anchors that need it
     ///
-    /// Requires internet connectivity. If no internet is available,
-    /// verification fails with an error instead of falling back to
-    /// offline mode.
+    /// If the receipt has an anchor that needs the network (only
+    /// bitcoin_ots does) and no internet is available, verification fails
+    /// with an error instead of falling back to offline mode.
     ///
-    /// Useful when you require anchor verification for trust.
+    /// A receipt with no such anchor -- an RFC 3161-only receipt, say -- is
+    /// verified without any network access and reports mode "offline" even
+    /// under this flag. Nothing is probed, and nothing fails: there is
+    /// simply nothing online to do, and claiming otherwise would be a
+    /// verification result the tool did not perform.
     #[arg(long, conflicts_with = "offline")]
     pub online: bool,
 
@@ -171,6 +185,15 @@ pub struct VerifyArgs {
     /// "tsa_chain_incomplete" -- some TSAs (notably Sectigo and DigiCert)
     /// ship tokens whose topmost certificate is cross-signed by a legacy
     /// root that the token itself does not include.
+    ///
+    /// It will NOT help with reason "tsa_chain_indeterminate" or
+    /// "cms_signature_indeterminate": there the check could not be performed
+    /// at all (commonly a signature algorithm this verifier does not
+    /// implement, such as SHA-1 on a long-lived root).
+    /// A certificate passed here is checked like any other link on the
+    /// path; the same certificate passed to --tsa-trust-store is an
+    /// external trusted input and is not re-checked (RFC 5280 6.1), which
+    /// is why the two flags can differ on the very same file.
     ///
     /// Keeping this separate from --tsa-trust-store matters: feeding the
     /// missing issuer in as an anchor would silently move your trust

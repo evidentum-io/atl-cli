@@ -13,15 +13,19 @@ use crate::error::CliResult;
 use crate::verify::anchor::{AnchorDetails, AnchorVerificationResult};
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
 use crate::verify::single::SingleVerificationResult;
-use crate::verify::verdict::{ReasonCode, ReceiptVerdict};
+use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
 
 #[derive(Serialize)]
 struct SingleResultJson {
     /// `"valid"` / `"untrusted"` / `"invalid"` / `"pending"`.
     ///
-    /// `"untrusted"` means nothing about the evidence was refuted: this
-    /// verifier was not given the trust material to finish the check. It is
-    /// never a success — see `reason_code` for what to supply.
+    /// `"untrusted"` means nothing about the evidence was refuted and the
+    /// check could not be finished — either this verifier was not given the
+    /// trust material, or a fact could not be evaluated at all (cryptography
+    /// this verifier does not implement). It is never a success. Read
+    /// `reason_code` before telling anyone what to supply: for the
+    /// `*_indeterminate` and `*_not_checked` reasons there is nothing to
+    /// supply.
     status: &'static str,
     /// Stable machine-readable reason; absent when `status` is `"valid"`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -168,10 +172,35 @@ fn describe(reason: ReasonCode) -> String {
             "TSA certificate chain terminates in a root no trust store names"
         }
         ReasonCode::TsaChainIncomplete => "TSA certificate chain is missing an issuer certificate",
+        ReasonCode::TsaChainIndeterminate => {
+            "TSA certificate chain could not be evaluated; nothing was refuted"
+        }
+        ReasonCode::CmsSignatureIndeterminate => {
+            "CMS signature could not be evaluated; nothing was refuted"
+        }
+        ReasonCode::TsaImprintIndeterminate => {
+            "messageImprint could not be compared; nothing was refuted"
+        }
+        ReasonCode::TsaImprintMalformed => {
+            "messageImprint is malformed: its hash length contradicts the algorithm it names"
+        }
+        ReasonCode::TsaTimestampingEkuNotChecked => {
+            "the signer's timestamping EKU was never examined; no signer was established"
+        }
         ReasonCode::BitcoinBlockNotChecked => "Bitcoin block was not fetched",
         ReasonCode::BitcoinBlockUnavailable => "Bitcoin block lookup failed",
         ReasonCode::BatchItemsInvalid => "One or more items failed verification",
-        ReasonCode::BatchItemsUntrusted => "One or more items reached no configured trust root",
+        ReasonCode::BatchItemsUntrusted => {
+            "One or more items could not be verified to completion; none was refuted"
+        }
+        ReasonCode::BatchItemsUnmatched => {
+            "One or more named files were never verified: no matching receipt or source file"
+        }
+        ReasonCode::BatchNothingVerified => "No file in this batch was verified",
+        ReasonCode::BatchItemsPending => {
+            "One or more receipts carry no anchors, so they make no external-time claim"
+        }
+        ReasonCode::BatchItemsErrored => "One or more items could not be processed",
         ReasonCode::LogConsistencyFailed => "Cross-receipt log consistency verification failed",
         other => return other.as_str().replace('_', " "),
     }
@@ -206,7 +235,16 @@ struct BatchResultJson {
 struct SummaryJson {
     total: usize,
     valid: usize,
-    /// Items that were not refuted but reached no configured trust root.
+    /// Items whose receipts carry no anchors at all (Receipt-Lite).
+    ///
+    /// Counted separately from `valid`, never folded into it: `valid` means
+    /// every anchor reached a configured trust root, and these items have no
+    /// anchors to reach one. Folding them in made a batch of Receipt-Lites
+    /// report `"status": "valid"` while single-file mode called the very
+    /// same receipt `"pending"`.
+    pending: usize,
+    /// Items that were not refuted but could not be verified to completion
+    /// — no configured trust root, or a check that could not be performed.
     untrusted: usize,
     invalid: usize,
     errors: usize,
@@ -231,6 +269,14 @@ struct CrossCheckJson {
     included: bool,
 }
 
+/// One row of a batch report.
+///
+/// `status` is the item's own verdict word for every bucket that reached a
+/// verdict (`valid` / `pending` / `untrusted` / `invalid`), so a row can
+/// never say something the summary contradicts. Two extra words appear for
+/// items that never reached a verdict at all -- `no_receipt` and `no_source`
+/// -- plus `error` for one that could not be processed; all three carry the
+/// aggregate's `reason_code` so they can be joined to the top-level status.
 #[derive(Serialize)]
 struct BatchItemJson {
     file: String,
@@ -269,9 +315,13 @@ fn batch_item_json(result: &SingleVerificationResult) -> BatchItemJson {
         file_hash_match: Some(result.file_hash_valid),
         super_root,
         data_tree_index,
+        // `error` is for outcomes that failed. `Pending` is a successful
+        // outcome (exit 0) whose reason is already carried by `status` and
+        // `reason_code`; labelling it an error would tell a machine consumer
+        // that something went wrong on a run we ourselves call a success.
         error: verdict
             .reason_code
-            .filter(|_| !verdict.is_valid())
+            .filter(|_| !matches!(verdict.status, Status::Valid | Status::Pending))
             .map(describe),
     }
 }
@@ -289,32 +339,16 @@ pub fn print_batch_result(
     source_dir: &std::path::Path,
     receipt_dir: &std::path::Path,
 ) -> CliResult<()> {
-    let total = result.valid_count
-        + result.untrusted_count
-        + result.invalid_count
-        + result.error_count
-        + result.unmatched_count;
+    // Single source of truth for the total: computing it inline here
+    // once omitted `untrusted_count` and printed a total that did not
+    // match the rows beneath it.
+    let total = result.total_count();
 
-    // Build sorted list of items for cross-check file name lookup. Untrusted
-    // items take part in consistency checking too (their proofs are sound),
-    // so they belong in this list alongside valid ones.
-    let mut checked_items_sorted: Vec<_> = result
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            BatchItemResult::Valid(r) | BatchItemResult::Untrusted(r) => {
-                let data_tree_index = r
-                    .receipt
-                    .super_proof
-                    .as_ref()
-                    .map_or(0, |sp| sp.data_tree_index);
-                Some((data_tree_index, file_name(&r.source_path)))
-            }
-            _ => None,
-        })
-        .collect();
-    checked_items_sorted.sort_by_key(|(idx, _)| *idx);
-
+    // The receipts that took part come from the consistency result itself,
+    // in the order it walked them. Rebuilding the list here -- with a
+    // different filter and a different sort key than the check used -- made
+    // the `[i] -> [j]` rows name files by positional coincidence, and emit
+    // empty names whenever the two lists differed in length.
     let consistency = result.consistency.as_ref().map(|c| {
         let cross_checks_passed = c
             .cross_results
@@ -329,14 +363,8 @@ pub fn print_batch_result(
             .map(|(idx, cr)| CrossCheckJson {
                 from_index: idx + 1,
                 to_index: idx + 2,
-                from_file: checked_items_sorted
-                    .get(idx)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_default(),
-                to_file: checked_items_sorted
-                    .get(idx + 1)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_default(),
+                from_file: c.participants.get(idx).cloned().unwrap_or_default(),
+                to_file: c.participants.get(idx + 1).cloned().unwrap_or_default(),
                 included: cr.history_consistent,
             })
             .collect();
@@ -357,23 +385,30 @@ pub fn print_batch_result(
         .iter()
         .map(|item| match item {
             BatchItemResult::Valid(r)
+            | BatchItemResult::Pending(r)
             | BatchItemResult::Untrusted(r)
             | BatchItemResult::Invalid(r) => batch_item_json(r),
             BatchItemResult::Error { source, error, .. } => BatchItemJson {
                 file: file_name(source),
                 receipt: None,
                 status: "error",
-                reason_code: None,
+                reason_code: Some(ReasonCode::BatchItemsErrored.as_str()),
                 file_hash_match: None,
                 super_root: None,
                 data_tree_index: None,
                 error: Some(error.to_string()),
             },
+            // `status` here is deliberately more specific than the four
+            // `Status` words -- it says which side of the pair is missing.
+            // `reason_code` carries the aggregate's own code so a consumer
+            // can join the item rows to the top-level verdict; without it,
+            // `.items[].reason_code` never yielded `batch_items_unmatched`
+            // and the rows could not explain the status they produced.
             BatchItemResult::NoReceipt(path) => BatchItemJson {
                 file: file_name(path),
                 receipt: None,
                 status: "no_receipt",
-                reason_code: None,
+                reason_code: Some(ReasonCode::BatchItemsUnmatched.as_str()),
                 file_hash_match: None,
                 super_root: None,
                 data_tree_index: None,
@@ -383,7 +418,7 @@ pub fn print_batch_result(
                 file: file_name(path),
                 receipt: None,
                 status: "no_source",
-                reason_code: None,
+                reason_code: Some(ReasonCode::BatchItemsUnmatched.as_str()),
                 file_hash_match: None,
                 super_root: None,
                 data_tree_index: None,
@@ -405,6 +440,7 @@ pub fn print_batch_result(
         summary: SummaryJson {
             total,
             valid: result.valid_count,
+            pending: result.pending_count,
             untrusted: result.untrusted_count,
             invalid: result.invalid_count,
             errors: result.error_count,
@@ -412,11 +448,16 @@ pub fn print_batch_result(
         },
         consistency,
         items,
+        // Same rule as the per-item field: a run that exits 0 must not also
+        // hand back a non-empty `errors`. `Pending` reports itself through
+        // `status` and `reason_code`, which is where a consumer should look.
         errors: match verdict.reason_code {
-            Some(reason) if !verdict.is_valid() => vec![ErrorJson {
-                error_type: reason.as_str().to_string(),
-                message: describe(reason),
-            }],
+            Some(reason) if !matches!(verdict.status, Status::Valid | Status::Pending) => {
+                vec![ErrorJson {
+                    error_type: reason.as_str().to_string(),
+                    message: describe(reason),
+                }]
+            }
             _ => Vec::new(),
         },
     };
@@ -436,10 +477,30 @@ struct AnchorResultJson {
     /// Stable machine-readable reason; absent when `verified` is `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<&'static str>,
+    /// The time this anchor **establishes** — emitted only when `verified`
+    /// is `true`.
+    ///
+    /// A timestamp anchor exists to answer "when did this exist", so this is
+    /// the single number a consumer is most likely to lift straight out and
+    /// act on. Emitting it for an unverified anchor would hand over the
+    /// token's own unchecked claim wearing the name of a verified fact. When
+    /// the anchor is not accepted the key is **absent**, not annotated: a
+    /// script reading `timestamp` gets nothing and fails loudly rather than
+    /// silently trusting a number nobody established.
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp_nanos: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamp: Option<String>,
+    /// The time this anchor **asserts**, emitted only when `verified` is
+    /// `false` — the same value the fields above would have carried, under a
+    /// name that cannot be mistaken for an established fact. Attacker-
+    /// controlled until the anchor verifies: useful for diagnostics and for
+    /// reporting *what was claimed*, never admissible as when something
+    /// existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_timestamp_nanos: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     block_height: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -459,20 +520,41 @@ struct AnchorResultJson {
     merkle_match: Option<bool>,
     // RFC 3161 facts (only for rfc3161 type) -- see `Rfc3161AnchorFacts` in
     // atl-core. Reported as *facts*, not a collapsed verdict.
-    // `trust_state` is the one summary label
-    // (`"trusted"`/`"assumed"`/`"incomplete"`/`"failed"`) the human renderer
-    // uses too, derived from the same classification as `verified` and
+    // `trust_state` is the one summary label the human renderer uses too --
+    // `"trusted"`, `"assumed"` (a self-issued terminal nobody vouched for),
+    // `"incomplete"` (material missing on this side), `"indeterminate"` (a
+    // check that could not be performed at all) or `"failed"` (something was
+    // refuted) -- derived from the same classification as `verified` and
     // `reason_code`, so the three can never disagree.
     #[serde(skip_serializing_if = "Option::is_none")]
     trust_state: Option<&'static str>,
+    /// `"verified"`, `"mismatch"`, `"malformed"`, or `"indeterminate"`.
+    /// Replaces the former `imprint_matches_root` boolean: an imprint whose
+    /// hash algorithm this verifier does not implement was never compared at
+    /// all, and a boolean forced that to be reported as a mismatch.
+    /// `"mismatch"` and `"malformed"` are both refutations but are kept
+    /// apart — a hash length contradicting its own algorithm could never be
+    /// compared, so calling it a mismatch would explain a proven defect with
+    /// the wrong cause.
     #[serde(skip_serializing_if = "Option::is_none")]
-    imprint_matches_root: Option<bool>,
+    message_imprint: Option<&'static str>,
+    /// `"verified"`, `"refuted"`, or `"indeterminate"`. Replaces the former
+    /// `cms_signature_valid` boolean: an algorithm this verifier does not
+    /// implement is neither a valid nor an invalid signature, and a boolean
+    /// forced it to be reported as invalid.
     #[serde(skip_serializing_if = "Option::is_none")]
-    cms_signature_valid: Option<bool>,
+    cms_signature: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     chain_valid_at_gen_time: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timestamping_eku_ok: Option<bool>,
+    /// *Which* RFC 3161 2.3 condition the EKU check landed on: `"ok"`,
+    /// `"absent"`, `"malformed"`, `"not_critical"`, `"not_exclusive"`, or
+    /// `"not_checked"`. `timestamping_eku_ok` keeps the yes/no; this says
+    /// which, because "the TSA issued a signer with no EKU at all" and "the
+    /// extension is duplicated" are different problems.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timestamping_eku: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path_status: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -485,11 +567,19 @@ struct AnchorResultJson {
 struct TerminalAnchorJson {
     /// `"trusted"` if the fingerprint was matched against the caller's
     /// `--tsa-trust-store`, `"assumed"` if the chain merely terminates in
-    /// an unverified self-signed certificate.
+    /// a self-issued certificate nobody vouched for.
     kind: &'static str,
     /// SHA-256 fingerprint of the terminal certificate, with `sha256:`
     /// prefix, regardless of `kind`.
     sha256_fingerprint: String,
+    /// For `kind: "assumed"` only: `"verified"` when that certificate's
+    /// signature over itself was checked and holds, `"unverifiable"` when
+    /// this verifier could not check it at all (an unsupported signature
+    /// algorithm — SHA-1-self-signed roots are the common case). Absent for
+    /// `kind: "trusted"`, where the caller vouched for the certificate and
+    /// its self-signature is beside the point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    self_signature: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -503,7 +593,43 @@ fn path_status_str(status: atl_core::PathStatus) -> &'static str {
     match status {
         atl_core::PathStatus::Complete => "complete",
         atl_core::PathStatus::Incomplete => "incomplete",
+        atl_core::PathStatus::Indeterminate => "indeterminate",
         atl_core::PathStatus::Invalid => "invalid",
+    }
+}
+
+/// `atl_core::MessageImprint` -> a stable lowercase JSON string. Written as
+/// a `match` so a future variant fails to compile here rather than silently
+/// acquiring a wrong label.
+fn message_imprint_str(imprint: atl_core::MessageImprint) -> &'static str {
+    match imprint {
+        atl_core::MessageImprint::Verified => "verified",
+        atl_core::MessageImprint::Mismatch => "mismatch",
+        atl_core::MessageImprint::Malformed => "malformed",
+        atl_core::MessageImprint::Indeterminate => "indeterminate",
+    }
+}
+
+/// `atl_core::CmsSignature` -> a stable lowercase JSON string. Written as a
+/// `match` so a future variant fails to compile here rather than silently
+/// falling through to a wrong label.
+fn cms_signature_str(signature: atl_core::CmsSignature) -> &'static str {
+    match signature {
+        atl_core::CmsSignature::Verified => "verified",
+        atl_core::CmsSignature::Refuted => "refuted",
+        atl_core::CmsSignature::Indeterminate => "indeterminate",
+    }
+}
+
+/// `atl_core::TimestampingEku` -> a stable `snake_case` JSON string.
+fn timestamping_eku_str(eku: atl_core::TimestampingEku) -> &'static str {
+    match eku {
+        atl_core::TimestampingEku::Ok => "ok",
+        atl_core::TimestampingEku::NotChecked => "not_checked",
+        atl_core::TimestampingEku::Absent => "absent",
+        atl_core::TimestampingEku::Malformed => "malformed",
+        atl_core::TimestampingEku::NotCritical => "not_critical",
+        atl_core::TimestampingEku::NotExclusive => "not_exclusive",
     }
 }
 
@@ -519,13 +645,26 @@ fn revocation_str(revocation: atl_core::Revocation) -> &'static str {
 
 /// `atl_core::TerminalAnchor` -> its JSON representation.
 fn terminal_anchor_json(anchor: atl_core::TerminalAnchor) -> TerminalAnchorJson {
-    let (kind, fingerprint) = match anchor {
-        atl_core::TerminalAnchor::Trusted { sha256_fingerprint } => ("trusted", sha256_fingerprint),
-        atl_core::TerminalAnchor::Assumed { sha256_fingerprint } => ("assumed", sha256_fingerprint),
+    let (kind, fingerprint, self_signature) = match anchor {
+        atl_core::TerminalAnchor::Trusted { sha256_fingerprint } => {
+            ("trusted", sha256_fingerprint, None)
+        }
+        atl_core::TerminalAnchor::Assumed {
+            sha256_fingerprint,
+            self_signature,
+        } => (
+            "assumed",
+            sha256_fingerprint,
+            Some(match self_signature {
+                atl_core::SelfSignature::Verified => "verified",
+                atl_core::SelfSignature::Unverifiable => "unverifiable",
+            }),
+        ),
     };
     TerminalAnchorJson {
         kind,
         sha256_fingerprint: format!("sha256:{}", hex::encode(fingerprint)),
+        self_signature,
     }
 }
 
@@ -579,40 +718,54 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
     };
 
     let (
-        imprint_matches_root,
-        cms_signature_valid,
+        message_imprint,
+        cms_signature,
         chain_valid_at_gen_time,
         timestamping_eku_ok,
+        timestamping_eku,
         path_status,
         terminal_anchor,
         revocation,
     ) = match &anchor.details {
         AnchorDetails::Rfc3161 {
-            imprint_matches_root,
-            cms_signature_valid,
+            message_imprint,
+            cms_signature,
             chain_valid_at_gen_time,
             timestamping_eku_ok,
+            timestamping_eku,
             path_status,
             terminal_anchor,
             revocation,
+            ..
         } => (
-            Some(*imprint_matches_root),
-            Some(*cms_signature_valid),
+            Some(message_imprint_str(*message_imprint)),
+            Some(cms_signature_str(*cms_signature)),
             Some(*chain_valid_at_gen_time),
             Some(*timestamping_eku_ok),
+            Some(timestamping_eku_str(*timestamping_eku)),
             Some(path_status_str(*path_status)),
             terminal_anchor.map(terminal_anchor_json),
             Some(revocation_str(*revocation)),
         ),
-        _ => (None, None, None, None, None, None, None),
+        _ => (None, None, None, None, None, None, None, None),
+    };
+
+    let (established_time, claimed_time) = if anchor.verified() {
+        (anchor.timestamp_nanos, None)
+    } else {
+        (None, anchor.timestamp_nanos)
     };
 
     AnchorResultJson {
         anchor_type: anchor.anchor_type.clone(),
         verified: anchor.verified(),
         reason_code: anchor.verdict.reason_code().map(ReasonCode::as_str),
-        timestamp_nanos: anchor.timestamp_nanos,
-        timestamp: anchor.timestamp_nanos.and_then(format_timestamp_iso),
+        // Established vs. claimed: the same value, but only one of the two
+        // names is ever emitted, decided by the verdict.
+        timestamp_nanos: established_time,
+        timestamp: established_time.and_then(format_timestamp_iso),
+        claimed_timestamp_nanos: claimed_time,
+        claimed_timestamp: claimed_time.and_then(format_timestamp_iso),
         block_height,
         block_timestamp,
         error: anchor.error.clone(),
@@ -622,10 +775,11 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
         block_merkle_root,
         merkle_match,
         trust_state: anchor.details.rfc3161_trust_state(),
-        imprint_matches_root,
-        cms_signature_valid,
+        message_imprint,
+        cms_signature,
         chain_valid_at_gen_time,
         timestamping_eku_ok,
+        timestamping_eku,
         path_status,
         terminal_anchor,
         revocation,
@@ -700,10 +854,12 @@ mod tests {
                 _ => Some("detail".to_string()),
             },
             details: AnchorDetails::Rfc3161 {
-                imprint_matches_root: true,
-                cms_signature_valid: true,
+                chain_diagnostic: None,
+                message_imprint: atl_core::MessageImprint::Verified,
+                cms_signature: atl_core::CmsSignature::Verified,
                 chain_valid_at_gen_time: terminal.is_some(),
                 timestamping_eku_ok: true,
+                timestamping_eku: atl_core::TimestampingEku::Ok,
                 // A terminal certificate exists only for a complete path;
                 // keep the fixture internally consistent with what atl-core
                 // would actually report.
@@ -759,6 +915,7 @@ mod tests {
             AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted),
             Some(TerminalAnchor::Assumed {
                 sha256_fingerprint: [0x11; 32],
+                self_signature: atl_core::SelfSignature::Verified,
             }),
         ));
 
@@ -818,6 +975,7 @@ mod tests {
             AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted),
             Some(TerminalAnchor::Assumed {
                 sha256_fingerprint: [0x11; 32],
+                self_signature: atl_core::SelfSignature::Verified,
             }),
         ));
         result.anchor_results.push(rfc3161_anchor(
@@ -854,6 +1012,7 @@ mod tests {
     fn batch_summary_counts_untrusted_separately() {
         let result = BatchVerificationResult {
             valid_count: 1,
+            pending_count: 0,
             untrusted_count: 2,
             invalid_count: 0,
             error_count: 0,
@@ -875,6 +1034,7 @@ mod tests {
     fn batch_with_failures_is_invalid() {
         let result = BatchVerificationResult {
             valid_count: 1,
+            pending_count: 0,
             untrusted_count: 1,
             invalid_count: 1,
             error_count: 0,
@@ -893,6 +1053,7 @@ mod tests {
     fn batch_items_render_every_bucket() {
         let result = BatchVerificationResult {
             valid_count: 1,
+            pending_count: 0,
             untrusted_count: 1,
             invalid_count: 1,
             error_count: 1,
@@ -996,14 +1157,33 @@ mod tests {
     fn stable_string_maps_cover_every_variant() {
         assert_eq!(path_status_str(PathStatus::Complete), "complete");
         assert_eq!(path_status_str(PathStatus::Incomplete), "incomplete");
+        assert_eq!(path_status_str(PathStatus::Indeterminate), "indeterminate");
         assert_eq!(path_status_str(PathStatus::Invalid), "invalid");
         assert_eq!(revocation_str(Revocation::NotChecked), "not_checked");
         assert_eq!(
             terminal_anchor_json(TerminalAnchor::Assumed {
-                sha256_fingerprint: [0u8; 32]
+                sha256_fingerprint: [0u8; 32],
+                self_signature: atl_core::SelfSignature::Verified,
             })
             .kind,
             "assumed"
+        );
+        // The self-signature fact rides along with `assumed`, and is absent
+        // for `trusted` (where the caller vouched for the certificate).
+        assert_eq!(
+            terminal_anchor_json(TerminalAnchor::Assumed {
+                sha256_fingerprint: [0u8; 32],
+                self_signature: atl_core::SelfSignature::Unverifiable,
+            })
+            .self_signature,
+            Some("unverifiable")
+        );
+        assert_eq!(
+            terminal_anchor_json(TerminalAnchor::Trusted {
+                sha256_fingerprint: [0u8; 32]
+            })
+            .self_signature,
+            None
         );
     }
 

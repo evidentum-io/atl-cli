@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 rust-version = "1.92.0"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ path = "test_data/fixtures/generate_test_data.rs"
 
 [dependencies]
 # Core - always required (with online features)
-atl-core = { version = "0.25", features = ["rfc3161-verify", "bitcoin-ots"] }
+atl-core = { version = "0.26", features = ["rfc3161-verify", "bitcoin-ots"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

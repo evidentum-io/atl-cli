@@ -93,8 +93,8 @@ fn rfc3161_only_single_reports_offline_even_under_online_flag() {
     // nothing here, which is the whole point.
     assert_eq!(json["anchor_verification"]["results"][0]["type"], "rfc3161");
     assert_eq!(
-        json["anchor_verification"]["results"][0]["cms_signature_valid"],
-        true
+        json["anchor_verification"]["results"][0]["cms_signature"],
+        "verified"
     );
 }
 

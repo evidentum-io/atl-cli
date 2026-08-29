@@ -99,6 +99,7 @@ mod tests {
     fn create_test_batch() -> BatchVerificationResult {
         BatchVerificationResult {
             valid_count: 1,
+            pending_count: 0,
             untrusted_count: 0,
             invalid_count: 0,
             error_count: 0,

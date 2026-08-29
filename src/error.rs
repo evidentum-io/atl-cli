@@ -4,10 +4,16 @@
 //! - 0 = VALID (verification passed; also PENDING, an unanchored receipt)
 //! - 1 = INVALID (the evidence was refuted)
 //! - 2 = ERROR (runtime error)
-//! - 3 = UNTRUSTED (nothing refuted; this verifier lacks the trust material)
+//! - 3 = UNTRUSTED (nothing refuted; the check could not be finished)
 //!
 //! Codes 1 and 3 are deliberately distinct so a script can tell "this
-//! evidence is broken" from "bring me the trust root" without parsing JSON.
+//! evidence is broken" from "I could not finish checking it" without parsing
+//! JSON. Code 2 is equally distinct: it means the tool failed to process an
+//! input and says nothing about the evidence.
+//!
+//! The same input must produce the same code whether it was passed as a file
+//! or as a directory. Batch mode aggregates per-item outcomes; it never
+//! reclassifies them into a different kind of answer.
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -22,9 +28,16 @@ pub enum ExitCode {
     Invalid = 1,
     /// Runtime error (file not found, parse error, network, etc.)
     Error = 2,
-    /// Nothing was refuted, but at least one anchor did not reach a trust
-    /// root this verifier was configured with. The evidence stands; the
-    /// verifier is under-configured.
+    /// Nothing was refuted, and the check could not be finished. Three
+    /// shapes reach this code: an anchor that did not reach a trust root
+    /// this verifier was configured with, a fact that could not be evaluated
+    /// at all (cryptography this build does not implement), and — in batch
+    /// mode — a file the caller named that never paired up with its
+    /// counterpart and was therefore never checked.
+    ///
+    /// The evidence stands in every case. Read the reason code before
+    /// telling anyone what to supply: only the first shape is fixed by
+    /// supplying trust material.
     Untrusted = 3,
 }
 
@@ -141,25 +154,48 @@ pub enum CliError {
     // ========================================================================
     // Trust Material Missing (Exit Code 3: UNTRUSTED)
     // ========================================================================
-    /// Every checkable fact holds, but no anchor reached a trust root this
-    /// verifier was configured with.
+    /// Every checkable fact holds, but the check could not be finished. Three
+    /// shapes reach this variant: no anchor reached a trust root this verifier
+    /// was configured with; the certificate path could not be evaluated at
+    /// all; or, in a batch, a file the caller named had no counterpart to
+    /// check it against.
     ///
     /// This is NOT a verification failure: nothing about the evidence was
-    /// refuted. It is a statement about *this verifier's* configuration, and
-    /// it gets its own exit code so callers never have to guess which of the
+    /// refuted. It is a statement about *this verifier's* limits, and it
+    /// gets its own exit code so callers never have to guess which of the
     /// two happened.
-    #[error("NOT VERIFIED: trust root unavailable ({reason_code}) -- {detail}")]
+    #[error("{headline} ({reason_code}) -- {detail}")]
     TrustNotEstablished {
+        /// Leading phrase. Two are possible, because "trust root
+        /// unavailable" is a lie for
+        /// [`crate::verify::verdict::ReasonCode::TsaChainIndeterminate`]:
+        /// there nothing is unavailable, the check could not be performed.
+        /// See [`Self::untrusted_headline`].
+        headline: &'static str,
         /// Stable machine-readable reason (see
         /// [`crate::verify::verdict::ReasonCode`]).
         reason_code: &'static str,
-        /// What the caller needs to supply.
+        /// What the caller needs to supply, or what stopped the check.
         detail: String,
     },
 
     // ========================================================================
     // Batch Mode Errors (Exit Codes vary)
     // ========================================================================
+    /// One or more batch items could not be processed at all — a file that
+    /// would not open, or a receipt that would not parse.
+    ///
+    /// Exit code 2, matching what single-file mode returns for the very same
+    /// input. This is an operational failure, not a statement about the
+    /// evidence: the tool never got far enough to make one.
+    #[error("ERROR: {errors} of {total} items could not be processed (no item was refuted)")]
+    BatchItemsUnprocessable {
+        /// Items that failed to be read or parsed.
+        errors: usize,
+        /// Total paths named by the caller.
+        total: usize,
+    },
+
     /// No matching receipt found for file (Exit Code 2 if critical, or just warning)
     #[error("No receipt found for file: {0}")]
     #[allow(dead_code)]
@@ -315,6 +351,7 @@ impl CliError {
             | Self::NoFileForReceipt(_)
             | Self::EmptySourceDirectory(_)
             | Self::EmptyReceiptDirectory(_)
+            | Self::BatchItemsUnprocessable { .. }
             | Self::NoInternetConnection
             | Self::NetworkError(_)
             | Self::TrustStoreError(_)

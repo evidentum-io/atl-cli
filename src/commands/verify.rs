@@ -105,7 +105,26 @@ fn execute_batch(
         }
         _ => false,
     });
-    let mode = verify_args.determine_mode_for_receipt(needs_network)?;
+    // Verification has already run at this point, so a failure to settle the
+    // mode must not throw the results away. If the batch already refutes
+    // something, that refutation outranks our inability to go online -- the
+    // same rule the per-anchor classifier follows. Reporting only the mode
+    // error would let an inability suppress a finding we already hold.
+    let mode = match verify_args.determine_mode_for_receipt(needs_network) {
+        Ok(mode) => mode,
+        Err(mode_error) => {
+            // The checks that did run were offline ones, so that is what the
+            // renderer is told -- never `online` for work never done.
+            output::print_batch_result(
+                &result,
+                args,
+                VerificationMode::Offline,
+                &verify_args.source,
+                &verify_args.receipt,
+            )?;
+            return Err(batch_error(&result).unwrap_or(mode_error));
+        }
+    };
 
     // Actually go online, per item, instead of merely reporting that we did.
     // This used to compute `mode` and hand it to the renderer without ever
@@ -151,7 +170,15 @@ fn single_error(verify_args: &VerifyArgs, result: &SingleVerificationResult) -> 
     let verdict = result.verdict();
     match verdict.status {
         Status::Valid | Status::Pending => None,
+        // Single-file mode never produces this status -- an unreadable file
+        // or unparsable receipt returns a `CliError` long before a verdict
+        // exists -- but the match must stay exhaustive and honest.
+        Status::Error => Some(CliError::BatchItemsUnprocessable {
+            errors: 1,
+            total: 1,
+        }),
         Status::Untrusted => Some(CliError::TrustNotEstablished {
+            headline: untrusted_headline(verdict),
             reason_code: reason_str(verdict),
             detail: trust_hint(result),
         }),
@@ -171,21 +198,70 @@ fn batch_error(result: &BatchVerificationResult) -> Option<CliError> {
     let verdict = result.verdict();
     match verdict.status {
         Status::Valid | Status::Pending => None,
+        // The detail must match the reason. Emitting the trust-root advice
+        // unconditionally told a caller whose filenames simply did not pair
+        // up to go and supply a certificate.
         Status::Untrusted => Some(CliError::TrustNotEstablished {
+            headline: untrusted_headline(verdict),
             reason_code: reason_str(verdict),
-            detail: format!(
-                "{} of {} receipts verified cryptographically but reached no configured trust \
-                 root; supply it with --tsa-trust-store (and --tsa-intermediates if a chain is \
-                 incomplete)",
-                result.untrusted_count,
-                result.valid_count + result.untrusted_count + result.invalid_count
-            ),
+            detail: match verdict.reason_code {
+                Some(ReasonCode::BatchItemsUnmatched) => format!(
+                    "{} of {} named files were never verified: a source file with no matching \
+                     receipt, or a receipt with no matching source file. The convention is \
+                     <name> alongside <name>.atl",
+                    result.unmatched_count,
+                    result.total_count()
+                ),
+                Some(ReasonCode::BatchNothingVerified) => format!(
+                    "none of the {} named files reached a verification result",
+                    result.total_count()
+                ),
+                // `total_count()`, not an inline sum: the sum here omitted
+                // pending, errored and unmatched items and printed "5 of 5"
+                // for an eight-file run.
+                _ => format!(
+                    "{} of {} receipts verified cryptographically but reached no configured \
+                     trust root; supply it with --tsa-trust-store (and --tsa-intermediates if a \
+                     chain is incomplete)",
+                    result.untrusted_count,
+                    result.total_count()
+                ),
+            },
+        }),
+        // Exit 2, matching what single-file mode returns for the same input.
+        Status::Error => Some(CliError::BatchItemsUnprocessable {
+            errors: result.error_count,
+            total: result.total_count(),
         }),
         Status::Invalid => Some(CliError::batch_failed(
             result.valid_count,
             result.invalid_count,
             result.error_count,
         )),
+    }
+}
+
+/// The leading phrase for an `untrusted` outcome.
+///
+/// "Trust root unavailable" is only true of the reasons where trust material
+/// really is what is missing. For the `*_indeterminate` / `*_not_checked`
+/// reasons the root may be right there and the obstacle is an unimplemented
+/// algorithm; for the batch reasons the files were never paired up at all.
+/// Naming a missing trust root in either case sends the reader after
+/// something that would not help.
+fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
+    match verdict.reason_code {
+        Some(ReasonCode::BatchItemsUnmatched) => {
+            "NOT VERIFIED: some named files were never checked"
+        }
+        Some(ReasonCode::BatchNothingVerified) => "NOT VERIFIED: nothing in this batch was checked",
+        Some(
+            ReasonCode::TsaChainIndeterminate
+            | ReasonCode::CmsSignatureIndeterminate
+            | ReasonCode::TsaImprintIndeterminate
+            | ReasonCode::TsaTimestampingEkuNotChecked,
+        ) => "NOT VERIFIED: the check could not be completed (nothing was refuted)",
+        _ => "NOT VERIFIED: trust root unavailable",
     }
 }
 
@@ -237,6 +313,24 @@ fn trust_hint(result: &SingleVerificationResult) -> String {
                  --tsa-intermediates, and the root it leads to with --tsa-trust-store"
                     .to_string()
             }
+            // No certificate-hunting advice here: what is missing may be an
+            // algorithm implementation, not a file. The anchor's own error
+            // text says what actually stopped the check.
+            ReasonCode::TsaTimestampingEkuNotChecked => anchor.error.clone().unwrap_or_else(|| {
+                "no signer certificate could be established, so its timestamping EKU was never \
+                 examined"
+                    .to_string()
+            }),
+            ReasonCode::TsaImprintIndeterminate => anchor.error.clone().unwrap_or_else(|| {
+                "the token's messageImprint could not be compared; nothing was refuted".to_string()
+            }),
+            ReasonCode::CmsSignatureIndeterminate => anchor.error.clone().unwrap_or_else(|| {
+                "the token's CMS signature could not be checked; nothing was refuted".to_string()
+            }),
+            ReasonCode::TsaChainIndeterminate => anchor.error.clone().unwrap_or_else(|| {
+                "the token's certificate chain could not be checked; nothing was refuted"
+                    .to_string()
+            }),
             ReasonCode::BitcoinBlockNotChecked | ReasonCode::BitcoinBlockUnavailable => {
                 "the Bitcoin block confirming this anchor was not fetched; re-run with network \
                  access"

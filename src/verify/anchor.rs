@@ -17,8 +17,9 @@ use atl_core::core::verify::anchors::bitcoin_ots::verify_ots_anchor_impl;
 use atl_core::core::verify::anchors::rfc3161::verify_rfc3161_token;
 use atl_core::core::verify::iso8601::parse_iso8601_to_nanos;
 use atl_core::{
-    PathStatus, ReceiptAnchor, Revocation, Rfc3161AnchorFacts, TerminalAnchor, TrustStore,
-    ANCHOR_TARGET_DATA_TREE_ROOT, ANCHOR_TARGET_SUPER_ROOT,
+    CmsSignature, MessageImprint, PathStatus, ReceiptAnchor, Revocation, Rfc3161AnchorFacts,
+    SelfSignature, TerminalAnchor, TimestampingEku, TrustStore, ANCHOR_TARGET_DATA_TREE_ROOT,
+    ANCHOR_TARGET_SUPER_ROOT,
 };
 use subtle::ConstantTimeEq;
 
@@ -27,17 +28,24 @@ use crate::verify::verdict::ReasonCode;
 /// Verdict for a single anchor.
 ///
 /// The three states mirror [`crate::verify::verdict::Status`] minus
-/// `Pending` (an anchor that exists is never "unanchored"):
-/// `Invalid` means a fact about the anchor is false, `Untrusted` means every
-/// fact holds but the check could not be completed with the material this
-/// verifier was given.
+/// `Pending` (an anchor that exists is never "unanchored"): `Invalid` means
+/// a fact about the anchor was checked and is false; `Untrusted` means
+/// **nothing was refuted** and the check could not be finished.
+///
+/// Note the precise wording of `Untrusted`. It does *not* mean "every fact
+/// holds": a fact may have been impossible to evaluate at all — an imprint
+/// hash algorithm, a CMS signature algorithm or a certificate signature this
+/// verifier does not implement. What unites the state is the absence of any
+/// refutation, not the presence of every confirmation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnchorVerdict {
     /// Every fact holds and the anchor reached a configured trust root.
     Valid,
-    /// Nothing is refuted; trust material is missing on the verifier's side.
+    /// Nothing was refuted, and the check could not be finished: either
+    /// trust material is missing on the verifier's side, or a fact could not
+    /// be evaluated at all. See the [`ReasonCode`] for which.
     Untrusted(ReasonCode),
-    /// At least one fact about the anchor is false.
+    /// At least one fact about the anchor was checked and is false.
     Invalid(ReasonCode),
 }
 
@@ -65,7 +73,22 @@ pub struct AnchorVerificationResult {
     pub anchor_type: String,
     /// The single classification every consumer derives from.
     pub verdict: AnchorVerdict,
-    /// Anchor-asserted time, in nanoseconds since the epoch.
+    /// Anchor-**asserted** time, in nanoseconds since the epoch.
+    ///
+    /// What the anchor claims, not what this verifier established. For an
+    /// RFC 3161 anchor it is the token's own `genTime` (or, failing that,
+    /// the receipt's `timestamp` field), populated whenever the token got
+    /// far enough to be parsed — certificate validity has to be evaluated
+    /// against some instant. It is `None` for an anchor rejected before that
+    /// point (a wrong `target`, a malformed hash, a `target_hash` that does
+    /// not pin to this receipt), because such an anchor was never read as a
+    /// token at all.
+    ///
+    /// Only treat it as an established time when [`Self::verdict`] is
+    /// [`AnchorVerdict::Valid`]; the renderers emit it under a `claimed_*`
+    /// name otherwise. For a `bitcoin_ots` anchor it is the confirming
+    /// block's time, and is left `None` unless a block was actually fetched
+    /// and matched.
     pub timestamp_nanos: Option<u64>,
     /// Human-readable elaboration. Never load-bearing: branch on
     /// [`Self::verdict`], not on this text.
@@ -90,19 +113,34 @@ pub enum AnchorDetails {
     /// The complete fact set from `atl-core`'s RFC 3161 verifier (see
     /// [`Rfc3161AnchorFacts`]).
     Rfc3161 {
-        /// The token's `MessageImprint` matches the receipt's root hash.
-        imprint_matches_root: bool,
-        /// The CMS `SignerInfo` signature verified.
-        cms_signature_valid: bool,
+        /// Whether the token's `MessageImprint` matched the receipt's root
+        /// hash, contradicted it, or could not be compared at all.
+        /// Three-valued because an unimplemented hash algorithm means no
+        /// comparison happened — reporting that as a mismatch would assert
+        /// the outcome of a check that never ran.
+        message_imprint: MessageImprint,
+        /// Whether the CMS `SignerInfo` signature verified, was refuted, or
+        /// could not be evaluated at all. Three-valued because an algorithm
+        /// `atl-core` does not implement must not be published as a broken
+        /// signature — see [`AnchorDetails::rfc3161_verdict`].
+        cms_signature: CmsSignature,
         /// Every link on the constructed path was valid at `genTime`.
         ///
         /// `atl-core` reports this as `false` whenever no complete path was
         /// built, so it is only a *refutation* when `path_status` is
         /// [`PathStatus::Invalid`] — see [`AnchorDetails::rfc3161_verdict`].
         chain_valid_at_gen_time: bool,
+        /// What stopped the chain from completing, in prose, when
+        /// `atl-core` had something to say. Never load-bearing.
+        chain_diagnostic: Option<String>,
         /// The signer certificate carries the exclusive critical
         /// `id-kp-timeStamping` EKU.
         timestamping_eku_ok: bool,
+        /// *Which* RFC 3161 2.3 condition the EKU check came out on —
+        /// absent, malformed, non-critical, non-exclusive, or never checked.
+        /// A single boolean cannot tell a caller which, and they call for
+        /// different reactions.
+        timestamping_eku: TimestampingEku,
         /// How chain construction terminated.
         path_status: PathStatus,
         /// The certificate the chain terminated at, if any.
@@ -139,19 +177,29 @@ impl AnchorDetails {
     /// per-anchor verdict, the receipt status, both renderers and the exit
     /// code are all derived from it.
     ///
-    /// The order of the checks is load-bearing. `path_status` is inspected
-    /// *before* `chain_valid_at_gen_time`, because `atl-core` sets that flag
-    /// to `false` for an `Incomplete` path too — where it means "no path was
-    /// validated", not "a path was found and rejected". Reading it as a
-    /// refutation there is exactly the mistake that used to report a
-    /// cross-signed Sectigo/DigiCert chain as broken evidence.
+    /// # Aggregation, not early returns
+    ///
+    /// Every fact is collected before any verdict is formed. An earlier
+    /// version returned as soon as it met a non-`Verified` fact, which meant
+    /// an *inability* encountered first silently suppressed a *refutation*
+    /// found later: `message_imprint: Indeterminate` together with
+    /// `cms_signature: Refuted` came out `untrusted`, even though
+    /// `untrusted` is defined as "nothing was refuted". Having spent this
+    /// whole rework stopping the CLI from accusing without grounds, that
+    /// produced the mirror-image defect — concealing what had actually been
+    /// proved.
+    ///
+    /// So: gather every refutation first; if any exists, the anchor is
+    /// `Invalid`. Only when there is none may an inability be reported, and
+    /// only then can the outcome be `Untrusted`. Any refuted fact outranks
+    /// every indeterminate fact, whichever order they appear in.
     #[must_use]
     pub fn rfc3161_verdict(&self) -> Option<AnchorVerdict> {
         let Self::Rfc3161 {
-            imprint_matches_root,
-            cms_signature_valid,
+            message_imprint,
+            cms_signature,
             chain_valid_at_gen_time,
-            timestamping_eku_ok,
+            timestamping_eku,
             path_status,
             terminal_anchor,
             ..
@@ -160,41 +208,96 @@ impl AnchorDetails {
             return None;
         };
 
-        // Facts that are outright false: the evidence is refuted.
-        if !*imprint_matches_root {
-            return Some(AnchorVerdict::Invalid(ReasonCode::TsaImprintMismatch));
+        // ---- Phase 1: every refutation, gathered before judging ----
+        //
+        // Ordered by how directly each bears on "does this token attest to
+        // THIS receipt", so the reported code is the most informative one
+        // when several hold at once. Which is reported never changes the
+        // verdict: any entry at all means `Invalid`.
+        let mut refutations: Vec<ReasonCode> = Vec::new();
+
+        match message_imprint {
+            MessageImprint::Mismatch => refutations.push(ReasonCode::TsaImprintMismatch),
+            // A structurally broken imprint is refuted too, but calling it a
+            // mismatch would explain a proven defect with the wrong cause.
+            MessageImprint::Malformed => refutations.push(ReasonCode::TsaImprintMalformed),
+            MessageImprint::Verified | MessageImprint::Indeterminate => {}
         }
-        if !*cms_signature_valid {
-            return Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid));
+        if matches!(cms_signature, CmsSignature::Refuted) {
+            refutations.push(ReasonCode::CmsSignatureInvalid);
         }
-        if !*timestamping_eku_ok {
-            return Some(AnchorVerdict::Invalid(
-                ReasonCode::TsaTimestampingEkuInvalid,
+        match timestamping_eku {
+            // Checked, and the certificate does not satisfy RFC 3161 2.3.
+            TimestampingEku::Absent
+            | TimestampingEku::Malformed
+            | TimestampingEku::NotCritical
+            | TimestampingEku::NotExclusive => {
+                refutations.push(ReasonCode::TsaTimestampingEkuInvalid);
+            }
+            // Never examined (no signer was established) — an inability, and
+            // reporting it as an EKU failure would refute on an unchecked
+            // fact. Handled in phase 2.
+            TimestampingEku::Ok | TimestampingEku::NotChecked => {}
+        }
+        match path_status {
+            // A candidate link was found and failed validation.
+            PathStatus::Invalid => refutations.push(ReasonCode::TsaChainInvalidAtGenTime),
+            // A path that completed must also have been valid at genTime;
+            // `atl-core` cannot produce the contrary, but if it ever did,
+            // that is a refutation and not a success.
+            PathStatus::Complete if !*chain_valid_at_gen_time => {
+                refutations.push(ReasonCode::TsaChainInvalidAtGenTime);
+            }
+            PathStatus::Complete | PathStatus::Incomplete | PathStatus::Indeterminate => {}
+        }
+
+        if let Some(reason) = refutations.first() {
+            return Some(AnchorVerdict::Invalid(*reason));
+        }
+
+        // ---- Phase 2: nothing was refuted; report the first inability ----
+        if matches!(message_imprint, MessageImprint::Indeterminate) {
+            return Some(AnchorVerdict::Untrusted(
+                ReasonCode::TsaImprintIndeterminate,
+            ));
+        }
+        if matches!(cms_signature, CmsSignature::Indeterminate) {
+            return Some(AnchorVerdict::Untrusted(
+                ReasonCode::CmsSignatureIndeterminate,
+            ));
+        }
+        if matches!(timestamping_eku, TimestampingEku::NotChecked) {
+            return Some(AnchorVerdict::Untrusted(
+                ReasonCode::TsaTimestampingEkuNotChecked,
             ));
         }
 
         Some(match path_status {
-            // A candidate link was found and failed validation.
-            PathStatus::Invalid => AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime),
             // Ran out of certificates before any terminal: a missing issuer,
             // not a broken one.
             PathStatus::Incomplete => AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete),
-            PathStatus::Complete => {
-                if *chain_valid_at_gen_time {
-                    match terminal_anchor {
-                        Some(TerminalAnchor::Trusted { .. }) => AnchorVerdict::Valid,
-                        Some(TerminalAnchor::Assumed { .. }) => {
-                            AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted)
-                        }
-                        // `Complete` always carries a terminal in atl-core;
-                        // treat the impossible case as missing material
-                        // rather than as a refutation.
-                        None => AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete),
-                    }
-                } else {
-                    AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime)
-                }
+            // The path could not be *evaluated* — unsupported cryptography
+            // or the depth limit. Fail closed, but never a refutation. This
+            // is inspected before `terminal_anchor`, because an
+            // `Indeterminate` path can still carry an `Assumed` terminal
+            // whose self-signature is precisely what could not be checked,
+            // and reporting that as `tsa_root_not_trusted` would name the
+            // wrong problem.
+            PathStatus::Indeterminate => {
+                AnchorVerdict::Untrusted(ReasonCode::TsaChainIndeterminate)
             }
+            PathStatus::Complete => match terminal_anchor {
+                Some(TerminalAnchor::Trusted { .. }) => AnchorVerdict::Valid,
+                Some(TerminalAnchor::Assumed { .. }) => {
+                    AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted)
+                }
+                // `Complete` always carries a terminal in atl-core; treat
+                // the impossible case as missing material rather than as a
+                // refutation.
+                None => AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete),
+            },
+            // Handled in phase 1; unreachable here.
+            PathStatus::Invalid => AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime),
         })
     }
 
@@ -206,6 +309,12 @@ impl AnchorDetails {
         Some(match self.rfc3161_verdict()? {
             AnchorVerdict::Valid => "trusted",
             AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted) => "assumed",
+            AnchorVerdict::Untrusted(
+                ReasonCode::TsaChainIndeterminate
+                | ReasonCode::CmsSignatureIndeterminate
+                | ReasonCode::TsaImprintIndeterminate
+                | ReasonCode::TsaTimestampingEkuNotChecked,
+            ) => "indeterminate",
             AnchorVerdict::Untrusted(_) => "incomplete",
             AnchorVerdict::Invalid(_) => "failed",
         })
@@ -219,7 +328,10 @@ impl AnchorDetails {
     pub fn untrusted_root_fingerprint(&self) -> Option<String> {
         match self {
             Self::Rfc3161 {
-                terminal_anchor: Some(TerminalAnchor::Assumed { sha256_fingerprint }),
+                terminal_anchor:
+                    Some(TerminalAnchor::Assumed {
+                        sha256_fingerprint, ..
+                    }),
                 ..
             } => Some(hex::encode(sha256_fingerprint)),
             _ => None,
@@ -271,19 +383,54 @@ fn rejected(
 /// [`AnchorDetails::rfc3161_verdict`]. This function re-derives nothing.
 fn summarize_rfc3161(facts: &Rfc3161AnchorFacts) -> String {
     let mut reasons = Vec::new();
-    if !facts.imprint_matches_root {
-        reasons.push("messageImprint does not match the receipt's Data Tree root".to_string());
+    match facts.message_imprint {
+        MessageImprint::Verified => {}
+        MessageImprint::Mismatch => {
+            reasons.push("messageImprint does not match the receipt's Data Tree root".to_string());
+        }
+        // Refuted too, but not a mismatch: no comparison could be attempted.
+        MessageImprint::Malformed => {
+            reasons.push(
+                "messageImprint is malformed: its hash length contradicts the hash algorithm it \
+                 names"
+                    .to_string(),
+            );
+        }
+        // No comparison happened, so nothing about the root is claimed, and
+        // no certificate the caller could supply changes that.
+        MessageImprint::Indeterminate => {
+            reasons.push(
+                "messageImprint could not be compared with the receipt's Data Tree root \
+                 (nothing was refuted): it names a hash algorithm this verifier does not \
+                 implement"
+                    .to_string(),
+            );
+        }
     }
-    if !facts.cms_signature_valid {
-        reasons.push(match &facts.diagnostic {
-            Some(detail) => format!("CMS signature invalid: {detail}"),
-            None => "CMS signature invalid".to_string(),
-        });
+    match facts.cms_signature {
+        CmsSignature::Verified => {}
+        CmsSignature::Refuted => {
+            reasons.push(match &facts.diagnostic {
+                Some(detail) => format!("CMS signature invalid: {detail}"),
+                None => "CMS signature invalid".to_string(),
+            });
+        }
+        // Names the real cause, and does not suggest a remedy: no
+        // certificate the caller could supply makes an unimplemented
+        // algorithm implementable.
+        CmsSignature::Indeterminate => {
+            reasons.push(match &facts.diagnostic {
+                Some(detail) => {
+                    format!("CMS signature could not be checked (nothing was refuted): {detail}")
+                }
+                None => "CMS signature could not be checked (nothing was refuted)".to_string(),
+            });
+        }
     }
-    if !facts.timestamping_eku_ok {
-        reasons.push(
-            "signer certificate lacks the exclusive critical id-kp-timeStamping EKU".to_string(),
-        );
+    if let Some(reason) = facts.timestamping_eku.reason() {
+        reasons.push(format!(
+            "signer certificate's id-kp-timeStamping EKU is not usable: {reason}"
+        ));
     }
     match facts.path_status {
         PathStatus::Invalid => {
@@ -296,15 +443,45 @@ fn summarize_rfc3161(facts: &Rfc3161AnchorFacts) -> String {
                     .to_string(),
             );
         }
+        // Deliberately NOT the "supply an intermediate or a root" advice.
+        // The chain could not be *evaluated* — most often because the
+        // certificate is signed with cryptography atl-core does not
+        // implement — and sending the user off to find a certificate they
+        // may already have would waste their time and misdescribe the
+        // problem. Name what actually stopped the check instead.
+        PathStatus::Indeterminate => {
+            reasons.push(match &facts.chain_diagnostic {
+                Some(detail) => format!(
+                    "certificate chain could not be evaluated (nothing was refuted): {detail}"
+                ),
+                None => {
+                    "certificate chain could not be evaluated (nothing was refuted)".to_string()
+                }
+            });
+        }
         PathStatus::Complete => {}
     }
     match &facts.terminal_anchor {
-        Some(TerminalAnchor::Assumed { sha256_fingerprint }) => {
-            reasons.push(format!(
-                "chain terminates in a certificate no trust store names (sha256:{}) -- supply it \
-                 with --tsa-trust-store",
-                hex::encode(sha256_fingerprint)
-            ));
+        Some(TerminalAnchor::Assumed {
+            sha256_fingerprint,
+            self_signature,
+        }) => {
+            let fingerprint = hex::encode(sha256_fingerprint);
+            reasons.push(match self_signature {
+                SelfSignature::Verified => format!(
+                    "chain terminates in a certificate no trust store names (sha256:{fingerprint}) \
+                     -- supply it with --tsa-trust-store"
+                ),
+                // Naming it as a trust anchor still resolves this — a
+                // pinned anchor is an external input and is not re-checked
+                // — but the reason it is unresolved right now is the
+                // unverifiable self-signature, not a missing file.
+                SelfSignature::Unverifiable => format!(
+                    "chain terminates in a self-issued certificate (sha256:{fingerprint}) whose \
+                     own signature this verifier cannot check; nothing is refuted -- name it with \
+                     --tsa-trust-store if you trust it from an external source"
+                ),
+            });
         }
         None | Some(TerminalAnchor::Trusted { .. }) => {}
     }
@@ -405,10 +582,12 @@ pub fn verify_rfc3161_anchor(
     match verify_rfc3161_token(&token_with_prefix, &expected_root, trust_store) {
         Ok(facts) => {
             let details = AnchorDetails::Rfc3161 {
-                imprint_matches_root: facts.imprint_matches_root,
-                cms_signature_valid: facts.cms_signature_valid,
+                message_imprint: facts.message_imprint,
+                cms_signature: facts.cms_signature,
                 chain_valid_at_gen_time: facts.chain_valid_at_gen_time,
+                chain_diagnostic: facts.chain_diagnostic.clone(),
                 timestamping_eku_ok: facts.timestamping_eku_ok,
+                timestamping_eku: facts.timestamping_eku,
                 path_status: facts.path_status,
                 terminal_anchor: facts.terminal_anchor,
                 revocation: facts.revocation,
@@ -663,18 +842,44 @@ mod tests {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn rfc3161_details(
-        imprint: bool,
-        cms: bool,
+        imprint: MessageImprint,
+        cms: CmsSignature,
         chain: bool,
         eku: bool,
         path_status: PathStatus,
         terminal_anchor: Option<TerminalAnchor>,
     ) -> AnchorDetails {
+        rfc3161_details_full(
+            imprint,
+            cms,
+            chain,
+            if eku {
+                TimestampingEku::Ok
+            } else {
+                TimestampingEku::Absent
+            },
+            path_status,
+            terminal_anchor,
+        )
+    }
+
+    /// The same, with the EKU state given explicitly — needed to exercise
+    /// `NotChecked`, which no boolean can express.
+    fn rfc3161_details_full(
+        imprint: MessageImprint,
+        cms: CmsSignature,
+        chain: bool,
+        eku: TimestampingEku,
+        path_status: PathStatus,
+        terminal_anchor: Option<TerminalAnchor>,
+    ) -> AnchorDetails {
         AnchorDetails::Rfc3161 {
-            imprint_matches_root: imprint,
-            cms_signature_valid: cms,
+            message_imprint: imprint,
+            cms_signature: cms,
             chain_valid_at_gen_time: chain,
-            timestamping_eku_ok: eku,
+            chain_diagnostic: None,
+            timestamping_eku_ok: eku.is_ok(),
+            timestamping_eku: eku,
             path_status,
             terminal_anchor,
             revocation: Revocation::NotChecked,
@@ -690,8 +895,8 @@ mod tests {
     #[test]
     fn trusted_terminal_with_sound_facts_is_valid() {
         let details = rfc3161_details(
-            true,
-            true,
+            MessageImprint::Verified,
+            CmsSignature::Verified,
             true,
             true,
             PathStatus::Complete,
@@ -708,13 +913,14 @@ mod tests {
         // Every cryptographic fact holds; only the trust root is missing.
         // This must NOT be reported as broken evidence.
         let details = rfc3161_details(
-            true,
-            true,
+            MessageImprint::Verified,
+            CmsSignature::Verified,
             true,
             true,
             PathStatus::Complete,
             Some(TerminalAnchor::Assumed {
                 sha256_fingerprint: [7u8; 32],
+                self_signature: SelfSignature::Verified,
             }),
         );
         assert_eq!(
@@ -733,7 +939,14 @@ mod tests {
         // The cross-signed Sectigo/DigiCert case: an issuer certificate is
         // missing from the token, so `chain_valid_at_gen_time` is false --
         // but nothing was refuted. This used to be reported as `Failed`.
-        let details = rfc3161_details(true, true, false, true, PathStatus::Incomplete, None);
+        let details = rfc3161_details(
+            MessageImprint::Verified,
+            CmsSignature::Verified,
+            false,
+            true,
+            PathStatus::Incomplete,
+            None,
+        );
         assert_eq!(
             details.rfc3161_verdict(),
             Some(AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete))
@@ -742,9 +955,459 @@ mod tests {
         assert_eq!(details.untrusted_root_fingerprint(), None);
     }
 
+    /// `Indeterminate` is routed explicitly, fails closed, and is NOT a
+    /// refutation. Its reason code must be the one that names the real
+    /// problem, not `tsa_chain_incomplete` (which would send the user
+    /// hunting for a certificate) and not `tsa_root_not_trusted`.
+    #[test]
+    fn indeterminate_path_is_untrusted_not_invalid() {
+        let details = rfc3161_details(
+            MessageImprint::Verified,
+            CmsSignature::Verified,
+            false,
+            true,
+            PathStatus::Indeterminate,
+            None,
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Untrusted(ReasonCode::TsaChainIndeterminate))
+        );
+        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
+    }
+
+    /// An `Indeterminate` path carrying an `Assumed`/`Unverifiable`
+    /// terminal — the SHA-1 self-signed root case — is still reported as
+    /// indeterminate. Reading the terminal first would call it
+    /// `tsa_root_not_trusted`, which names the wrong problem: the root is
+    /// not merely un-vouched-for, its self-signature was never checked.
+    #[test]
+    fn an_unverifiable_self_signature_is_reported_as_indeterminate() {
+        let details = rfc3161_details(
+            MessageImprint::Verified,
+            CmsSignature::Verified,
+            false,
+            true,
+            PathStatus::Indeterminate,
+            Some(TerminalAnchor::Assumed {
+                sha256_fingerprint: [3u8; 32],
+                self_signature: SelfSignature::Unverifiable,
+            }),
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Untrusted(ReasonCode::TsaChainIndeterminate))
+        );
+        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
+    }
+
+    /// Neither `Incomplete` nor `Indeterminate` may ever produce a valid
+    /// anchor, under ANY combination of the other facts and terminal
+    /// anchors — including a `Trusted` terminal, which cannot occur
+    /// alongside them but must not be a way in if it ever did.
+    #[test]
+    fn incomplete_and_indeterminate_never_reach_success() {
+        let terminals = [
+            None,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [1u8; 32],
+            }),
+            Some(TerminalAnchor::Assumed {
+                sha256_fingerprint: [1u8; 32],
+                self_signature: SelfSignature::Verified,
+            }),
+            Some(TerminalAnchor::Assumed {
+                sha256_fingerprint: [1u8; 32],
+                self_signature: SelfSignature::Unverifiable,
+            }),
+        ];
+
+        for status in [PathStatus::Incomplete, PathStatus::Indeterminate] {
+            for terminal in terminals {
+                for chain_valid in [true, false] {
+                    let details = rfc3161_details(
+                        MessageImprint::Verified,
+                        CmsSignature::Verified,
+                        chain_valid,
+                        true,
+                        status,
+                        terminal,
+                    );
+                    let verdict = details.rfc3161_verdict().expect("rfc3161 details");
+                    assert!(
+                        !verdict.is_valid(),
+                        "{status:?} with terminal {terminal:?} and chain_valid={chain_valid} \
+                         must never be valid, got {verdict:?}"
+                    );
+                    assert!(
+                        matches!(verdict, AnchorVerdict::Untrusted(_)),
+                        "{status:?} must be Untrusted, never a refutation: {verdict:?}"
+                    );
+                    assert_ne!(details.rfc3161_trust_state(), Some("trusted"));
+                }
+            }
+        }
+    }
+
+    /// **Blocker regression.** A `messageImprint` naming a hash algorithm
+    /// this verifier does not implement was never *compared* with the
+    /// receipt's root, so it must not be reported as a mismatch. ATL
+    /// mandates a minimum of algorithm support, not a prohibition on the
+    /// rest, so this is the verifier's limitation, not the token's defect.
+    #[test]
+    fn an_uncomparable_imprint_is_untrusted_not_a_mismatch() {
+        let details = rfc3161_details(
+            MessageImprint::Indeterminate,
+            CmsSignature::Verified,
+            true,
+            true,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [1u8; 32],
+            }),
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Untrusted(
+                ReasonCode::TsaImprintIndeterminate
+            ))
+        );
+        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
+    }
+
+    /// An imprint that WAS compared and differs stays a refutation.
+    #[test]
+    fn a_refuted_imprint_is_still_a_refutation() {
+        let details = rfc3161_details(
+            MessageImprint::Mismatch,
+            CmsSignature::Verified,
+            true,
+            true,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [1u8; 32],
+            }),
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Invalid(ReasonCode::TsaImprintMismatch))
+        );
+    }
+
+    /// Neither indeterminate fact may ever reach success, in any
+    /// combination with the others.
+    #[test]
+    fn indeterminate_facts_never_reach_success() {
+        let trusted = Some(TerminalAnchor::Trusted {
+            sha256_fingerprint: [1u8; 32],
+        });
+        for (imprint, cms) in [
+            (MessageImprint::Indeterminate, CmsSignature::Verified),
+            (MessageImprint::Verified, CmsSignature::Indeterminate),
+            (MessageImprint::Indeterminate, CmsSignature::Indeterminate),
+        ] {
+            let details = rfc3161_details(imprint, cms, true, true, PathStatus::Complete, trusted);
+            let verdict = details.rfc3161_verdict().expect("rfc3161 details");
+            assert!(
+                !verdict.is_valid(),
+                "{imprint:?}/{cms:?} must never be valid"
+            );
+            assert!(
+                matches!(verdict, AnchorVerdict::Untrusted(_)),
+                "{imprint:?}/{cms:?} must be Untrusted, never a refutation: {verdict:?}"
+            );
+        }
+    }
+
+    /// **The blocker regression.** Any refuted fact must outrank every
+    /// indeterminate fact, in every pairing, whichever order they are
+    /// inspected in.
+    ///
+    /// The case that motivated it: `MessageImprint::Indeterminate` with
+    /// `CmsSignature::Refuted` used to return at the first non-verified fact
+    /// and come out `untrusted` — concealing a proven refutation behind
+    /// "nothing was refuted". Having spent this rework stopping the CLI
+    /// accusing without grounds, that was the mirror-image defect.
+    #[test]
+    fn any_refutation_outranks_every_indeterminate() {
+        let inconclusive_imprints = [MessageImprint::Verified, MessageImprint::Indeterminate];
+        let refuted_imprints = [MessageImprint::Mismatch, MessageImprint::Malformed];
+        let inconclusive_cms = [CmsSignature::Verified, CmsSignature::Indeterminate];
+        let inconclusive_ekus = [TimestampingEku::Ok, TimestampingEku::NotChecked];
+        let inconclusive_paths = [
+            PathStatus::Complete,
+            PathStatus::Incomplete,
+            PathStatus::Indeterminate,
+        ];
+
+        // A refuted imprint, against every combination of inabilities.
+        for imprint in refuted_imprints {
+            for cms in inconclusive_cms {
+                for eku in inconclusive_ekus {
+                    for path in inconclusive_paths {
+                        let details = rfc3161_details_full(imprint, cms, true, eku, path, None);
+                        let verdict = details.rfc3161_verdict().expect("rfc3161 details");
+                        assert!(
+                            matches!(verdict, AnchorVerdict::Invalid(_)),
+                            "{imprint:?}+{cms:?}+{eku:?}+{path:?} must be Invalid, got {verdict:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // A refuted CMS signature, against every combination of inabilities.
+        for imprint in inconclusive_imprints {
+            for eku in inconclusive_ekus {
+                for path in inconclusive_paths {
+                    let details =
+                        rfc3161_details_full(imprint, CmsSignature::Refuted, true, eku, path, None);
+                    assert_eq!(
+                        details.rfc3161_verdict(),
+                        Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid)),
+                        "{imprint:?}+Refuted+{eku:?}+{path:?} must be Invalid"
+                    );
+                }
+            }
+        }
+
+        // A refuted EKU, and a refuted path, likewise.
+        for imprint in inconclusive_imprints {
+            for cms in inconclusive_cms {
+                let refuted_eku = rfc3161_details_full(
+                    imprint,
+                    cms,
+                    true,
+                    TimestampingEku::Absent,
+                    PathStatus::Indeterminate,
+                    None,
+                );
+                assert!(
+                    matches!(
+                        refuted_eku.rfc3161_verdict(),
+                        Some(AnchorVerdict::Invalid(_))
+                    ),
+                    "a checked EKU failure must outrank {imprint:?}+{cms:?}"
+                );
+
+                let refuted_path = rfc3161_details_full(
+                    imprint,
+                    cms,
+                    false,
+                    TimestampingEku::NotChecked,
+                    PathStatus::Invalid,
+                    None,
+                );
+                assert_eq!(
+                    refuted_path.rfc3161_verdict(),
+                    Some(AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime)),
+                    "a refuted path must outrank {imprint:?}+{cms:?}"
+                );
+            }
+        }
+    }
+
+    /// The exact counterexample from the review, spelled out on its own so a
+    /// regression names itself.
+    #[test]
+    fn an_indeterminate_imprint_never_conceals_a_refuted_signature() {
+        let details = rfc3161_details_full(
+            MessageImprint::Indeterminate,
+            CmsSignature::Refuted,
+            true,
+            TimestampingEku::Ok,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [1u8; 32],
+            }),
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid)),
+            "untrusted means nothing was refuted; a refuted signature must not hide behind an \
+             uncomparable imprint"
+        );
+        assert_eq!(details.rfc3161_trust_state(), Some("failed"));
+    }
+
+    /// A malformed imprint is refuted, but must not be explained as a
+    /// mismatch: no comparison could be attempted at all.
+    #[test]
+    fn a_malformed_imprint_has_its_own_reason_code() {
+        let details = rfc3161_details_full(
+            MessageImprint::Malformed,
+            CmsSignature::Verified,
+            true,
+            TimestampingEku::Ok,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [1u8; 32],
+            }),
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Invalid(ReasonCode::TsaImprintMalformed))
+        );
+    }
+
+    /// An EKU that was never *examined* must not be reported as an EKU
+    /// failure. Before aggregation this was masked by the CMS check
+    /// returning first, but the boolean it read was `false` — one reordering
+    /// away from refuting on an unchecked fact.
+    #[test]
+    fn an_unexamined_eku_is_not_an_eku_failure() {
+        let details = rfc3161_details_full(
+            MessageImprint::Verified,
+            CmsSignature::Verified,
+            false,
+            TimestampingEku::NotChecked,
+            PathStatus::Indeterminate,
+            None,
+        );
+        let verdict = details.rfc3161_verdict().expect("rfc3161 details");
+        assert!(
+            !matches!(
+                verdict,
+                AnchorVerdict::Invalid(ReasonCode::TsaTimestampingEkuInvalid)
+            ),
+            "an unexamined EKU must never be reported as a checked failure: {verdict:?}"
+        );
+        assert!(matches!(verdict, AnchorVerdict::Untrusted(_)));
+    }
+
+    /// Every *checked* EKU failure stays a refutation — the fix must not
+    /// soften real failures into "cannot tell".
+    #[test]
+    fn checked_eku_failures_remain_refutations() {
+        for eku in [
+            TimestampingEku::Absent,
+            TimestampingEku::Malformed,
+            TimestampingEku::NotCritical,
+            TimestampingEku::NotExclusive,
+        ] {
+            let details = rfc3161_details_full(
+                MessageImprint::Verified,
+                CmsSignature::Verified,
+                true,
+                eku,
+                PathStatus::Complete,
+                Some(TerminalAnchor::Trusted {
+                    sha256_fingerprint: [1u8; 32],
+                }),
+            );
+            assert_eq!(
+                details.rfc3161_verdict(),
+                Some(AnchorVerdict::Invalid(
+                    ReasonCode::TsaTimestampingEkuInvalid
+                )),
+                "{eku:?} was checked and failed; it must stay a refutation"
+            );
+        }
+    }
+
+    /// **Blocker regression.** A CMS signature this verifier cannot evaluate
+    /// must fail closed as `untrusted`, never as `invalid`. `atl-core`
+    /// explicitly does not implement P-521 or RSA-PSS, so this is a token a
+    /// real TSA can mint today -- and under the previous `is_ok()` collapse
+    /// its holder was told the evidence had been disproved.
+    #[test]
+    fn an_unevaluatable_cms_signature_is_untrusted_not_invalid() {
+        let details = rfc3161_details(
+            MessageImprint::Verified,
+            CmsSignature::Indeterminate,
+            true,
+            true,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [1u8; 32],
+            }),
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Untrusted(
+                ReasonCode::CmsSignatureIndeterminate
+            ))
+        );
+        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
+    }
+
+    /// A CMS signature that WAS checked and failed stays a refutation — the
+    /// fix must not soften real failures into "cannot tell".
+    #[test]
+    fn a_refuted_cms_signature_is_still_a_refutation() {
+        let details = rfc3161_details(
+            MessageImprint::Verified,
+            CmsSignature::Refuted,
+            true,
+            true,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [1u8; 32],
+            }),
+        );
+        assert_eq!(
+            details.rfc3161_verdict(),
+            Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid))
+        );
+        assert_eq!(details.rfc3161_trust_state(), Some("failed"));
+    }
+
+    /// An unevaluatable CMS signature never reaches success, whatever else
+    /// holds — including a fully trusted certificate path.
+    #[test]
+    fn an_unevaluatable_cms_signature_never_reaches_success() {
+        for status in [
+            PathStatus::Complete,
+            PathStatus::Incomplete,
+            PathStatus::Indeterminate,
+            PathStatus::Invalid,
+        ] {
+            for terminal in [
+                None,
+                Some(TerminalAnchor::Trusted {
+                    sha256_fingerprint: [1u8; 32],
+                }),
+            ] {
+                let details = rfc3161_details(
+                    MessageImprint::Verified,
+                    CmsSignature::Indeterminate,
+                    true,
+                    true,
+                    status,
+                    terminal,
+                );
+                let verdict = details.rfc3161_verdict().expect("rfc3161 details");
+                assert!(
+                    !verdict.is_valid(),
+                    "{status:?}/{terminal:?} must never be valid"
+                );
+                if matches!(status, PathStatus::Invalid) {
+                    // A refuted path is a proven defect and must not be
+                    // concealed behind an unevaluatable signature.
+                    assert!(
+                        matches!(verdict, AnchorVerdict::Invalid(_)),
+                        "a refuted path must outrank an indeterminate signature: {verdict:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(verdict, AnchorVerdict::Untrusted(_)),
+                        "{status:?}/{terminal:?} must be Untrusted, never a refutation"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn invalid_path_is_a_refutation() {
-        let details = rfc3161_details(true, true, false, true, PathStatus::Invalid, None);
+        let details = rfc3161_details(
+            MessageImprint::Verified,
+            CmsSignature::Verified,
+            false,
+            true,
+            PathStatus::Invalid,
+            None,
+        );
         assert_eq!(
             details.rfc3161_verdict(),
             Some(AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime))
@@ -758,18 +1421,39 @@ mod tests {
             sha256_fingerprint: [0u8; 32],
         });
         assert_eq!(
-            rfc3161_details(false, true, true, true, PathStatus::Complete, trusted)
-                .rfc3161_verdict(),
+            rfc3161_details(
+                MessageImprint::Mismatch,
+                CmsSignature::Verified,
+                true,
+                true,
+                PathStatus::Complete,
+                trusted
+            )
+            .rfc3161_verdict(),
             Some(AnchorVerdict::Invalid(ReasonCode::TsaImprintMismatch))
         );
         assert_eq!(
-            rfc3161_details(true, false, true, true, PathStatus::Complete, trusted)
-                .rfc3161_verdict(),
+            rfc3161_details(
+                MessageImprint::Verified,
+                CmsSignature::Refuted,
+                true,
+                true,
+                PathStatus::Complete,
+                trusted
+            )
+            .rfc3161_verdict(),
             Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid))
         );
         assert_eq!(
-            rfc3161_details(true, true, true, false, PathStatus::Complete, trusted)
-                .rfc3161_verdict(),
+            rfc3161_details(
+                MessageImprint::Verified,
+                CmsSignature::Verified,
+                true,
+                false,
+                PathStatus::Complete,
+                trusted
+            )
+            .rfc3161_verdict(),
             Some(AnchorVerdict::Invalid(
                 ReasonCode::TsaTimestampingEkuInvalid
             ))

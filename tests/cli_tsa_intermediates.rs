@@ -174,8 +174,8 @@ fn incomplete_chain_without_trust_material_is_untrusted_not_invalid() {
     assert_eq!(anchor["trust_state"], "incomplete");
     assert_eq!(anchor["path_status"], "incomplete");
     // Nothing about the token itself was refuted.
-    assert_eq!(anchor["imprint_matches_root"], true);
-    assert_eq!(anchor["cms_signature_valid"], true);
+    assert_eq!(anchor["message_imprint"], "verified");
+    assert_eq!(anchor["cms_signature"], "verified");
     assert_eq!(anchor["timestamping_eku_ok"], true);
     assert_eq!(json["anchor_verification"]["all_verified"], false);
 }
@@ -324,5 +324,274 @@ fn human_output_names_the_remedy_for_an_incomplete_chain() {
     assert!(
         !human.contains("INVALID"),
         "a missing issuer certificate must never read as damaged evidence:\n{human}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// `Indeterminate`: the chain could not be CHECKED, and that is not a
+// refutation
+// ---------------------------------------------------------------------
+//
+// "AAA Certificate Services" signs itself with `sha1WithRSAEncryption`, an
+// algorithm `atl-core` deliberately does not implement. It is not an
+// oddity: 31 of the 156 roots in macOS's system store are SHA-1
+// self-signed, DigiCert Assured ID Root CA among them.
+//
+// Supplied as a trust ANCHOR (the tests above) it works, because a trust
+// anchor is an external input and its own signature is beside the point.
+// Supplied as an INTERMEDIATE it is just another certificate on the path,
+// and the chain arrives at a self-issued certificate whose self-signature
+// cannot be evaluated. That used to come out as `invalid` -- the CLI told
+// the user their evidence had been disproved, on the strength of a
+// signature nobody had checked.
+
+/// **The regression this whole change exists for.** The same real receipt,
+/// the same real certificates, but the SHA-1 self-signed root is handed in
+/// as an intermediate rather than as an anchor: the result must be
+/// `untrusted` (exit 3), never `invalid` (exit 1).
+#[test]
+fn sha1_self_signed_root_as_an_intermediate_is_indeterminate_not_invalid() {
+    let dir = TempDir::new().unwrap();
+    let both = dir.path().join("both.pem");
+    std::fs::write(&both, format!("{USERTRUST_CROSS_SIGNED_PEM}{AAA_ROOT_PEM}")).unwrap();
+
+    let json = verify_json(&["--tsa-intermediates", both.to_str().unwrap()], 3);
+
+    assert_eq!(json["status"], "untrusted");
+    assert_eq!(json["reason_code"], "tsa_chain_indeterminate");
+
+    let anchor = &json["anchor_verification"]["results"][0];
+    assert_eq!(anchor["path_status"], "indeterminate");
+    assert_eq!(anchor["trust_state"], "indeterminate");
+    assert_eq!(anchor["reason_code"], "tsa_chain_indeterminate");
+
+    // The chain did reach the root -- it just could not confirm the root
+    // signs itself.
+    assert_eq!(anchor["terminal_anchor"]["kind"], "assumed");
+    assert_eq!(anchor["terminal_anchor"]["self_signature"], "unverifiable");
+    assert_eq!(
+        anchor["terminal_anchor"]["sha256_fingerprint"], AAA_ROOT_SHA256,
+        "the terminal must be the SHA-1 self-signed root itself"
+    );
+
+    // Nothing about the token was refuted. Every fact that WAS checked holds.
+    assert_eq!(anchor["message_imprint"], "verified");
+    assert_eq!(anchor["cms_signature"], "verified");
+    assert_eq!(anchor["timestamping_eku_ok"], true);
+}
+
+/// **The output-layer blocker.** For an anchor that established no trust,
+/// the token's `genTime` must not be emitted as `timestamp` — the key a
+/// consumer reads as an established fact. This product sells proof of *when*
+/// something existed; that number is the one thing that must never be handed
+/// over unqualified.
+///
+/// The claim is not discarded: it moves to `claimed_timestamp`, so a script
+/// reading `timestamp` gets nothing and fails loudly instead of silently
+/// trusting a time nobody established.
+#[test]
+fn an_indeterminate_anchor_reports_a_claimed_time_not_an_established_one() {
+    let dir = TempDir::new().unwrap();
+    let both = dir.path().join("both.pem");
+    std::fs::write(&both, format!("{USERTRUST_CROSS_SIGNED_PEM}{AAA_ROOT_PEM}")).unwrap();
+
+    let json = verify_json(&["--tsa-intermediates", both.to_str().unwrap()], 3);
+    let anchor = &json["anchor_verification"]["results"][0];
+
+    assert_eq!(anchor["verified"], false);
+    assert!(
+        anchor.get("timestamp").is_none(),
+        "an unverified anchor must not emit an established timestamp: {anchor}"
+    );
+    assert!(
+        anchor.get("timestamp_nanos").is_none(),
+        "nor the nanosecond form: {anchor}"
+    );
+    assert!(
+        anchor.get("claimed_timestamp").is_some(),
+        "the claim itself is still reported, under an unmistakable name: {anchor}"
+    );
+    assert!(anchor.get("claimed_timestamp_nanos").is_some());
+}
+
+/// The same for an anchor with no trust material at all (`Incomplete`) —
+/// every non-`valid` verdict, not just the indeterminate one.
+#[test]
+fn an_untrusted_anchor_reports_a_claimed_time_not_an_established_one() {
+    let json = verify_json(&[], 3);
+    let anchor = &json["anchor_verification"]["results"][0];
+
+    assert_eq!(anchor["verified"], false);
+    assert!(anchor.get("timestamp").is_none());
+    assert!(anchor.get("claimed_timestamp").is_some());
+}
+
+/// And the converse: an accepted anchor DOES establish a time, reported
+/// under the plain name with no `claimed_*` alongside it.
+#[test]
+fn a_valid_anchor_reports_an_established_time() {
+    let dir = TempDir::new().unwrap();
+    let (anchor_path, intermediate_path) = trust_material(&dir);
+
+    let json = verify_json(
+        &[
+            "--tsa-trust-store",
+            anchor_path.to_str().unwrap(),
+            "--tsa-intermediates",
+            intermediate_path.to_str().unwrap(),
+        ],
+        0,
+    );
+    let anchor = &json["anchor_verification"]["results"][0];
+
+    assert_eq!(anchor["verified"], true);
+    assert!(
+        anchor.get("timestamp").is_some(),
+        "an accepted anchor establishes a time: {anchor}"
+    );
+    assert!(
+        anchor.get("claimed_timestamp").is_none(),
+        "and must not also carry the claim form: {anchor}"
+    );
+}
+
+/// The human output must label it too. An unqualified `Timestamp:` line
+/// under a NOT TRUSTED status reads as an established fact however the
+/// status above it is worded.
+#[test]
+fn human_output_labels_an_unestablished_time_as_claimed() {
+    let dir = TempDir::new().unwrap();
+    let both = dir.path().join("both.pem");
+    std::fs::write(&both, format!("{USERTRUST_CROSS_SIGNED_PEM}{AAA_ROOT_PEM}")).unwrap();
+
+    let source = real_data_path("testfile.txt");
+    let receipt = real_data_path("receipt-tsa.atl");
+
+    let output = Command::cargo_bin("atl-cli")
+        .unwrap()
+        .args([
+            "verify",
+            source.to_str().unwrap(),
+            receipt.to_str().unwrap(),
+            "--no-color",
+            "--tsa-intermediates",
+            both.to_str().unwrap(),
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+
+    let human = String::from_utf8(output).unwrap();
+    assert!(
+        human.contains("Claimed genTime (not established)"),
+        "an unestablished time must be labelled as claimed: {human}"
+    );
+    assert!(
+        !human.contains("      Timestamp: "),
+        "and must not appear under the plain established label: {human}"
+    );
+}
+
+/// `Indeterminate` fails closed: it is never `valid`, never `verified`, and
+/// never contributes to `all_verified`.
+#[test]
+fn an_indeterminate_chain_never_counts_as_success() {
+    let dir = TempDir::new().unwrap();
+    let both = dir.path().join("both.pem");
+    std::fs::write(&both, format!("{USERTRUST_CROSS_SIGNED_PEM}{AAA_ROOT_PEM}")).unwrap();
+
+    let json = verify_json(&["--tsa-intermediates", both.to_str().unwrap()], 3);
+
+    assert_ne!(json["status"], "valid");
+    assert_eq!(json["anchor_verification"]["results"][0]["verified"], false);
+    assert_eq!(json["anchor_verification"]["all_verified"], false);
+    assert_ne!(
+        json["anchor_verification"]["results"][0]["trust_state"],
+        "trusted"
+    );
+}
+
+/// The very same certificate, named as a trust ANCHOR instead, still
+/// resolves the chain -- proving the fix did not simply make SHA-1 roots
+/// unusable, and that RFC 5280 6.1's "trust anchor is an input" reading is
+/// what makes the difference.
+#[test]
+fn the_same_sha1_root_works_when_named_as_a_trust_anchor() {
+    let dir = TempDir::new().unwrap();
+    let (anchor_path, intermediate_path) = trust_material(&dir);
+
+    let json = verify_json(
+        &[
+            "--tsa-trust-store",
+            anchor_path.to_str().unwrap(),
+            "--tsa-intermediates",
+            intermediate_path.to_str().unwrap(),
+        ],
+        0,
+    );
+
+    assert_eq!(json["status"], "valid");
+    assert_eq!(
+        json["anchor_verification"]["results"][0]["terminal_anchor"]["sha256_fingerprint"],
+        AAA_ROOT_SHA256
+    );
+}
+
+/// The human-readable output for an `Indeterminate` chain must say what
+/// actually stopped the check, and must NOT tell the reader to go find an
+/// intermediate certificate or a root: neither would help, because what is
+/// missing is an algorithm implementation.
+#[test]
+fn human_output_for_an_indeterminate_chain_does_not_ask_for_more_certificates() {
+    let dir = TempDir::new().unwrap();
+    let both = dir.path().join("both.pem");
+    std::fs::write(&both, format!("{USERTRUST_CROSS_SIGNED_PEM}{AAA_ROOT_PEM}")).unwrap();
+
+    let source = real_data_path("testfile.txt");
+    let receipt = real_data_path("receipt-tsa.atl");
+
+    let output = Command::cargo_bin("atl-cli")
+        .unwrap()
+        .args([
+            "verify",
+            source.to_str().unwrap(),
+            receipt.to_str().unwrap(),
+            "--no-color",
+            "--tsa-intermediates",
+            both.to_str().unwrap(),
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+
+    let human = String::from_utf8(output).unwrap();
+
+    assert!(
+        human.contains("could NOT be checked") || human.contains("could not be evaluated"),
+        "the output must say the check could not be completed: {human}"
+    );
+    // "trust root unavailable" is false here: the root is present, the
+    // check of it could not be performed. The headline must not claim
+    // otherwise anywhere in the output, summary line included.
+    assert!(
+        !human.contains("trust root unavailable"),
+        "an indeterminate chain must not be described as a missing trust root: {human}"
+    );
+    assert!(
+        !human.contains("Supply it with --tsa-intermediates"),
+        "an indeterminate chain must not be blamed on a missing intermediate: {human}"
+    );
+    assert!(
+        !human.to_lowercase().contains("invalid"),
+        "nothing was refuted, so the word must not appear: {human}"
+    );
+    // The real cause has to be nameable, not hidden behind a status word.
+    assert!(
+        human.contains("signature algorithm"),
+        "the output must name what stopped the check: {human}"
     );
 }
