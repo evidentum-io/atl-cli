@@ -1,17 +1,30 @@
-//! Online verification orchestration
+//! Online verification: the one thing that genuinely needs the network.
+//!
+//! RFC 3161 anchors are verified in full by [`crate::verify::anchor`], with
+//! no network access at all. The only anchor type that needs to go online is
+//! `bitcoin_ots`, and only to ask block-explorer APIs for the header whose
+//! Merkle root is compared against the
+//! OTS proof. This module does exactly that, in place, replacing each
+//! `bitcoin_ots` anchor's network-free verdict with the confirmed one.
 
-use crate::cli::VerificationMode;
-use crate::error::CliResult;
-use crate::verify::single::SingleVerificationResult;
 use std::time::Duration;
 
-use atl_core::core::verify::anchors::bitcoin_ots::verify_ots_anchor_impl;
-use atl_core::core::verify::anchors::rfc3161::verify_rfc3161_anchor_impl;
 use atl_core::ReceiptAnchor;
+
+use crate::error::CliResult;
+use crate::net::bitcoin::BlockLookup;
+use crate::verify::anchor::BlockSourceReport;
+use crate::verify::anchor::PreparedOts;
+use crate::verify::anchor::{
+    prepare_bitcoin_ots, requires_network, AnchorDetails, AnchorVerdict, AnchorVerificationResult,
+};
+use crate::verify::single::SingleVerificationResult;
+use crate::verify::verdict::ReasonCode;
 
 /// Configuration for online verification
 #[derive(Debug, Clone)]
 pub struct OnlineConfig {
+    /// Per-request timeout for Bitcoin block lookups.
     pub request_timeout: Duration,
 }
 
@@ -23,374 +36,267 @@ impl Default for OnlineConfig {
     }
 }
 
-/// Result of online anchor verification
-#[derive(Debug, Clone)]
-pub struct AnchorVerificationResult {
-    pub anchor_type: String,
-    pub verified: bool,
-    pub timestamp_nanos: Option<u64>,
-    pub error: Option<String>,
-    pub details: AnchorDetails,
+/// `true` if any anchor in `receipt` needs network access to be verified to
+/// completion.
+///
+/// A receipt anchored only by RFC 3161 is fully verifiable offline, so the
+/// CLI must not probe connectivity for it — that probe was contacting
+/// external hosts for a check that never leaves the process.
+#[must_use]
+pub fn receipt_requires_network(receipt: &atl_core::Receipt) -> bool {
+    receipt.anchors.iter().any(requires_network)
 }
 
-#[derive(Debug, Clone)]
-pub enum AnchorDetails {
-    Rfc3161 {
-        #[allow(dead_code)]
-        algorithm_oid: String,
-    },
-    Bitcoin {
-        block_height: u64,
-        block_timestamp_secs: u64,
-        /// Target hash being verified (with sha256: prefix)
-        target_hash: String,
-        /// Number of operations in OTS proof
-        operation_count: usize,
-        /// Computed merkle root from OTS proof (with sha256: prefix, 71 chars total)
-        computed_root: String,
-        /// Block merkle root from API (with sha256: prefix) - None if offline/error
-        block_merkle_root: Option<String>,
-        /// Whether computed_root matches block_merkle_root
-        merkle_match: Option<bool>,
-    },
-    Unknown,
-}
-
-/// Extended verification result with online checks
-#[derive(Debug)]
-pub struct OnlineVerificationResult {
-    pub offline: SingleVerificationResult,
-    pub anchor_results: Vec<AnchorVerificationResult>,
-    pub all_anchors_verified: bool,
-    #[allow(dead_code)]
-    pub mode: VerificationMode,
-}
-
-impl OnlineVerificationResult {
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        self.offline.is_valid() && self.all_anchors_verified
-    }
-}
-
-/// Verify RFC 3161 anchor using atl-core
-fn verify_rfc3161(
-    target: &str,
-    target_hash: &str,
-    timestamp: &str,
-    token_der: &str,
-) -> AnchorVerificationResult {
-    // Validate target
-    if target != "data_tree_root" {
-        return AnchorVerificationResult {
-            anchor_type: "rfc3161".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some(format!(
-                "Invalid target '{}', expected 'data_tree_root'",
-                target
-            )),
-            details: AnchorDetails::Unknown,
-        };
-    }
-
-    // Decode expected hash
-    let hash_hex = target_hash.strip_prefix("sha256:").unwrap_or(target_hash);
-    let expected_hash: [u8; 32] = match hex::decode(hash_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
-        }
-        Ok(b) => {
-            return AnchorVerificationResult {
-                anchor_type: "rfc3161".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some(format!("Invalid hash length: {} bytes", b.len())),
-                details: AnchorDetails::Unknown,
-            }
-        }
-        Err(e) => {
-            return AnchorVerificationResult {
-                anchor_type: "rfc3161".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some(format!("Invalid hex: {}", e)),
-                details: AnchorDetails::Unknown,
-            }
-        }
-    };
-
-    // Ensure "base64:" prefix for atl-core
-    let token_with_prefix = if token_der.starts_with("base64:") {
-        token_der.to_string()
-    } else {
-        format!("base64:{}", token_der)
-    };
-
-    // CALL atl-core function
-    let result = verify_rfc3161_anchor_impl(timestamp, &token_with_prefix, &expected_hash);
-
-    AnchorVerificationResult {
-        anchor_type: "rfc3161".to_string(),
-        verified: result.is_valid,
-        timestamp_nanos: result.timestamp,
-        error: result.error,
-        details: AnchorDetails::Rfc3161 {
-            algorithm_oid: "2.16.840.1.101.3.4.2.1".to_string(), // SHA-256
-        },
-    }
-}
-
-/// Verify Bitcoin/OTS anchor using atl-core + Bitcoin API
-async fn verify_bitcoin_ots(
+/// Check one `bitcoin_ots` anchor against the block header that the
+/// configured block-explorer APIs report for the height its OTS proof names.
+///
+/// Deliberately not "confirm against the blockchain": this contacts HTTP
+/// endpoints, validates no proof of work and follows no chain. What it can
+/// establish is that two or more of the configured sources report the same
+/// header
+/// and that the OTS proof's computed root equals that header's Merkle root.
+/// That is a real and useful statement; it is just not the one the old
+/// wording made.
+///
+/// # The four source outcomes
+///
+/// | sources | outcome | why |
+/// |---|---|---|
+/// | two or more, agreeing | compare, then `Valid` or `Invalid` | the header is corroborated |
+/// | two or more, disagreeing | `Untrusted(BitcoinProvidersDisagree)` | no established header exists to compare against |
+/// | exactly one | `Untrusted(BitcoinSingleSourceOnly)` | one endpoint's word settles nothing |
+/// | none | `Untrusted(BitcoinBlockUnavailable)` | nothing to compare against |
+///
+/// Only the first row may produce a refutation, and that is the whole point
+/// of the table. A mismatch reported by a single uncorroborated endpoint is
+/// **not** a refutation: if one source is not enough to accept evidence, it
+/// is not enough to accuse it either, and a wrong or compromised API would
+/// otherwise be able to turn sound evidence into `invalid`. That is the
+/// worst failure this tool has, and it is now unreachable through one
+/// endpoint.
+async fn verify_bitcoin_ots_online(
     target: &str,
     target_hash: &str,
     ots_proof: &str,
     super_root: Option<&str>,
     config: &OnlineConfig,
 ) -> AnchorVerificationResult {
-    // Validate target
-    if target != "super_root" {
-        return AnchorVerificationResult {
+    // Every network-free check first, sharing exactly the offline rules.
+    let prepared = match prepare_bitcoin_ots(target, target_hash, ots_proof, super_root) {
+        Ok(p) => p,
+        Err(result) => return result,
+    };
+
+    let lookup = crate::net::bitcoin::lookup_block(
+        prepared.attestation.block_height,
+        config.request_timeout,
+    )
+    .await;
+
+    anchor_from_lookup(&prepared, target_hash, lookup)
+}
+
+/// Turn one block lookup into the anchor's result.
+///
+/// Split out of [`verify_bitcoin_ots_online`] and kept free of I/O so that
+/// three of the four source outcomes can be tested deterministically. Only
+/// the HTTP call itself is untestable offline; the decisions made about its
+/// outcome — which is where a verifier overclaims — are not.
+fn anchor_from_lookup(
+    prepared: &PreparedOts,
+    target_hash: &str,
+    lookup: BlockLookup,
+) -> AnchorVerificationResult {
+    let claimed_height = prepared.attestation.block_height;
+
+    // Everything a not-yet-compared outcome reports: the local computation,
+    // whatever the sources said, and no header presented as established.
+    let unconfirmed_details = |reports: Vec<BlockSourceReport>| AnchorDetails::Bitcoin {
+        block_height: claimed_height,
+        block_timestamp_secs: None,
+        target_hash: target_hash.to_string(),
+        operation_count: prepared.operation_count,
+        computed_root: prepared.computed_root.clone(),
+        block_merkle_root: None,
+        merkle_match: None,
+        block_sources: reports,
+    };
+
+    let (info, reports) = match lookup {
+        BlockLookup::Corroborated { info, reports } => (info, reports),
+
+        // Sources contradict each other. There is no header to compare
+        // against, so nothing is compared -- and nothing is refuted. The
+        // conflicting reports travel out in `block_sources` and in the
+        // prose, because a user must be told that their sources disagree.
+        BlockLookup::Disagreement { reports } => {
+            let detail = reports
+                .iter()
+                .map(|r| {
+                    // Every field the agreement predicate compares, so the
+                    // reader can see which of them the sources differ on --
+                    // including the time, which this message used to omit
+                    // while a time-only conflict was what produced it.
+                    format!(
+                        "{} reported merkle_root {} in block {} at {}",
+                        r.source, r.merkle_root, r.block_hash, r.block_timestamp_secs
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            return AnchorVerificationResult {
+                anchor_type: "bitcoin_ots".to_string(),
+                verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinProvidersDisagree),
+                timestamp_nanos: None,
+                error: Some(format!(
+                    "block-explorer APIs disagree about block {claimed_height}, so no block \
+                     header is established and nothing was compared -- this is NOT a finding \
+                     about your receipt: {detail}"
+                )),
+                details: unconfirmed_details(reports),
+            };
+        }
+
+        // One endpoint answered. It can neither accept nor accuse.
+        BlockLookup::Uncorroborated { reports, failures } => {
+            let named = reports
+                .first()
+                .map_or_else(|| "one source".to_string(), |r| r.source.clone());
+            return AnchorVerificationResult {
+                anchor_type: "bitcoin_ots".to_string(),
+                verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinSingleSourceOnly),
+                timestamp_nanos: None,
+                error: Some(format!(
+                    "only {named} reported block {claimed_height}; a single uncorroborated \
+                     source cannot establish a block header, so the OTS proof was not compared \
+                     against it. Others did not answer: {}",
+                    failures.join("; ")
+                )),
+                details: unconfirmed_details(reports),
+            };
+        }
+
+        // Nobody answered: the lookup was attempted and failed.
+        BlockLookup::Unavailable { failures } => {
+            return AnchorVerificationResult {
+                anchor_type: "bitcoin_ots".to_string(),
+                verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinBlockUnavailable),
+                timestamp_nanos: None,
+                error: Some(format!(
+                    "no block-explorer API returned block {claimed_height}: {}",
+                    failures.join("; ")
+                )),
+                details: unconfirmed_details(Vec::new()),
+            };
+        }
+    };
+
+    // CRITICAL, and only reachable with a corroborated header: the OTS
+    // proof's root must equal the Merkle root two or more sources agree on.
+    let merkle_match = prepared.attestation.verify_against_block(&info.merkle_root);
+    let source_count = reports.len();
+
+    let details = AnchorDetails::Bitcoin {
+        block_height: info.height,
+        block_timestamp_secs: Some(info.timestamp_secs),
+        target_hash: target_hash.to_string(),
+        operation_count: prepared.operation_count,
+        computed_root: prepared.computed_root.clone(),
+        block_merkle_root: Some(format!("sha256:{}", info.merkle_root)),
+        merkle_match: Some(merkle_match),
+        block_sources: reports,
+    };
+
+    if merkle_match {
+        AnchorVerificationResult {
             anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
+            verdict: AnchorVerdict::Valid,
+            timestamp_nanos: Some(info.timestamp_secs * 1_000_000_000),
+            error: None,
+            details,
+        }
+    } else {
+        AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verdict: AnchorVerdict::Invalid(ReasonCode::BitcoinMerkleRootMismatch),
             timestamp_nanos: None,
             error: Some(format!(
-                "Invalid target '{}', expected 'super_root'",
-                target
+                "Merkle root mismatch: the OTS proof does not match the header that \
+                 {source_count} block-explorer APIs agree on for block {}",
+                info.height
             )),
-            details: AnchorDetails::Unknown,
-        };
-    }
-
-    // Validate super_root exists
-    let Some(expected_super_root) = super_root else {
-        return AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("Receipt has no super_proof".to_string()),
-            details: AnchorDetails::Unknown,
-        };
-    };
-
-    // Validate target_hash matches super_root
-    if target_hash != expected_super_root {
-        return AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("target_hash does not match super_root".to_string()),
-            details: AnchorDetails::Unknown,
-        };
-    }
-
-    // Decode expected hash
-    let hash_hex = target_hash.strip_prefix("sha256:").unwrap_or(target_hash);
-    let expected_hash: [u8; 32] = match hex::decode(hash_hex) {
-        Ok(b) if b.len() == 32 => {
-            let mut arr = [0u8; 32];
-            arr.copy_from_slice(&b);
-            arr
+            details,
         }
-        Ok(b) => {
-            return AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some(format!("Invalid hash length: {} bytes", b.len())),
-                details: AnchorDetails::Unknown,
-            }
-        }
-        Err(e) => {
-            return AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some(format!("Invalid hex: {e}")),
-                details: AnchorDetails::Unknown,
-            }
-        }
-    };
-
-    // CALL atl-core function for OTS parsing and verification
-    let ots_result = match verify_ots_anchor_impl(ots_proof, &expected_hash) {
-        Ok(r) => r,
-        Err(e) => {
-            return AnchorVerificationResult {
-                anchor_type: "bitcoin_ots".to_string(),
-                verified: false,
-                timestamp_nanos: None,
-                error: Some(format!("OTS verification failed: {e}")),
-                details: AnchorDetails::Unknown,
-            }
-        }
-    };
-
-    if ots_result.attestations.is_empty() {
-        return AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("No Bitcoin attestations in OTS proof".to_string()),
-            details: AnchorDetails::Unknown,
-        };
-    }
-
-    // Get earliest attestation
-    let earliest = ots_result
-        .attestations
-        .iter()
-        .min_by_key(|a| a.block_height)
-        .unwrap();
-
-    // Check merkle path is not empty
-    if earliest.merkle_path.is_empty() {
-        return AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some("Empty merkle path in attestation".to_string()),
-            details: AnchorDetails::Unknown,
-        };
-    }
-
-    // Extract computed root (last hash, byte-reversed for display, with sha256: prefix)
-    let computed_root = earliest
-        .merkle_path
-        .last()
-        .map_or_else(String::new, |last_hash| {
-            let mut reversed = *last_hash;
-            reversed.reverse();
-            format!("sha256:{}", hex::encode(reversed))
-        });
-
-    let operation_count = earliest.merkle_path.len();
-
-    // Fetch block info with merkle_root
-    let block_info =
-        match crate::net::bitcoin::get_block_info(earliest.block_height, config.request_timeout)
-            .await
-        {
-            Ok(info) => info,
-            Err(e) => {
-                // Return with partial data for offline-like display
-                return AnchorVerificationResult {
-                    anchor_type: "bitcoin_ots".to_string(),
-                    verified: false,
-                    timestamp_nanos: None,
-                    error: Some(e.to_string()),
-                    details: AnchorDetails::Bitcoin {
-                        block_height: earliest.block_height,
-                        block_timestamp_secs: 0,
-                        target_hash: target_hash.to_string(),
-                        operation_count,
-                        computed_root,
-                        block_merkle_root: None,
-                        merkle_match: None,
-                    },
-                };
-            }
-        };
-
-    // CRITICAL: Verify merkle root matches (using atl-core method)
-    let merkle_match = earliest.verify_against_block(&block_info.merkle_root);
-
-    if !merkle_match {
-        return AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verified: false,
-            timestamp_nanos: None,
-            error: Some(format!(
-                "Merkle root mismatch: OTS proof does not match block {}",
-                earliest.block_height
-            )),
-            details: AnchorDetails::Bitcoin {
-                block_height: block_info.height,
-                block_timestamp_secs: block_info.timestamp_secs,
-                target_hash: target_hash.to_string(),
-                operation_count,
-                computed_root,
-                block_merkle_root: Some(format!("sha256:{}", block_info.merkle_root)),
-                merkle_match: Some(false),
-            },
-        };
-    }
-
-    // SUCCESS: Cryptographic verification complete
-    let timestamp_nanos = block_info.timestamp_secs * 1_000_000_000;
-    AnchorVerificationResult {
-        anchor_type: "bitcoin_ots".to_string(),
-        verified: true,
-        timestamp_nanos: Some(timestamp_nanos),
-        error: None,
-        details: AnchorDetails::Bitcoin {
-            block_height: block_info.height,
-            block_timestamp_secs: block_info.timestamp_secs,
-            target_hash: target_hash.to_string(),
-            operation_count,
-            computed_root,
-            block_merkle_root: Some(format!("sha256:{}", block_info.merkle_root)),
-            merkle_match: Some(true),
-        },
     }
 }
 
-/// Verify anchors online for single file
-pub async fn verify_single_online(
-    result: SingleVerificationResult,
+/// Upgrade every `bitcoin_ots` anchor in `result` from its network-free
+/// verdict to a block-confirmed one.
+///
+/// RFC 3161 anchors are left exactly as they were: their verification is
+/// complete already and going online could not change it. Callers re-read
+/// [`SingleVerificationResult::verdict`] afterwards — the receipt status
+/// follows from the updated anchors automatically.
+///
+/// # Errors
+///
+/// Never returns `Err` today; the signature keeps a `CliResult` so a future
+/// hard failure (as opposed to an unconfirmed anchor) can be surfaced
+/// without changing every caller.
+pub async fn verify_anchors_online(
+    result: &mut SingleVerificationResult,
     config: &OnlineConfig,
-) -> CliResult<OnlineVerificationResult> {
-    let mut anchor_results = Vec::new();
-
+) -> CliResult<()> {
     let super_root = result
         .receipt
         .super_proof
         .as_ref()
-        .map(|sp| sp.super_root.as_str());
+        .map(|sp| sp.super_root.clone());
 
-    for anchor in &result.receipt.anchors {
-        let anchor_result = match anchor {
-            ReceiptAnchor::Rfc3161 {
-                target,
-                target_hash,
-                timestamp,
-                token_der,
-                ..
-            } => verify_rfc3161(target, target_hash, timestamp, token_der),
-            ReceiptAnchor::BitcoinOts {
-                target,
-                target_hash,
-                ots_proof,
-                ..
-            } => verify_bitcoin_ots(target, target_hash, ots_proof, super_root, config).await,
+    for (index, anchor) in result.receipt.anchors.iter().enumerate() {
+        let ReceiptAnchor::BitcoinOts {
+            target,
+            target_hash,
+            ots_proof,
+            ..
+        } = anchor
+        else {
+            continue;
         };
-        anchor_results.push(anchor_result);
+
+        let confirmed = verify_bitcoin_ots_online(
+            target,
+            target_hash,
+            ots_proof,
+            super_root.as_deref(),
+            config,
+        )
+        .await;
+
+        if let Some(slot) = result.anchor_results.get_mut(index) {
+            *slot = confirmed;
+        }
     }
 
-    let all_verified = anchor_results.iter().all(|r| r.verified);
-
-    Ok(OnlineVerificationResult {
-        offline: result,
-        anchor_results,
-        all_anchors_verified: all_verified,
-        mode: VerificationMode::Online,
-    })
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::policy::AnchorPolicy;
+    use crate::verify::verdict::Status;
     use atl_core::{
-        CheckpointJson, Receipt, ReceiptAnchor, ReceiptEntry, ReceiptProof, SignatureStatus,
-        VerificationResult,
+        CheckpointJson, Receipt, ReceiptEntry, ReceiptProof, SignatureStatus, VerificationResult,
     };
     use std::path::PathBuf;
 
+    const TEST_ROOT_HASH: &str =
+        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const OTHER_HASH: &str =
+        "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
     fn create_test_receipt() -> Receipt {
-        // Use a fixed UUID for testing (v4 format)
         let test_uuid = "550e8400-e29b-41d4-a716-446655440000"
             .parse()
             .expect("Valid UUID");
@@ -400,9 +306,7 @@ mod tests {
             upgrade_url: None,
             entry: ReceiptEntry {
                 id: test_uuid,
-                payload_hash:
-                    "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-                        .to_string(),
+                payload_hash: TEST_ROOT_HASH.to_string(),
                 metadata_hash:
                     "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                         .to_string(),
@@ -410,9 +314,7 @@ mod tests {
             },
             proof: ReceiptProof {
                 tree_size: 1,
-                root_hash:
-                    "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-                        .to_string(),
+                root_hash: TEST_ROOT_HASH.to_string(),
                 inclusion_path: vec![],
                 leaf_index: 0,
                 checkpoint: CheckpointJson {
@@ -420,10 +322,8 @@ mod tests {
                         "sha256:0000000000000000000000000000000000000000000000000000000000000000"
                             .to_string(),
                     tree_size: 1,
-                    root_hash:
-                        "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-                            .to_string(),
-                    timestamp: 1234567890,
+                    root_hash: TEST_ROOT_HASH.to_string(),
+                    timestamp: 1_234_567_890,
                     signature: "base64:signature".to_string(),
                     key_id:
                         "sha256:0000000000000000000000000000000000000000000000000000000000000000"
@@ -436,8 +336,8 @@ mod tests {
         }
     }
 
-    fn create_test_single_result(valid: bool) -> crate::verify::single::SingleVerificationResult {
-        crate::verify::single::SingleVerificationResult {
+    fn create_test_single_result(valid: bool) -> SingleVerificationResult {
+        SingleVerificationResult {
             source_path: PathBuf::from("test.txt"),
             receipt_path: PathBuf::from("test.atl"),
             file_hash: [0x12; 32],
@@ -448,7 +348,7 @@ mod tests {
                 leaf_hash: [0x12; 32],
                 root_hash: [0x34; 32],
                 tree_size: 1,
-                timestamp: 1234567890,
+                timestamp: 1_234_567_890,
                 signature_valid: valid,
                 signature_status: if valid {
                     SignatureStatus::Verified
@@ -466,7 +366,247 @@ mod tests {
                 anchor_results: vec![],
                 errors: vec![],
             },
+            anchor_results: vec![],
+            policy: AnchorPolicy::AllAnchors,
         }
+    }
+
+    use crate::net::bitcoin::{BitcoinBlockInfo, BlockLookup};
+
+    fn ots_fixture() -> PreparedOts {
+        // The real Receipt-Full anchor, prepared exactly as the offline pass
+        // prepares it, so the assertions below run against production data.
+        let receipt: atl_core::Receipt =
+            serde_json::from_str(include_str!("../../real-data/receipt-full.atl"))
+                .expect("fixture receipt");
+        let super_root = receipt
+            .super_proof
+            .as_ref()
+            .map(|sp| sp.super_root.as_str());
+        let anchor = receipt
+            .anchors
+            .iter()
+            .find_map(|a| match a {
+                atl_core::ReceiptAnchor::BitcoinOts {
+                    target,
+                    target_hash,
+                    ots_proof,
+                    ..
+                } => Some((target.clone(), target_hash.clone(), ots_proof.clone())),
+                atl_core::ReceiptAnchor::Rfc3161 { .. } => None,
+            })
+            .expect("fixture carries a bitcoin_ots anchor");
+        crate::verify::anchor::prepare_bitcoin_ots(&anchor.0, &anchor.1, &anchor.2, super_root)
+            .expect("the fixture's OTS proof is sound")
+    }
+
+    fn header(ts: u64, root: &str) -> BitcoinBlockInfo {
+        BitcoinBlockInfo {
+            height: 932_897,
+            timestamp_secs: ts,
+            block_hash: "a".repeat(64),
+            merkle_root: root.to_string(),
+        }
+    }
+
+    const REAL_ROOT: &str = "2f826dce65159ccc8f74da5305cb28267ef04161d92fb798f293e62670a8206f";
+    const BLOCK_TS: u64 = 1_768_806_080;
+
+    fn bitcoin_details(result: &AnchorVerificationResult) -> (Option<u64>, Option<bool>, usize) {
+        match &result.details {
+            AnchorDetails::Bitcoin {
+                block_timestamp_secs,
+                merkle_match,
+                block_sources,
+                ..
+            } => (*block_timestamp_secs, *merkle_match, block_sources.len()),
+            _ => panic!("expected a Bitcoin fact set"),
+        }
+    }
+
+    /// **Two agreeing sources are the only route to `Valid`.** Success must
+    /// stay reachable, or the corroboration requirement becomes a refusal.
+    #[test]
+    fn a_corroborated_matching_header_verifies_the_anchor() {
+        let prepared = ots_fixture();
+        let info = header(BLOCK_TS, REAL_ROOT);
+        let result = anchor_from_lookup(
+            &prepared,
+            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            BlockLookup::Corroborated {
+                reports: vec![
+                    info.to_source_report("blockstream.info"),
+                    info.to_source_report("mempool.space"),
+                ],
+                info,
+            },
+        );
+        assert_eq!(result.verdict, AnchorVerdict::Valid);
+        let (ts, merkle_match, sources) = bitcoin_details(&result);
+        assert_eq!(ts, Some(BLOCK_TS));
+        assert_eq!(merkle_match, Some(true));
+        assert_eq!(sources, 2);
+    }
+
+    /// A corroborated header that does **not** match is the one route to a
+    /// refutation. Two sources agreed on what the block contains, and it is
+    /// not what the proof computes.
+    #[test]
+    fn a_corroborated_mismatching_header_refutes_the_anchor() {
+        let prepared = ots_fixture();
+        let info = header(BLOCK_TS, &"9".repeat(64));
+        let result = anchor_from_lookup(
+            &prepared,
+            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            BlockLookup::Corroborated {
+                reports: vec![
+                    info.to_source_report("blockstream.info"),
+                    info.to_source_report("mempool.space"),
+                ],
+                info,
+            },
+        );
+        assert_eq!(
+            result.verdict,
+            AnchorVerdict::Invalid(ReasonCode::BitcoinMerkleRootMismatch)
+        );
+        assert_eq!(bitcoin_details(&result).1, Some(false));
+    }
+
+    /// **Sources disagree.** Not a refutation: the conflict is among the
+    /// sources, the receipt is not implicated, and no header is published.
+    #[test]
+    fn disagreeing_sources_never_refute_the_receipt() {
+        let prepared = ots_fixture();
+        let a = header(BLOCK_TS, REAL_ROOT);
+        let b = header(BLOCK_TS, &"9".repeat(64));
+        let result = anchor_from_lookup(
+            &prepared,
+            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            BlockLookup::Disagreement {
+                reports: vec![
+                    a.to_source_report("blockstream.info"),
+                    b.to_source_report("mempool.space"),
+                ],
+            },
+        );
+        assert_eq!(
+            result.verdict,
+            AnchorVerdict::Untrusted(ReasonCode::BitcoinProvidersDisagree)
+        );
+        assert_eq!(
+            result.state(),
+            crate::verify::anchor::AnchorState::Contested
+        );
+        // No header was established, so none is published -- not even the
+        // one that happens to match.
+        let (ts, merkle_match, sources) = bitcoin_details(&result);
+        assert_eq!(ts, None);
+        assert_eq!(merkle_match, None);
+        // ... but both reports survive: the conflict is the finding, and
+        // this is the only place the user can see it.
+        assert_eq!(sources, 2);
+        let error = result.error.expect("the disagreement must be described");
+        assert!(error.contains("blockstream.info"), "{error}");
+        assert!(error.contains("mempool.space"), "{error}");
+        assert!(
+            error.contains("NOT a finding about your receipt"),
+            "the user must not read a source conflict as an accusation: {error}"
+        );
+    }
+
+    /// A conflict about nothing but the time reaches the same outcome, and
+    /// its prose names both times -- the message used to list only the root
+    /// and the hash, which are identical in exactly this case, so the reader
+    /// was shown two rows that looked the same and told they disagreed.
+    #[test]
+    fn a_time_only_disagreement_is_described_with_the_times() {
+        let prepared = ots_fixture();
+        let a = header(BLOCK_TS, REAL_ROOT);
+        let b = header(BLOCK_TS + 1, REAL_ROOT);
+        let result = anchor_from_lookup(
+            &prepared,
+            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            BlockLookup::Disagreement {
+                reports: vec![
+                    a.to_source_report("blockstream.info"),
+                    b.to_source_report("mempool.space"),
+                ],
+            },
+        );
+        assert_eq!(
+            result.verdict,
+            AnchorVerdict::Untrusted(ReasonCode::BitcoinProvidersDisagree)
+        );
+        let error = result
+            .error
+            .clone()
+            .expect("the conflict must be described");
+        assert!(error.contains(&BLOCK_TS.to_string()), "{error}");
+        assert!(error.contains(&(BLOCK_TS + 1).to_string()), "{error}");
+        assert!(
+            error.contains("NOT a finding about your receipt"),
+            "{error}"
+        );
+        // No header was established, so none is published.
+        let (ts, merkle_match, sources) = bitcoin_details(&result);
+        assert_eq!(ts, None);
+        assert_eq!(merkle_match, None);
+        assert_eq!(sources, 2);
+    }
+
+    /// **One source.** It can neither accept nor accuse    /// **One source.** It can neither accept nor accuse — including when it
+    /// reports a mismatch. If one endpoint is not enough to trust evidence,
+    /// it is not enough to condemn it either.
+    #[test]
+    fn a_single_source_can_neither_verify_nor_refute() {
+        let prepared = ots_fixture();
+        for root in [REAL_ROOT, &"9".repeat(64)] {
+            let info = header(BLOCK_TS, root);
+            let result = anchor_from_lookup(
+                &prepared,
+                "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+                BlockLookup::Uncorroborated {
+                    reports: vec![info.to_source_report("blockstream.info")],
+                    failures: vec!["mempool.space: HTTP error".to_string()],
+                },
+            );
+            assert_eq!(
+                result.verdict,
+                AnchorVerdict::Untrusted(ReasonCode::BitcoinSingleSourceOnly),
+                "root {root}"
+            );
+            assert_eq!(
+                result.state(),
+                crate::verify::anchor::AnchorState::Uncorroborated
+            );
+            let (ts, merkle_match, sources) = bitcoin_details(&result);
+            assert_eq!(ts, None, "an uncorroborated time is not published");
+            assert_eq!(merkle_match, None);
+            assert_eq!(sources, 1);
+        }
+    }
+
+    /// **Nobody answered.** Unchanged behaviour, and still never a
+    /// refutation.
+    #[test]
+    fn no_source_is_unavailable_not_refuted() {
+        let prepared = ots_fixture();
+        let result = anchor_from_lookup(
+            &prepared,
+            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            BlockLookup::Unavailable {
+                failures: vec!["blockstream.info: down".to_string()],
+            },
+        );
+        assert_eq!(
+            result.verdict,
+            AnchorVerdict::Untrusted(ReasonCode::BitcoinBlockUnavailable)
+        );
+        let (ts, merkle_match, sources) = bitcoin_details(&result);
+        assert_eq!(ts, None);
+        assert_eq!(merkle_match, None);
+        assert_eq!(sources, 0);
     }
 
     #[test]
@@ -476,425 +616,86 @@ mod tests {
     }
 
     #[test]
-    fn test_anchor_details_variants() {
-        let rfc = AnchorDetails::Rfc3161 {
-            algorithm_oid: "2.16.840.1.101.3.4.2.1".to_string(),
-        };
-        let bitcoin = AnchorDetails::Bitcoin {
-            block_height: 800000,
-            block_timestamp_secs: 1700000000,
-            target_hash: "sha256:abc".to_string(),
-            operation_count: 10,
-            computed_root: "sha256:def".to_string(),
-            block_merkle_root: Some("sha256:ghi".to_string()),
-            merkle_match: Some(true),
-        };
-        let unknown = AnchorDetails::Unknown;
-
-        // Just ensure variants construct properly
-        match rfc {
-            AnchorDetails::Rfc3161 { algorithm_oid } => {
-                assert_eq!(algorithm_oid, "2.16.840.1.101.3.4.2.1");
-            }
-            _ => panic!("Wrong variant"),
-        }
-        match bitcoin {
-            AnchorDetails::Bitcoin {
-                block_height,
-                block_timestamp_secs,
-                target_hash,
-                operation_count,
-                computed_root,
-                block_merkle_root,
-                merkle_match,
-            } => {
-                assert_eq!(block_height, 800000);
-                assert_eq!(block_timestamp_secs, 1700000000);
-                assert_eq!(target_hash, "sha256:abc");
-                assert_eq!(operation_count, 10);
-                assert_eq!(computed_root, "sha256:def");
-                assert_eq!(block_merkle_root, Some("sha256:ghi".to_string()));
-                assert_eq!(merkle_match, Some(true));
-            }
-            _ => panic!("Wrong variant"),
-        }
-        match unknown {
-            AnchorDetails::Unknown => {}
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_anchor_verification_result_creation() {
-        let result = AnchorVerificationResult {
-            anchor_type: "rfc3161".to_string(),
-            verified: true,
-            timestamp_nanos: Some(1234567890),
-            error: None,
-            details: AnchorDetails::Rfc3161 {
-                algorithm_oid: "test".to_string(),
-            },
-        };
-        assert_eq!(result.anchor_type, "rfc3161");
-        assert!(result.verified);
-        assert_eq!(result.timestamp_nanos, Some(1234567890));
-        assert!(result.error.is_none());
-    }
-
-    #[test]
-    fn test_verify_rfc3161_invalid_target() {
-        let result = verify_rfc3161(
-            "wrong_target",
-            "sha256:abc",
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-        );
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result
-            .error
-            .unwrap()
-            .contains("Invalid target 'wrong_target'"));
-    }
-
-    #[test]
-    fn test_verify_rfc3161_invalid_hex() {
-        let result = verify_rfc3161(
-            "data_tree_root",
-            "sha256:notvalidhex",
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-        );
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hex"));
-    }
-
-    #[test]
-    fn test_verify_rfc3161_wrong_hash_length() {
-        let result = verify_rfc3161(
-            "data_tree_root",
-            "sha256:aabb",
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-        );
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hash length"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_bitcoin_ots_invalid_target() {
-        let config = OnlineConfig::default();
-        let result =
-            verify_bitcoin_ots("wrong_target", "sha256:abc", "base64:proof", None, &config).await;
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result
-            .error
-            .unwrap()
-            .contains("Invalid target 'wrong_target'"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_bitcoin_ots_no_super_root() {
-        let config = OnlineConfig::default();
-        let result =
-            verify_bitcoin_ots("super_root", "sha256:abc", "base64:proof", None, &config).await;
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("no super_proof"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_bitcoin_ots_hash_mismatch() {
-        let config = OnlineConfig::default();
-        let result = verify_bitcoin_ots(
-            "super_root",
-            "sha256:abc",
-            "base64:proof",
-            Some("sha256:different"),
-            &config,
-        )
-        .await;
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result
-            .error
-            .unwrap()
-            .contains("target_hash does not match super_root"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_bitcoin_ots_invalid_hex() {
-        let config = OnlineConfig::default();
-        let result = verify_bitcoin_ots(
-            "super_root",
-            "sha256:notvalidhex",
-            "base64:proof",
-            Some("sha256:notvalidhex"),
-            &config,
-        )
-        .await;
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hex"));
-    }
-
-    #[tokio::test]
-    async fn test_verify_bitcoin_ots_wrong_hash_length() {
-        let config = OnlineConfig::default();
-        let result = verify_bitcoin_ots(
-            "super_root",
-            "sha256:aabb",
-            "base64:proof",
-            Some("sha256:aabb"),
-            &config,
-        )
-        .await;
-        assert!(!result.verified);
-        assert!(result.error.is_some());
-        assert!(result.error.unwrap().contains("Invalid hash length"));
-    }
-
-    #[test]
-    fn test_online_verification_result_is_valid_both_true() {
-        let single = create_test_single_result(true);
-
-        let online = OnlineVerificationResult {
-            offline: single,
-            anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: VerificationMode::Online,
-        };
-        assert!(online.is_valid());
-    }
-
-    #[test]
-    fn test_online_verification_result_is_valid_offline_false() {
-        let single = create_test_single_result(false);
-
-        let online = OnlineVerificationResult {
-            offline: single,
-            anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: VerificationMode::Online,
-        };
-        assert!(!online.is_valid());
-    }
-
-    #[test]
-    fn test_online_verification_result_is_valid_anchors_false() {
-        let single = create_test_single_result(true);
-
-        let online = OnlineVerificationResult {
-            offline: single,
-            anchor_results: vec![],
-            all_anchors_verified: false,
-            mode: VerificationMode::Online,
-        };
-        assert!(!online.is_valid());
-    }
-
-    #[tokio::test]
-    async fn test_verify_single_online_no_anchors() {
-        let single = create_test_single_result(true);
-
-        let config = OnlineConfig::default();
-        let result = verify_single_online(single, &config).await;
-        assert!(result.is_ok());
-        let online = result.unwrap();
-        assert!(online.anchor_results.is_empty());
-        assert!(online.all_anchors_verified); // vacuously true for empty list
-    }
-
-    #[tokio::test]
-    async fn test_verify_single_online_with_rfc3161_invalid() {
-        let mut single = create_test_single_result(true);
-        single.receipt.anchors.push(ReceiptAnchor::Rfc3161 {
-            target: "wrong".to_string(),
-            target_hash: "sha256:abc".to_string(),
-            tsa_url: "https://example.com/tsa".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            token_der: "base64:token".to_string(),
-        });
-
-        let config = OnlineConfig::default();
-        let result = verify_single_online(single, &config).await;
-        assert!(result.is_ok());
-        let online = result.unwrap();
-        assert_eq!(online.anchor_results.len(), 1);
-        assert!(!online.anchor_results[0].verified);
-        assert!(!online.all_anchors_verified);
-    }
-
-    #[tokio::test]
-    async fn test_verify_single_online_with_bitcoin_ots_invalid() {
-        let mut single = create_test_single_result(true);
-        single.receipt.anchors.push(ReceiptAnchor::BitcoinOts {
-            target: "wrong".to_string(),
-            target_hash: "sha256:abc".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            bitcoin_block_height: 800000,
-            bitcoin_block_time: "2024-01-01T00:00:00Z".to_string(),
-            ots_proof: "base64:proof".to_string(),
-        });
-
-        let config = OnlineConfig::default();
-        let result = verify_single_online(single, &config).await;
-        assert!(result.is_ok());
-        let online = result.unwrap();
-        assert_eq!(online.anchor_results.len(), 1);
-        assert!(!online.anchor_results[0].verified);
-        assert!(!online.all_anchors_verified);
-    }
-
-    // Note: verify_merkle_root tests moved to atl-core (BitcoinAttestation::verify_against_block)
-
-    #[test]
-    fn should_reverse_bytes_for_computed_root_display() {
-        // Arrange
-        // Internal format (little-endian)
-        let last_hash_hex = "6f20a87026e693f298b72fd96141f07e2628cb0553da748fcc9c1565ce6d822f";
-        // Expected display format (big-endian, with sha256: prefix)
-        let expected = "sha256:2f826dce65159ccc8f74da5305cb28267ef04161d92fb798f293e62670a8206f";
-
-        let mut last_hash = [0u8; 32];
-        hex::decode_to_slice(last_hash_hex, &mut last_hash).unwrap();
-
-        // Act
-        let mut reversed = last_hash;
-        reversed.reverse();
-        let result = format!("sha256:{}", hex::encode(reversed));
-
-        // Assert
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn should_format_target_hash_with_sha256_prefix() {
-        // Arrange
-        let target_hash = "94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2";
-
-        // Act
-        let result = format!("sha256:{}", target_hash);
-
-        // Assert
-        assert_eq!(
-            result,
-            "sha256:94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2"
-        );
-        assert_eq!(result.len(), 71); // "sha256:" (7) + 64 hex chars
-    }
-
-    #[test]
-    fn should_populate_operation_count_from_merkle_path() {
-        // Arrange
-        let mut path = Vec::new();
-        for _ in 0..39 {
-            path.push([0u8; 32]);
-        }
-
-        // Act
-        let count = path.len();
-
-        // Assert
-        assert_eq!(count, 39);
-    }
-
-    #[test]
-    fn test_online_config_clone() {
+    fn test_online_config_clone_and_debug() {
         let config = OnlineConfig::default();
         let cloned = config.clone();
         assert_eq!(config.request_timeout, cloned.request_timeout);
+        assert!(format!("{config:?}").contains("OnlineConfig"));
     }
 
     #[test]
-    fn test_online_config_debug() {
-        let config = OnlineConfig::default();
-        let debug_str = format!("{:?}", config);
-        assert!(debug_str.contains("OnlineConfig"));
+    fn rfc3161_only_receipt_needs_no_network() {
+        let mut receipt = create_test_receipt();
+        receipt.anchors.push(ReceiptAnchor::Rfc3161 {
+            target: "data_tree_root".to_string(),
+            target_hash: TEST_ROOT_HASH.to_string(),
+            tsa_url: "https://example.invalid/tsa".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            token_der: "base64:token".to_string(),
+        });
+        assert!(!receipt_requires_network(&receipt));
     }
 
     #[test]
-    fn test_anchor_verification_result_clone() {
-        let result = AnchorVerificationResult {
-            anchor_type: "test".to_string(),
-            verified: true,
-            timestamp_nanos: Some(123),
-            error: None,
-            details: AnchorDetails::Unknown,
-        };
-        let cloned = result.clone();
-        assert_eq!(cloned.anchor_type, "test");
-        assert!(cloned.verified);
+    fn bitcoin_anchor_needs_network() {
+        let mut receipt = create_test_receipt();
+        receipt.anchors.push(ReceiptAnchor::BitcoinOts {
+            target: "super_root".to_string(),
+            target_hash: TEST_ROOT_HASH.to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            bitcoin_block_height: 800_000,
+            bitcoin_block_time: "2024-01-01T00:00:00Z".to_string(),
+            ots_proof: "base64:proof".to_string(),
+        });
+        assert!(receipt_requires_network(&receipt));
     }
 
-    #[test]
-    fn test_anchor_details_clone() {
-        let rfc = AnchorDetails::Rfc3161 {
-            algorithm_oid: "test".to_string(),
-        };
-        let bitcoin = AnchorDetails::Bitcoin {
-            block_height: 1,
-            block_timestamp_secs: 2,
-            target_hash: "hash".to_string(),
-            operation_count: 3,
-            computed_root: "root".to_string(),
-            block_merkle_root: Some("merkle".to_string()),
-            merkle_match: Some(true),
-        };
+    #[tokio::test]
+    async fn online_pass_leaves_non_bitcoin_anchors_untouched() {
+        // A receipt with no bitcoin anchors must come out of the online pass
+        // byte-for-byte identical -- and, crucially, without any network
+        // call having been made.
+        let mut result = create_test_single_result(true);
+        result.receipt.anchors.push(ReceiptAnchor::Rfc3161 {
+            target: "data_tree_root".to_string(),
+            target_hash: OTHER_HASH.to_string(),
+            tsa_url: "https://example.invalid/tsa".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            token_der: "base64:token".to_string(),
+        });
+        result.anchor_results =
+            crate::verify::anchor::verify_anchors_offline(&result.receipt, None);
+        let before = result.anchor_results[0].verdict;
 
-        let rfc_cloned = rfc.clone();
-        let bitcoin_cloned = bitcoin.clone();
+        verify_anchors_online(&mut result, &OnlineConfig::default())
+            .await
+            .expect("online pass must not fail");
 
-        match rfc_cloned {
-            AnchorDetails::Rfc3161 { algorithm_oid } => assert_eq!(algorithm_oid, "test"),
-            _ => panic!("Wrong variant"),
-        }
-
-        match bitcoin_cloned {
-            AnchorDetails::Bitcoin { block_height, .. } => assert_eq!(block_height, 1),
-            _ => panic!("Wrong variant"),
-        }
-    }
-
-    #[test]
-    fn test_online_verification_result_debug() {
-        let single = create_test_single_result(true);
-        let online = OnlineVerificationResult {
-            offline: single,
-            anchor_results: vec![],
-            all_anchors_verified: true,
-            mode: VerificationMode::Online,
-        };
-        let debug_str = format!("{:?}", online);
-        assert!(debug_str.contains("OnlineVerificationResult"));
-    }
-
-    #[test]
-    fn test_verify_rfc3161_with_base64_prefix() {
-        // Test that base64: prefix is handled correctly
-        let result = verify_rfc3161(
-            "data_tree_root",
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "2024-01-01T00:00:00Z",
-            "base64:sometoken",
+        assert_eq!(result.anchor_results[0].verdict, before);
+        assert_eq!(
+            before,
+            AnchorVerdict::Invalid(ReasonCode::AnchorTargetHashMismatch)
         );
-        // Will fail verification but should not fail on prefix handling
-        assert!(!result.verified);
     }
 
     #[test]
-    fn test_verify_rfc3161_without_base64_prefix() {
-        // Test that missing base64: prefix is added
-        let result = verify_rfc3161(
-            "data_tree_root",
-            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "2024-01-01T00:00:00Z",
-            "sometoken",
+    fn unanchored_receipt_is_untrusted() {
+        let result = create_test_single_result(true);
+        assert_eq!(result.verdict().status, Status::Untrusted);
+        assert_eq!(
+            result.verdict().reason_code,
+            Some(ReasonCode::ReceiptUnanchored)
         );
-        // Will fail verification but should not fail on prefix handling
-        assert!(!result.verified);
+        assert_eq!(result.verdict().exit_code().code(), 3);
+        assert!(result.is_lite());
+        assert!(!result.is_valid());
+    }
+
+    #[test]
+    fn file_hash_mismatch_outranks_everything() {
+        let result = create_test_single_result(false);
+        let verdict = result.verdict();
+        assert_eq!(verdict.status, Status::Invalid);
+        assert_eq!(verdict.reason_code, Some(ReasonCode::FileHashMismatch));
     }
 }

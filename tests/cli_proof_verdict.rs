@@ -39,13 +39,18 @@ fn offline_json_unanchored_valid_receipt_has_true_inclusion_flags() {
             "--offline",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
 
     let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(json["status"], "pending");
+    // Untrusted (ATL v2.0 §5.5 -- no verified anchor), yet every proof flag
+    // below is `true`. That is the whole point of this test: the proof
+    // verdict is a statement about proofs, not about trust, and the two must
+    // stay separately readable.
+    assert_eq!(json["status"], "untrusted");
+    assert_eq!(json["reason_code"], "receipt_unanchored");
     assert_eq!(json["verification"]["inclusion_valid"], true);
     assert_eq!(json["verification"]["super_inclusion_valid"], true);
     assert_eq!(json["verification"]["super_consistency_valid"], true);
@@ -54,7 +59,8 @@ fn offline_json_unanchored_valid_receipt_has_true_inclusion_flags() {
 
 /// Same receipt, human-readable offline output: must print "Inclusion
 /// Proof: VALID" (not blocked on the missing trust anchor, which is
-/// reported separately as "Anchor Status: UNANCHORED").
+/// reported separately as "Anchor Status: UNANCHORED", and drives the
+/// untrusted headline).
 #[test]
 fn offline_human_unanchored_valid_receipt_shows_valid_inclusion() {
     let mut cmd = Command::cargo_bin("atl-cli").unwrap();
@@ -68,9 +74,12 @@ fn offline_human_unanchored_valid_receipt_shows_valid_inclusion() {
         "--offline",
     ])
     .assert()
-    .success()
+    .code(3)
     .stdout(predicate::str::contains("Inclusion Proof: VALID"))
-    .stdout(predicate::str::contains("PENDING (unanchored)"));
+    .stdout(predicate::str::contains("Anchor Status: UNANCHORED"))
+    .stdout(predicate::str::contains(
+        "NOT VERIFIED: the receipt carries no anchors (Receipt-Lite)",
+    ));
 }
 
 /// A receipt whose base inclusion proof is valid but whose Super-Tree

@@ -9,12 +9,18 @@ use std::path::PathBuf;
 /// Verify cryptographic evidence receipts from Anchored Transparency Logs.
 /// Trust is established through external anchors (TSA, Bitcoin), NOT operator keys.
 ///
-/// The CLI auto-detects internet connectivity at startup:
-/// - If online: performs full verification including anchor checks
-/// - If offline: performs cryptographic proof verification only
+/// Only Bitcoin OTS anchors need the network. RFC 3161 verification is pure
+/// computation, so a receipt without a Bitcoin anchor is verified in full
+/// without any network access, and connectivity is never probed for it.
+///
+/// When a receipt does carry a Bitcoin anchor, the CLI auto-detects
+/// connectivity: online, it asks block-explorer APIs for the block header and
+/// compares the OTS proof's merkle root against the one two or more of them
+/// agree on; offline, that anchor is reported unconfirmed rather than
+/// accepted. It does not observe the Bitcoin network -- see the README.
 ///
 /// Use --offline to skip online checks even when internet is available.
-/// Use --online to require online verification (fails if no internet).
+/// Use --online to require connectivity for anchors that need it.
 #[derive(Parser, Debug)]
 #[command(name = "atl-cli")]
 #[command(author = "Evidentum <info@evidentum.io>")]
@@ -31,9 +37,15 @@ pub struct Args {
     ///
     /// When enabled, no output is printed to stdout/stderr.
     /// Use the exit code to determine verification result:
-    /// - 0: VALID
-    /// - 1: INVALID (verification failed)
-    /// - 2: ERROR (runtime error)
+    /// - 0: VALID (accepted under the anchor policy in force)
+    /// - 1: INVALID (the evidence was refuted)
+    /// - 2: ERROR (an input could not be processed -- says nothing about
+    ///   the evidence)
+    /// - 3: UNTRUSTED (nothing refuted; the check could not be finished --
+    ///   trust material is missing on this side, the certificate path could
+    ///   not be evaluated at all, or the receipt carries no anchors. See
+    ///   reason_code and the anchor's error text before assuming a
+    ///   certificate is what is needed)
     #[arg(short, long, global = true)]
     pub quiet: bool,
 
@@ -72,9 +84,13 @@ pub enum Command {
     /// 4. Verify Merkle inclusion proof
     /// 5. Verify Super-Tree proofs
     ///
-    /// **Additional steps (online):**
-    /// 6. Verify RFC 3161 TSA anchor (certificate chain)
-    /// 7. Verify Bitcoin OTS anchor (blockchain confirmation)
+    /// 6. Verify RFC 3161 TSA anchors: token decoding, CMS signature,
+    ///    certificate chain, validity at genTime, EKU. This is pure
+    ///    computation and needs no network.
+    ///
+    /// **Additional step (online):**
+    /// 7. Check Bitcoin OTS anchors against the block header that two or
+    ///    more block-explorer APIs agree on. The only step needing network.
     ///
     /// **Batch mode also verifies:**
     /// - Log consistency (all receipts from same append-only log)
@@ -104,10 +120,13 @@ pub struct VerifyArgs {
     #[arg(value_hint = ValueHint::AnyPath)]
     pub receipt: PathBuf,
 
-    /// Force offline mode (skip online verification)
+    /// Force offline mode (skip the Bitcoin block lookup)
     ///
-    /// Even if internet is available, only perform cryptographic
-    /// proof verification without checking external anchors.
+    /// Even if internet is available, perform no network access. RFC 3161
+    /// anchors are still verified in full -- that is pure computation. What
+    /// is skipped is asking block-explorer APIs for the block header an OTS
+    /// proof is compared against, so a bitcoin_ots anchor can at best report
+    /// "not confirmed" and the receipt cannot reach "valid" through it.
     ///
     /// Useful for:
     /// - Faster verification
@@ -116,13 +135,17 @@ pub struct VerifyArgs {
     #[arg(long)]
     pub offline: bool,
 
-    /// Force online mode (fail if no internet)
+    /// Require connectivity for anchors that need it
     ///
-    /// Requires internet connectivity. If no internet is available,
-    /// verification fails with an error instead of falling back to
-    /// offline mode.
+    /// If the receipt has an anchor that needs the network (only
+    /// bitcoin_ots does) and no internet is available, verification fails
+    /// with an error instead of falling back to offline mode.
     ///
-    /// Useful when you require anchor verification for trust.
+    /// A receipt with no such anchor -- an RFC 3161-only receipt, say -- is
+    /// verified without any network access and reports mode "offline" even
+    /// under this flag. Nothing is probed, and nothing fails: there is
+    /// simply nothing online to do, and claiming otherwise would be a
+    /// verification result the tool did not perform.
     #[arg(long, conflicts_with = "offline")]
     pub online: bool,
 
@@ -132,6 +155,85 @@ pub struct VerifyArgs {
     /// Useful for debugging verification failures.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Accept the receipt once ONE anchor has been verified
+    ///
+    /// Lowers the anchor quorum to the ATL v2.0 §5.5 floor: "At least one
+    /// anchor MUST be verified to establish trust in the receipt."
+    ///
+    /// The default is stricter, and deliberately so: EVERY anchor a receipt
+    /// presents must be verified. That is a rule about the anchors this
+    /// receipt offers, not about anchor types -- a Receipt-TSA satisfies it
+    /// with its single TSA anchor -- so it is NOT §5.6. §5.6 is reported
+    /// separately as the max_trust_profile field.
+    ///
+    /// A Receipt-Full whose Bitcoin anchor was never confirmed did not
+    /// deliver what it offered, and this tool says so rather than quietly
+    /// settling for less.
+    ///
+    /// What this flag does NOT do:
+    ///
+    /// - It never rescues a refuted anchor. One disproved fact makes the
+    ///   receipt "invalid" (exit 1) whatever the quorum is, and every trust
+    ///   axis reports false beside it.
+    /// - It never accepts a receipt with no anchors at all: a quorum of one
+    ///   cannot be met by none.
+    /// - It never hides an unverified anchor. Every anchor that reached no
+    ///   result is still listed, with its reason, and the run is reported as
+    ///   a success RELATIVE TO THIS POLICY -- never as an unqualified VALID.
+    ///
+    /// A "verified anchor" here means the cryptographic facts were checked
+    /// AND the certificate path reached a root you supplied via
+    /// --tsa-trust-store. A sound signature under an unknown root is not a
+    /// verified anchor and never counts towards the quorum.
+    #[arg(long)]
+    pub allow_single_anchor: bool,
+
+    /// Trusted TSA root certificates, for RFC 3161 anchor verification
+    ///
+    /// Path to a PEM file (one or more concatenated certificates), a single
+    /// DER-encoded certificate, or a directory containing such files.
+    ///
+    /// Per the ATL Protocol trust model, this tool ships with NO built-in
+    /// TSA roots: without this flag, an RFC 3161 anchor's certificate chain
+    /// can at best be reported "Assumed" (cryptographically sound, but
+    /// nobody vouches for the root), which yields status "untrusted" and
+    /// NEVER a valid verification result. Pass the root(s) you have obtained
+    /// through some trusted channel (e.g. the TSA operator's published root
+    /// bundle) to let matching anchors be reported "Trusted" instead.
+    ///
+    /// Certificates given here are trust ANCHORS. To merely bridge a gap in
+    /// a token's certificate set, use --tsa-intermediates.
+    #[arg(long, value_hint = ValueHint::AnyPath)]
+    pub tsa_trust_store: Option<PathBuf>,
+
+    /// Intermediate CA certificates, for completing an RFC 3161 chain
+    ///
+    /// Same accepted formats as --tsa-trust-store (PEM file, DER file, or a
+    /// directory of either).
+    ///
+    /// Certificates given here confer NO trust of their own: chain
+    /// construction may walk through them, but the chain must still reach a
+    /// certificate named by --tsa-trust-store to be reported "Trusted".
+    /// Use this when a token's chain reports status "untrusted" with reason
+    /// "tsa_chain_incomplete" -- some TSAs (notably Sectigo and DigiCert)
+    /// ship tokens whose topmost certificate is cross-signed by a legacy
+    /// root that the token itself does not include.
+    ///
+    /// It will NOT help with reason "tsa_chain_indeterminate" or
+    /// "cms_signature_indeterminate": there the check could not be performed
+    /// at all (commonly a signature algorithm this verifier does not
+    /// implement, such as SHA-1 on a long-lived root).
+    /// A certificate passed here is checked like any other link on the
+    /// path; the same certificate passed to --tsa-trust-store is an
+    /// external trusted input and is not re-checked (RFC 5280 6.1), which
+    /// is why the two flags can differ on the very same file.
+    ///
+    /// Keeping this separate from --tsa-trust-store matters: feeding the
+    /// missing issuer in as an anchor would silently move your trust
+    /// boundary outward to a certificate you never meant to trust.
+    #[arg(long, value_hint = ValueHint::AnyPath)]
+    pub tsa_intermediates: Option<PathBuf>,
 }
 
 /// Arguments for the inspect command
@@ -224,35 +326,50 @@ impl VerifyArgs {
         }
     }
 
-    /// Determine verification mode, considering receipt anchors
+    /// Determine verification mode for a receipt that does (or does not)
+    /// have anchors needing network access.
     ///
-    /// For lite receipts (no anchors), skip connectivity check since
-    /// there's nothing to verify online anyway.
+    /// `needs_network` must be `true` only when at least one anchor cannot
+    /// be verified to completion offline — today that means a `bitcoin_ots`
+    /// anchor. RFC 3161 verification (token decoding, CMS signature,
+    /// certificate chain) is pure computation and never touches the network,
+    /// so a receipt anchored only by a TSA must not cause a connectivity
+    /// probe: that probe contacts external hosts for a check that never
+    /// leaves the process, which is both a needless delay and a needless
+    /// disclosure of when and how often someone verifies evidence.
     ///
     /// Priority:
-    /// 1. --offline flag -> Offline (no network check)
-    /// 2. --online flag -> Online (requires network check)
-    /// 3. No anchors in receipt -> Offline (skip network check)
-    /// 4. Has anchors, no flag -> auto-detect (check network)
+    /// 1. `--offline` -> Offline (no network check)
+    /// 2. Nothing in the receipt needs the network -> Offline (no network
+    ///    check), **including under `--online`**: there is no online step to
+    ///    require, and reporting `mode: online` for a run that made no
+    ///    network call would be the same overclaim this CLI exists to avoid.
+    /// 3. `--online` -> Online, or [`CliError::NoInternetConnection`] if the
+    ///    connectivity probe fails
+    /// 4. Otherwise -> auto-detect
     #[allow(dead_code)]
     pub fn determine_mode_for_receipt(
         &self,
-        has_anchors: bool,
+        needs_network: bool,
     ) -> crate::error::CliResult<VerificationMode> {
         // --offline always wins
         if self.offline {
             return Ok(VerificationMode::Offline);
         }
 
-        // --online requires network check regardless of anchors
+        // Nothing to do online: never probe, whatever the flags say.
+        if !needs_network {
+            return Ok(VerificationMode::Offline);
+        }
+
+        // --online requires connectivity
         if self.online {
             #[cfg(feature = "online")]
             {
                 if crate::net::detect::has_internet_blocking() {
                     return Ok(VerificationMode::Online);
-                } else {
-                    return Err(crate::error::CliError::NoInternetConnection);
                 }
+                return Err(crate::error::CliError::NoInternetConnection);
             }
             #[cfg(not(feature = "online"))]
             {
@@ -262,12 +379,7 @@ impl VerifyArgs {
             }
         }
 
-        // No anchors = no point checking connectivity
-        if !has_anchors {
-            return Ok(VerificationMode::Offline);
-        }
-
-        // Has anchors, auto-detect mode
+        // Network-backed anchors present, no flag: auto-detect
         #[cfg(feature = "online")]
         {
             if crate::net::detect::has_internet_blocking() {
@@ -428,6 +540,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         assert!(args.is_batch_mode());
 
@@ -437,6 +552,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         assert!(!args2.is_batch_mode());
     }
@@ -449,6 +567,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: true,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         assert!(args.is_verbose());
 
@@ -458,6 +579,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         assert!(!args2.is_verbose());
     }
@@ -470,6 +594,9 @@ mod tests {
             offline: true,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let mode = args.determine_mode().unwrap();
         assert_eq!(mode, VerificationMode::Offline);
@@ -484,6 +611,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let mode = args.determine_mode().unwrap();
         assert_eq!(mode, VerificationMode::Offline);
@@ -498,6 +628,9 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let result = args.determine_mode();
         assert!(result.is_err());
@@ -511,6 +644,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let result = args.validate();
         assert!(result.is_err());
@@ -529,6 +665,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let result = args.validate();
         assert!(result.is_err());
@@ -550,6 +689,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let result = args.validate();
         assert!(result.is_err());
@@ -574,6 +716,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let result = args.validate();
         assert!(result.is_ok());
@@ -594,6 +739,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         let result = args.validate();
         assert!(result.is_ok());
@@ -614,6 +762,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
         // Should still succeed, just prints warning
         let result = args.validate();
@@ -628,6 +779,9 @@ mod tests {
             offline: true,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // --offline flag should return Offline regardless of anchors
@@ -649,6 +803,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // No anchors = should return Offline immediately without network check
@@ -665,6 +822,9 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // --online flag without online feature should error
@@ -681,6 +841,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // Has anchors but no online feature - should return Offline
@@ -697,6 +860,9 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // --online flag with online feature - result depends on actual internet
@@ -714,6 +880,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // Auto-detect with anchors and online feature
@@ -730,6 +899,9 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // --online flag with online feature
@@ -747,6 +919,9 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
         };
 
         // Auto-detect with online feature

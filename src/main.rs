@@ -17,7 +17,15 @@
 //!
 //! # JSON output
 //! atl-cli verify document.pdf document.pdf.atl --json
+//!
+//! # Supply the trust material RFC 3161 anchors are checked against
+//! atl-cli verify document.pdf document.pdf.atl \
+//!     --tsa-trust-store roots.pem --tsa-intermediates bridge.pem
 //! ```
+//!
+//! Exit codes: 0 valid, 1 refuted, 2 runtime error, 3 untrusted (which
+//! includes an unanchored receipt -- ATL v2.0 §5.5)
+//! -- see [`error::ExitCode`].
 
 mod cli;
 mod commands;
@@ -64,6 +72,7 @@ mod tests {
         assert_eq!(ExitCode::Valid.code(), 0);
         assert_eq!(ExitCode::Invalid.code(), 1);
         assert_eq!(ExitCode::Error.code(), 2);
+        assert_eq!(ExitCode::Untrusted.code(), 3);
     }
 
     #[test]

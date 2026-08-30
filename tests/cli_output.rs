@@ -1,5 +1,11 @@
 #![allow(deprecated)]
 //! Output format tests: JSON, quiet, verbose, no-color
+//!
+//! The bundled `document.pdf` receipt is a Receipt-Lite. Since ATL v2.0
+//! §5.5 became binding here -- no verified anchor means untrustworthy -- it
+//! exits 3, so these tests pin `.code(3)` where they used to pin
+//! `.success()`. They are about *rendering*, not about the verdict; the
+//! verdict itself is pinned in `cli_exit_codes.rs`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -24,7 +30,7 @@ fn test_json_output_single_valid() {
             "--json",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
@@ -78,7 +84,7 @@ fn test_json_output_is_valid_json() {
             "--json",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
@@ -99,7 +105,7 @@ fn test_quiet_mode_no_output() {
         "--quiet",
     ])
     .assert()
-    .success()
+    .code(3)
     .stdout(predicate::str::is_empty());
 }
 
@@ -134,7 +140,7 @@ fn test_no_color_flag() {
             "--no-color",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
@@ -156,7 +162,7 @@ fn test_verbose_mode() {
         "--verbose",
     ])
     .assert()
-    .success();
+    .code(3);
 }
 
 #[test]
@@ -172,7 +178,7 @@ fn test_verbose_with_json() {
         "--json",
     ])
     .assert()
-    .success();
+    .code(3);
 }
 
 #[test]
@@ -188,7 +194,7 @@ fn test_quiet_with_json() {
         "--json",
     ])
     .assert()
-    .success()
+    .code(3)
     .stdout(predicate::str::is_empty());
 }
 
@@ -205,7 +211,7 @@ fn test_batch_json_output() {
             "--json",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
@@ -227,7 +233,7 @@ fn test_batch_quiet_mode() {
         "--quiet",
     ])
     .assert()
-    .success()
+    .code(3)
     .stdout(predicate::str::is_empty());
 }
 
@@ -244,7 +250,7 @@ fn test_batch_no_color() {
             "--no-color",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();

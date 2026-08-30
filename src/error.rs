@@ -1,9 +1,20 @@
 //! Error types and exit codes for atl-cli
 //!
 //! Exit codes:
-//! - 0 = VALID (verification passed)
-//! - 1 = INVALID (verification failed cryptographically)
+//! - 0 = VALID (accepted under the anchor policy in force -- the only
+//!   status that exits 0)
+//! - 1 = INVALID (the evidence was refuted)
 //! - 2 = ERROR (runtime error)
+//! - 3 = UNTRUSTED (nothing refuted; the check could not be finished)
+//!
+//! Codes 1 and 3 are deliberately distinct so a script can tell "this
+//! evidence is broken" from "I could not finish checking it" without parsing
+//! JSON. Code 2 is equally distinct: it means the tool failed to process an
+//! input and says nothing about the evidence.
+//!
+//! The same input must produce the same code whether it was passed as a file
+//! or as a directory. Batch mode aggregates per-item outcomes; it never
+//! reclassifies them into a different kind of answer.
 
 use std::path::PathBuf;
 use thiserror::Error;
@@ -14,10 +25,21 @@ use thiserror::Error;
 pub enum ExitCode {
     /// All verifications passed
     Valid = 0,
-    /// One or more verifications failed (cryptographic/hash failure)
+    /// One or more verifications was refuted (cryptographic/hash failure)
     Invalid = 1,
     /// Runtime error (file not found, parse error, network, etc.)
     Error = 2,
+    /// Nothing was refuted, and the check could not be finished. Three
+    /// shapes reach this code: an anchor that did not reach a trust root
+    /// this verifier was configured with, a fact that could not be evaluated
+    /// at all (cryptography this build does not implement), and — in batch
+    /// mode — a file the caller named that never paired up with its
+    /// counterpart and was therefore never checked.
+    ///
+    /// The evidence stands in every case. Read the reason code before
+    /// telling anyone what to supply: only the first shape is fixed by
+    /// supplying trust material.
+    Untrusted = 3,
 }
 
 impl ExitCode {
@@ -131,8 +153,50 @@ pub enum CliError {
     VerificationFailed(String),
 
     // ========================================================================
+    // Trust Material Missing (Exit Code 3: UNTRUSTED)
+    // ========================================================================
+    /// Every checkable fact holds, but the check could not be finished. Three
+    /// shapes reach this variant: no anchor reached a trust root this verifier
+    /// was configured with; the certificate path could not be evaluated at
+    /// all; or, in a batch, a file the caller named had no counterpart to
+    /// check it against.
+    ///
+    /// This is NOT a verification failure: nothing about the evidence was
+    /// refuted. It is a statement about *this verifier's* limits, and it
+    /// gets its own exit code so callers never have to guess which of the
+    /// two happened.
+    #[error("{headline} ({reason_code}) -- {detail}")]
+    TrustNotEstablished {
+        /// Leading phrase. Two are possible, because "trust root
+        /// unavailable" is a lie for
+        /// [`crate::verify::verdict::ReasonCode::TsaChainIndeterminate`]:
+        /// there nothing is unavailable, the check could not be performed.
+        /// See [`Self::untrusted_headline`].
+        headline: &'static str,
+        /// Stable machine-readable reason (see
+        /// [`crate::verify::verdict::ReasonCode`]).
+        reason_code: &'static str,
+        /// What the caller needs to supply, or what stopped the check.
+        detail: String,
+    },
+
+    // ========================================================================
     // Batch Mode Errors (Exit Codes vary)
     // ========================================================================
+    /// One or more batch items could not be processed at all — a file that
+    /// would not open, or a receipt that would not parse.
+    ///
+    /// Exit code 2, matching what single-file mode returns for the very same
+    /// input. This is an operational failure, not a statement about the
+    /// evidence: the tool never got far enough to make one.
+    #[error("ERROR: {errors} of {total} items could not be processed (no item was refuted)")]
+    BatchItemsUnprocessable {
+        /// Items that failed to be read or parsed.
+        errors: usize,
+        /// Total paths named by the caller.
+        total: usize,
+    },
+
     /// No matching receipt found for file (Exit Code 2 if critical, or just warning)
     #[error("No receipt found for file: {0}")]
     #[allow(dead_code)]
@@ -165,26 +229,18 @@ pub enum CliError {
     // ========================================================================
     // Consistency Errors (Exit Code 1: INVALID)
     // ========================================================================
-    /// Receipts have different genesis (from different logs)
-    #[error(
-        "Log consistency failed: receipts are from different logs (different genesis_super_root)"
-    )]
-    #[allow(dead_code)]
-    DifferentLogOrigins {
-        /// First receipt's genesis
-        genesis_a: String,
-        /// Second receipt's genesis (different)
-        genesis_b: String,
-    },
-
-    /// Tree size anomaly detected
-    #[error("Log consistency failed: tree size anomaly detected (potential log tampering)")]
-    #[allow(dead_code)]
-    TreeSizeAnomaly {
-        /// Description of the anomaly
-        description: String,
-    },
-
+    // Two variants used to live here and were removed rather than left
+    // lying about: `DifferentLogOrigins` ("receipts are from different
+    // logs") and `TreeSizeAnomaly` ("potential log tampering"). Both mapped
+    // to exit 1 -- *the evidence was refuted* -- and neither was constructed
+    // anywhere. ATL v2.0 defines no such refutations: §3.3.2 makes
+    // `genesis_super_root` the identifier of a log instance rather than a
+    // rule to break, §5.4.3 defines what to conclude when two identifiers
+    // agree and no error when they differ, and the only tree-size check in
+    // the spec is `checkpoint.tree_size == proof.tree_size` (§5.2), which is
+    // already `ReasonCode::CheckpointTreeSizeMismatch`. A ready-made
+    // refutation for a case the protocol does not call a fault is a loaded
+    // gun for whoever wires it up next.
     /// Cross-receipt consistency proof failed
     #[error("Log consistency failed: consistency proof verification failed")]
     #[allow(dead_code)]
@@ -213,6 +269,11 @@ pub enum CliError {
     #[allow(dead_code)]
     OtsVerificationFailed(String),
 
+    /// Failed to load `--tsa-trust-store` material (bad path or unparsable
+    /// certificate)
+    #[error("Failed to load TSA trust store: {0}")]
+    TrustStoreError(String),
+
     /// No trust anchor available (ATL Protocol v2.0)
     ///
     /// Per ATL Protocol v2.0, trust is established through external anchors
@@ -222,6 +283,23 @@ pub enum CliError {
     ///
     /// In offline mode, this is expected if anchors require online verification.
     /// Use online mode to verify anchors.
+    ///
+    /// # Do not wire this up as a refutation
+    ///
+    /// Nothing in this crate constructs it: the only route is the
+    /// `From<CoreVerificationError>` impl below, which no production path
+    /// uses ([`crate::verify::single::verify_single`] maps core errors
+    /// through `VerificationFailed` instead). That is the only reason its
+    /// `ExitCode::Invalid` mapping does no harm today.
+    ///
+    /// `atl-core` raises `NoTrustAnchor` when *zero anchors ended up valid*,
+    /// which is exactly the state
+    /// [`crate::verify::single::map_core_error`] deliberately refuses to
+    /// call a refutation: an RFC 3161 anchor whose cryptography is sound but
+    /// whose root nobody vouched for lands there, and that is `untrusted`
+    /// (exit 3), not `invalid` (exit 1). If this variant is ever put on a
+    /// live path, its exit code must be settled against
+    /// [`crate::verify::verdict`] first — not left at `Invalid`.
     #[error("No trust anchor available (no verified signature or valid external anchors)")]
     #[allow(dead_code)]
     NoTrustAnchor,
@@ -256,12 +334,17 @@ impl CliError {
             | Self::SuperConsistencyFailed { .. }
             | Self::VerificationFailed(_)
             | Self::BatchVerificationFailed { .. }
-            | Self::DifferentLogOrigins { .. }
-            | Self::TreeSizeAnomaly { .. }
             | Self::ConsistencyProofFailed { .. }
             | Self::TsaVerificationFailed(_)
             | Self::OtsVerificationFailed(_)
             | Self::NoTrustAnchor => ExitCode::Invalid,
+
+            // Nothing refuted, trust material missing -> UNTRUSTED (exit 3).
+            // Read straight off `Status` so the exit code for this state has
+            // exactly one definition.
+            Self::TrustNotEstablished { .. } => {
+                crate::verify::verdict::Status::Untrusted.exit_code()
+            }
 
             // Runtime errors -> ERROR (exit 2)
             Self::SourceNotFound(_)
@@ -276,8 +359,10 @@ impl CliError {
             | Self::NoFileForReceipt(_)
             | Self::EmptySourceDirectory(_)
             | Self::EmptyReceiptDirectory(_)
+            | Self::BatchItemsUnprocessable { .. }
             | Self::NoInternetConnection
             | Self::NetworkError(_)
+            | Self::TrustStoreError(_)
             | Self::Io(_)
             | Self::Json(_)
             | Self::HexDecode(_) => ExitCode::Error,
@@ -395,15 +480,6 @@ impl CliError {
         }
     }
 
-    /// Create a different log origins error
-    #[allow(dead_code)]
-    pub fn different_logs(genesis_a: &[u8; 32], genesis_b: &[u8; 32]) -> Self {
-        Self::DifferentLogOrigins {
-            genesis_a: format!("sha256:{}", hex::encode(genesis_a)),
-            genesis_b: format!("sha256:{}", hex::encode(genesis_b)),
-        }
-    }
-
     /// Create a batch verification failed error
     #[allow(dead_code)]
     pub fn batch_failed(valid: usize, invalid: usize, errors: usize) -> Self {
@@ -487,15 +563,6 @@ mod tests {
     fn test_no_internet_is_error() {
         let err = CliError::NoInternetConnection;
         assert_eq!(err.exit_code(), ExitCode::Error);
-    }
-
-    #[test]
-    fn test_different_logs_is_invalid() {
-        let err = CliError::DifferentLogOrigins {
-            genesis_a: "sha256:aaa".to_string(),
-            genesis_b: "sha256:bbb".to_string(),
-        };
-        assert_eq!(err.exit_code(), ExitCode::Invalid);
     }
 
     #[test]
@@ -665,14 +732,6 @@ mod tests {
         let expected = "sha256:abcd";
         let err = CliError::file_hash_mismatch(PathBuf::from("/test/file"), &computed, expected);
         assert!(matches!(err, CliError::FileHashMismatch { .. }));
-    }
-
-    #[test]
-    fn test_different_logs_helper() {
-        let genesis_a = [0xAAu8; 32];
-        let genesis_b = [0xBBu8; 32];
-        let err = CliError::different_logs(&genesis_a, &genesis_b);
-        assert!(matches!(err, CliError::DifferentLogOrigins { .. }));
     }
 
     #[test]
