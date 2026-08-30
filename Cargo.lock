@@ -130,6 +130,8 @@ dependencies = [
 [[package]]
 name = "atl-core"
 version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d334f7daf6e2dc7ec2af90a29014899651cba41365bf69d38955c36a4cee914"
 dependencies = [
  "base64",
  "bitcoin_hashes",
