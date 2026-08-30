@@ -14,9 +14,10 @@ use std::path::PathBuf;
 /// without any network access, and connectivity is never probed for it.
 ///
 /// When a receipt does carry a Bitcoin anchor, the CLI auto-detects
-/// connectivity: online, it fetches the block and confirms the OTS proof's
-/// merkle root; offline, that anchor is reported unconfirmed rather than
-/// accepted.
+/// connectivity: online, it asks block-explorer APIs for the block header and
+/// compares the OTS proof's merkle root against the one two or more of them
+/// agree on; offline, that anchor is reported unconfirmed rather than
+/// accepted. It does not observe the Bitcoin network -- see the README.
 ///
 /// Use --offline to skip online checks even when internet is available.
 /// Use --online to require connectivity for anchors that need it.
@@ -36,15 +37,15 @@ pub struct Args {
     ///
     /// When enabled, no output is printed to stdout/stderr.
     /// Use the exit code to determine verification result:
-    /// - 0: VALID (also PENDING, an unanchored Receipt-Lite)
+    /// - 0: VALID (accepted under the anchor policy in force)
     /// - 1: INVALID (the evidence was refuted)
     /// - 2: ERROR (an input could not be processed -- says nothing about
     ///   the evidence)
     /// - 3: UNTRUSTED (nothing refuted; the check could not be finished --
-    ///   either trust material is missing on this side, or the certificate
-    ///   path could not be evaluated at all. See reason_code and the
-    ///   anchor's error text before assuming a certificate is what is
-    ///   needed)
+    ///   trust material is missing on this side, the certificate path could
+    ///   not be evaluated at all, or the receipt carries no anchors. See
+    ///   reason_code and the anchor's error text before assuming a
+    ///   certificate is what is needed)
     #[arg(short, long, global = true)]
     pub quiet: bool,
 
@@ -88,8 +89,8 @@ pub enum Command {
     ///    computation and needs no network.
     ///
     /// **Additional step (online):**
-    /// 7. Verify Bitcoin OTS anchors by fetching the block whose Merkle
-    ///    root confirms the proof. The only step that needs the network.
+    /// 7. Check Bitcoin OTS anchors against the block header that two or
+    ///    more block-explorer APIs agree on. The only step needing network.
     ///
     /// **Batch mode also verifies:**
     /// - Log consistency (all receipts from same append-only log)
@@ -123,9 +124,9 @@ pub struct VerifyArgs {
     ///
     /// Even if internet is available, perform no network access. RFC 3161
     /// anchors are still verified in full -- that is pure computation. What
-    /// is skipped is fetching the Bitcoin block that confirms an OTS proof,
-    /// so a bitcoin_ots anchor can at best report "not confirmed" and the
-    /// receipt cannot reach "valid" through it.
+    /// is skipped is asking block-explorer APIs for the block header an OTS
+    /// proof is compared against, so a bitcoin_ots anchor can at best report
+    /// "not confirmed" and the receipt cannot reach "valid" through it.
     ///
     /// Useful for:
     /// - Faster verification
@@ -154,6 +155,39 @@ pub struct VerifyArgs {
     /// Useful for debugging verification failures.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Accept the receipt once ONE anchor has been verified
+    ///
+    /// Lowers the anchor quorum to the ATL v2.0 §5.5 floor: "At least one
+    /// anchor MUST be verified to establish trust in the receipt."
+    ///
+    /// The default is stricter, and deliberately so: EVERY anchor a receipt
+    /// presents must be verified. That is a rule about the anchors this
+    /// receipt offers, not about anchor types -- a Receipt-TSA satisfies it
+    /// with its single TSA anchor -- so it is NOT §5.6. §5.6 is reported
+    /// separately as the max_trust_profile field.
+    ///
+    /// A Receipt-Full whose Bitcoin anchor was never confirmed did not
+    /// deliver what it offered, and this tool says so rather than quietly
+    /// settling for less.
+    ///
+    /// What this flag does NOT do:
+    ///
+    /// - It never rescues a refuted anchor. One disproved fact makes the
+    ///   receipt "invalid" (exit 1) whatever the quorum is, and every trust
+    ///   axis reports false beside it.
+    /// - It never accepts a receipt with no anchors at all: a quorum of one
+    ///   cannot be met by none.
+    /// - It never hides an unverified anchor. Every anchor that reached no
+    ///   result is still listed, with its reason, and the run is reported as
+    ///   a success RELATIVE TO THIS POLICY -- never as an unqualified VALID.
+    ///
+    /// A "verified anchor" here means the cryptographic facts were checked
+    /// AND the certificate path reached a root you supplied via
+    /// --tsa-trust-store. A sound signature under an unknown root is not a
+    /// verified anchor and never counts towards the quorum.
+    #[arg(long)]
+    pub allow_single_anchor: bool,
 
     /// Trusted TSA root certificates, for RFC 3161 anchor verification
     ///
@@ -506,6 +540,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -517,6 +552,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -531,6 +567,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: true,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -542,6 +579,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -556,6 +594,7 @@ mod tests {
             offline: true,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -572,6 +611,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -588,6 +628,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -603,6 +644,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -623,6 +665,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -646,6 +689,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -672,6 +716,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -694,6 +739,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -716,6 +762,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -732,6 +779,7 @@ mod tests {
             offline: true,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -755,6 +803,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -773,6 +822,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -791,6 +841,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -809,6 +860,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -828,6 +880,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -846,6 +899,7 @@ mod tests {
             offline: false,
             online: true,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };
@@ -865,6 +919,7 @@ mod tests {
             offline: false,
             online: false,
             verbose: false,
+            allow_single_anchor: false,
             tsa_trust_store: None,
             tsa_intermediates: None,
         };

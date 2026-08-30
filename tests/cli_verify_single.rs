@@ -1,5 +1,10 @@
 #![allow(deprecated)]
 //! Single file verification tests
+//!
+//! The bundled `document.pdf` / `contract.pdf` receipts are Receipt-Lites.
+//! Since ATL v2.0 §5.5 became binding here -- no verified anchor means
+//! untrustworthy -- they exit 3, so these tests pin `.code(3)` where they
+//! used to pin `.success()`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -22,7 +27,7 @@ fn test_verify_valid_file() {
             .unwrap(),
     ])
     .assert()
-    .success()
+    .code(3)
     .stdout(predicate::str::contains("VALID").or(predicate::str::contains("Match: YES")));
 }
 
@@ -37,7 +42,7 @@ fn test_verify_contract_file() {
             .unwrap(),
     ])
     .assert()
-    .success();
+    .code(3);
 }
 
 #[test]
@@ -169,7 +174,7 @@ fn test_verify_offline_flag() {
         "--offline",
     ])
     .assert()
-    .success()
+    .code(3)
     .stdout(predicate::str::contains("OFFLINE").or(predicate::str::is_match("").unwrap()));
 }
 
@@ -230,5 +235,5 @@ fn test_verify_verbose_flag() {
         "--verbose",
     ])
     .assert()
-    .success();
+    .code(3);
 }

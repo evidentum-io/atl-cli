@@ -1,5 +1,10 @@
 #![allow(deprecated)]
 //! Batch verification tests
+//!
+//! The bundled `batch/consistent` fixture is three Receipt-Lites. Since ATL
+//! v2.0 §5.5 became binding here -- no verified anchor means untrustworthy --
+//! that fixture exits 3, so the rendering tests below pin `.code(3)` where
+//! they used to pin `.success()`.
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -13,15 +18,14 @@ fn test_data_path(name: &str) -> PathBuf {
 }
 
 /// The consistent fixture is three Receipt-Lites from one log: every proof
-/// checks out and every item is `pending`, because none carries an anchor.
+/// checks out, and not one of them carries an anchor.
 ///
-/// The name says "all valid" for historical reasons and the loose `VALID`
-/// predicate used to pass by accident, when `pending` items were folded into
-/// the valid count. They are not, so this asserts what the fixture actually
-/// is: exit 0 (the documented Receipt-Lite decision) with a `pending` status,
-/// never `valid`.
+/// ATL v2.0 §5.5 makes that `untrusted` and exit 3: zero verified anchors.
+/// The cross-receipt consistency check still holds for them -- §5.4.3 is
+/// about log history, not about anchors -- which is exactly why the two are
+/// reported on separate lines.
 #[test]
-fn test_batch_all_pending_consistent() {
+fn test_batch_all_unanchored_consistent() {
     let mut cmd = Command::cargo_bin("atl-cli").unwrap();
     let output = cmd
         .args([
@@ -33,25 +37,30 @@ fn test_batch_all_pending_consistent() {
             "--json",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
 
     let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
-    assert_eq!(json["status"], "pending");
+    assert_eq!(json["status"], "untrusted");
+    assert_eq!(json["reason_code"], "batch_items_unanchored");
     assert_ne!(
         json["status"], "valid",
-        "receipts with no anchors make no external-time claim"
+        "receipts with no anchors have no verified anchor"
     );
-    assert_eq!(json["summary"]["pending"], 3);
+    assert_eq!(json["summary"]["unanchored"], 3);
     assert_eq!(json["summary"]["valid"], 0);
     // Cross-receipt consistency still holds for them.
     assert_eq!(json["consistency"]["status"], "verified");
 }
 
+/// A directory holding receipts from two different log instances reports
+/// that fact and refutes nothing. See
+/// `receipts_from_two_log_instances_are_reported_not_refuted` in
+/// `cli_exit_codes.rs` for why exit 1 here was a false accusation.
 #[test]
-fn test_batch_inconsistent_logs() {
+fn test_batch_two_log_instances_are_reported_separately() {
     let mut cmd = Command::cargo_bin("atl-cli").unwrap();
     cmd.args([
         "verify",
@@ -61,14 +70,15 @@ fn test_batch_inconsistent_logs() {
         test_data_path("batch/inconsistent/receipts/")
             .to_str()
             .unwrap(),
+        "--no-color",
     ])
     .assert()
-    .code(1) // INVALID - consistency failed
-    .stdout(
-        predicate::str::contains("FAILED")
-            .or(predicate::str::contains("different"))
-            .or(predicate::str::contains("inconsistent")),
-    );
+    .code(3)
+    .stdout(predicate::str::contains("NOT CHECKED"))
+    .stdout(predicate::str::contains("2 log instance"))
+    // The old wording asserted a chain the code never proved.
+    .stdout(predicate::str::contains("unbroken append-only chain").not())
+    .stdout(predicate::str::contains("INVALID").not());
 }
 
 #[test]
@@ -128,7 +138,7 @@ fn test_batch_json_output() {
             "--json",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
@@ -164,7 +174,7 @@ fn test_batch_json_has_items() {
             "--json",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
@@ -189,7 +199,7 @@ fn test_batch_json_has_summary() {
             "--json",
         ])
         .assert()
-        .success()
+        .code(3)
         .get_output()
         .stdout
         .clone();
@@ -213,7 +223,7 @@ fn test_batch_quiet_mode() {
         "--quiet",
     ])
     .assert()
-    .success()
+    .code(3)
     .stdout(predicate::str::is_empty());
 }
 
@@ -229,7 +239,7 @@ fn test_batch_with_offline_flag() {
         "--offline",
     ])
     .assert()
-    .success();
+    .code(3);
 }
 
 #[test]
@@ -244,7 +254,7 @@ fn test_batch_verbose_mode() {
         "--verbose",
     ])
     .assert()
-    .success();
+    .code(3);
 }
 
 // ---------------------------------------------------------------------
@@ -477,8 +487,13 @@ fn summary_counts_match_the_item_rows() {
     let count_of = |status: &str| items.iter().filter(|i| i["status"] == status).count();
 
     assert_eq!(summary["valid"], count_of("valid"));
-    assert_eq!(summary["pending"], count_of("pending"));
-    assert_eq!(summary["untrusted"], count_of("untrusted"));
+    // `unanchored` and `untrusted` are two sub-buckets of one status word:
+    // ATL v2.0 §5.5 makes an unanchored receipt untrusted, and the split
+    // exists only so the report can say which kind it is.
+    assert_eq!(
+        summary["unanchored"].as_u64().unwrap() + summary["untrusted"].as_u64().unwrap(),
+        count_of("untrusted") as u64
+    );
     assert_eq!(summary["invalid"], count_of("invalid"));
     assert_eq!(
         summary["unmatched"],
@@ -492,7 +507,7 @@ fn summary_counts_match_the_item_rows() {
 
     // And the specific mixture this fixture builds: unanchored receipts get
     // their own bucket and are never counted as accepted.
-    assert_eq!(summary["pending"], 3);
+    assert_eq!(summary["unanchored"], 3);
     assert_eq!(summary["valid"], 0);
     assert_eq!(summary["unmatched"], 1);
     assert_eq!(json["reason_code"], "batch_items_unmatched");

@@ -12,12 +12,13 @@ use crate::cli::VerificationMode;
 use crate::error::CliResult;
 use crate::verify::anchor::{AnchorDetails, AnchorVerificationResult};
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
+use crate::verify::policy::{TrustAssessment, UnresolvedAnchor};
 use crate::verify::single::SingleVerificationResult;
 use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
 
 #[derive(Serialize)]
 struct SingleResultJson {
-    /// `"valid"` / `"untrusted"` / `"invalid"` / `"pending"`.
+    /// `"valid"` / `"untrusted"` / `"invalid"`.
     ///
     /// `"untrusted"` means nothing about the evidence was refuted and the
     /// check could not be finished — either this verifier was not given the
@@ -38,6 +39,11 @@ struct SingleResultJson {
     verification: Option<VerificationJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     anchor_verification: Option<AnchorVerificationJson>,
+    /// The three axes -- evidence (§5.5), policy (the selected quorum) and
+    /// coverage -- reported separately from `status`, which can only carry
+    /// one of them. Absent for a receipt with no anchors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assessment: Option<AssessmentJson>,
     errors: Vec<ErrorJson>,
 }
 
@@ -128,6 +134,7 @@ fn build_single_result_json(
             None
         },
         anchor_verification: build_anchor_verification(&result.anchor_results),
+        assessment: build_assessment(&result.assessment()),
         errors: build_errors(verdict, result),
     }
 }
@@ -139,7 +146,11 @@ fn build_errors(verdict: ReceiptVerdict, result: &SingleVerificationResult) -> V
     let Some(reason) = verdict.reason_code else {
         return Vec::new();
     };
-    if verdict.is_valid() || reason == ReasonCode::ReceiptUnanchored {
+    // Branched on the status, not on the reason: a run that exits 0 must not
+    // hand a machine consumer a populated `errors` array to act on, and
+    // `Valid` is the only status that exits 0. Same rule as
+    // `batch_item_json`.
+    if matches!(verdict.status, Status::Valid) {
         return Vec::new();
     }
 
@@ -187,8 +198,15 @@ fn describe(reason: ReasonCode) -> String {
         ReasonCode::TsaTimestampingEkuNotChecked => {
             "the signer's timestamping EKU was never examined; no signer was established"
         }
-        ReasonCode::BitcoinBlockNotChecked => "Bitcoin block was not fetched",
-        ReasonCode::BitcoinBlockUnavailable => "Bitcoin block lookup failed",
+        ReasonCode::BitcoinBlockNotChecked => "Bitcoin block header was not fetched",
+        ReasonCode::BitcoinBlockUnavailable => "no block-explorer API returned the block header",
+        ReasonCode::BitcoinProvidersDisagree => {
+            "block-explorer APIs contradicted each other about the block header; nothing about \
+             the receipt was refuted"
+        }
+        ReasonCode::BitcoinSingleSourceOnly => {
+            "only one block-explorer API answered, so the block header is uncorroborated"
+        }
         ReasonCode::BatchItemsInvalid => "One or more items failed verification",
         ReasonCode::BatchItemsUntrusted => {
             "One or more items could not be verified to completion; none was refuted"
@@ -197,8 +215,12 @@ fn describe(reason: ReasonCode) -> String {
             "One or more named files were never verified: no matching receipt or source file"
         }
         ReasonCode::BatchNothingVerified => "No file in this batch was verified",
-        ReasonCode::BatchItemsPending => {
-            "One or more receipts carry no anchors, so they make no external-time claim"
+        ReasonCode::BatchItemsUnanchored => {
+            "One or more receipts carry no anchors at all, so they have no verified anchor \
+             (ATL v2.0 5.5)"
+        }
+        ReasonCode::ReceiptUnanchored => {
+            "The receipt carries no anchors at all, so it has no verified anchor (ATL v2.0 5.5)"
         }
         ReasonCode::BatchItemsErrored => "One or more items could not be processed",
         ReasonCode::LogConsistencyFailed => "Cross-receipt log consistency verification failed",
@@ -223,6 +245,9 @@ struct BatchResultJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<&'static str>,
     mode: &'static str,
+    /// The anchor quorum every item was judged against: `"all-anchors"`
+    /// (default) or `"single-anchor"` (`--allow-single-anchor`).
+    policy_profile: &'static str,
     source_dir: String,
     receipt_dir: String,
     summary: SummaryJson,
@@ -237,12 +262,15 @@ struct SummaryJson {
     valid: usize,
     /// Items whose receipts carry no anchors at all (Receipt-Lite).
     ///
-    /// Counted separately from `valid`, never folded into it: `valid` means
-    /// every anchor reached a configured trust root, and these items have no
-    /// anchors to reach one. Folding them in made a batch of Receipt-Lites
-    /// report `"status": "valid"` while single-file mode called the very
-    /// same receipt `"pending"`.
-    pending: usize,
+    /// A sub-count of the untrusted outcome, not of the valid one: ATL v2.0
+    /// §5.5 says a receipt without any verified anchors should be treated as
+    /// untrustworthy, and such an item's own `status` is `"untrusted"` with
+    /// `reason_code` `"receipt_unanchored"`. It is counted apart only
+    /// because no trust material a caller could supply would change it.
+    ///
+    /// Renamed from `pending`, which named an exit-0 success this outcome is
+    /// not.
+    unanchored: usize,
     /// Items that were not refuted but could not be verified to completion
     /// — no configured trust root, or a check that could not be performed.
     untrusted: usize,
@@ -254,6 +282,16 @@ struct SummaryJson {
 #[derive(Serialize)]
 struct ConsistencyJson {
     status: &'static str,
+    /// How many distinct log instances the participants came from, counted
+    /// by the ATL v2.0 §3.3.2 identifier `genesis_super_root`.
+    ///
+    /// More than one is reported, never punished: §5.4.3 defines no error
+    /// for receipts whose identifiers differ, and calling that `failed` made
+    /// the batch exit 1 on evidence that is entirely sound. Each log
+    /// instance is checked separately; `status` covers all of them.
+    log_instances: usize,
+    /// The §3.3.2 identifier all participants share — absent when
+    /// `log_instances > 1`, because then there is no single one to name.
     genesis_super_root: Option<String>,
     receipt_count: usize,
     cross_checks_passed: usize,
@@ -266,7 +304,17 @@ struct CrossCheckJson {
     to_index: usize,
     from_file: String,
     to_file: String,
-    included: bool,
+    /// ATL v2.0 §5.4.3 holds for this pair: both receipts carry the same
+    /// `genesis_super_root` and valid `consistency_to_origin` proofs, so
+    /// "the log history between them was not modified".
+    ///
+    /// This field was `included`, which said one receipt's Super-Tree had
+    /// been shown to contain the other's. No receipt carries such a proof
+    /// and nothing checks it; §5.4.2 proves only that the genesis state is a
+    /// prefix of each receipt's own current state. A Split-View (fork) is
+    /// not ruled out here — per §7.3.2 that defence is a verified external
+    /// anchor.
+    same_log_instance: bool,
 }
 
 /// One row of a batch report.
@@ -282,6 +330,10 @@ struct BatchItemJson {
     file: String,
     receipt: Option<String>,
     status: &'static str,
+    /// The item's own three axes, so a row can be judged without re-running
+    /// the tool on it. Absent for a receipt with no anchors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    assessment: Option<AssessmentJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -311,17 +363,17 @@ fn batch_item_json(result: &SingleVerificationResult) -> BatchItemJson {
         file: file_name(&result.source_path),
         receipt: Some(file_name(&result.receipt_path)),
         status: verdict.status.as_str(),
+        assessment: build_assessment(&result.assessment()),
         reason_code: verdict.reason_code.map(ReasonCode::as_str),
         file_hash_match: Some(result.file_hash_valid),
         super_root,
         data_tree_index,
-        // `error` is for outcomes that failed. `Pending` is a successful
-        // outcome (exit 0) whose reason is already carried by `status` and
-        // `reason_code`; labelling it an error would tell a machine consumer
-        // that something went wrong on a run we ourselves call a success.
+        // `error` is for outcomes that did not reach acceptance. Only
+        // `valid` exits 0, and a run that exits 0 must never hand a machine
+        // consumer a populated error field to act on.
         error: verdict
             .reason_code
-            .filter(|_| !matches!(verdict.status, Status::Valid | Status::Pending))
+            .filter(|_| !matches!(verdict.status, Status::Valid))
             .map(describe),
     }
 }
@@ -353,24 +405,44 @@ pub fn print_batch_result(
         let cross_checks_passed = c
             .cross_results
             .iter()
-            .filter(|cr| cr.history_consistent)
+            .filter(|cr| cr.result.history_consistent)
             .count();
 
+        // Indices come from the check itself, not from this list's position:
+        // participants are grouped by log instance, so `idx` / `idx + 1`
+        // would name pairs that were never compared.
         let cross_checks: Vec<CrossCheckJson> = c
             .cross_results
             .iter()
-            .enumerate()
-            .map(|(idx, cr)| CrossCheckJson {
-                from_index: idx + 1,
-                to_index: idx + 2,
-                from_file: c.participants.get(idx).cloned().unwrap_or_default(),
-                to_file: c.participants.get(idx + 1).cloned().unwrap_or_default(),
-                included: cr.history_consistent,
+            .map(|cr| CrossCheckJson {
+                from_index: cr.from_index + 1,
+                to_index: cr.to_index + 1,
+                from_file: c
+                    .participants
+                    .get(cr.from_index)
+                    .cloned()
+                    .unwrap_or_default(),
+                to_file: c.participants.get(cr.to_index).cloned().unwrap_or_default(),
+                same_log_instance: cr.result.history_consistent,
             })
             .collect();
 
         ConsistencyJson {
-            status: if c.is_valid() { "verified" } else { "failed" },
+            // `not_checked` is not a third kind of failure: it is the
+            // honest word for a run where no two participants shared a log
+            // instance, so no pair satisfied ATL v2.0 §5.4.3 step 2 and no
+            // comparison existed to pass or fail. Calling it `verified`
+            // would report a check that never ran.
+            status: if c.checked() {
+                if c.is_valid() {
+                    "verified"
+                } else {
+                    "failed"
+                }
+            } else {
+                "not_checked"
+            },
+            log_instances: c.log_instance_count,
             genesis_super_root: c
                 .genesis_super_root
                 .map(|h| format!("sha256:{}", hex::encode(h))),
@@ -385,13 +457,14 @@ pub fn print_batch_result(
         .iter()
         .map(|item| match item {
             BatchItemResult::Valid(r)
-            | BatchItemResult::Pending(r)
+            | BatchItemResult::Unanchored(r)
             | BatchItemResult::Untrusted(r)
             | BatchItemResult::Invalid(r) => batch_item_json(r),
             BatchItemResult::Error { source, error, .. } => BatchItemJson {
                 file: file_name(source),
                 receipt: None,
                 status: "error",
+                assessment: None,
                 reason_code: Some(ReasonCode::BatchItemsErrored.as_str()),
                 file_hash_match: None,
                 super_root: None,
@@ -408,6 +481,7 @@ pub fn print_batch_result(
                 file: file_name(path),
                 receipt: None,
                 status: "no_receipt",
+                assessment: None,
                 reason_code: Some(ReasonCode::BatchItemsUnmatched.as_str()),
                 file_hash_match: None,
                 super_root: None,
@@ -418,6 +492,7 @@ pub fn print_batch_result(
                 file: file_name(path),
                 receipt: None,
                 status: "no_source",
+                assessment: None,
                 reason_code: Some(ReasonCode::BatchItemsUnmatched.as_str()),
                 file_hash_match: None,
                 super_root: None,
@@ -435,12 +510,13 @@ pub fn print_batch_result(
             VerificationMode::Online => "online",
             VerificationMode::Offline => "offline",
         },
+        policy_profile: result.policy.as_str(),
         source_dir: source_dir.display().to_string(),
         receipt_dir: receipt_dir.display().to_string(),
         summary: SummaryJson {
             total,
             valid: result.valid_count,
-            pending: result.pending_count,
+            unanchored: result.unanchored_count,
             untrusted: result.untrusted_count,
             invalid: result.invalid_count,
             errors: result.error_count,
@@ -449,10 +525,10 @@ pub fn print_batch_result(
         consistency,
         items,
         // Same rule as the per-item field: a run that exits 0 must not also
-        // hand back a non-empty `errors`. `Pending` reports itself through
-        // `status` and `reason_code`, which is where a consumer should look.
+        // hand back a non-empty `errors`. Only `valid` exits 0, so the test
+        // is now simply "was this accepted".
         errors: match verdict.reason_code {
-            Some(reason) if !matches!(verdict.status, Status::Valid | Status::Pending) => {
+            Some(reason) if !matches!(verdict.status, Status::Valid) => {
                 vec![ErrorJson {
                     error_type: reason.as_str().to_string(),
                     message: describe(reason),
@@ -471,9 +547,30 @@ pub fn print_batch_result(
 struct AnchorResultJson {
     #[serde(rename = "type")]
     anchor_type: String,
-    /// `true` only when the anchor is fully accepted. An anchor whose root
-    /// is merely `assumed` is `false` here, however sound its cryptography.
+    /// `true` only when the anchor is a **verified anchor** in the ATL v2.0
+    /// §5.5 sense: its cryptographic facts were checked AND its certificate
+    /// path reached a root the caller supplied. An anchor whose root is
+    /// merely `assumed` is `false` here, however sound its cryptography.
     verified: bool,
+    /// The anchor's state, uniform across anchor types:
+    ///
+    /// - `"verified"` — checked, and a caller-supplied trust root reached;
+    /// - `"cryptographically_consistent"` — every checkable fact holds, and
+    ///   the path terminates in a certificate no trust store names. NOT
+    ///   verified: a sound signature under an unknown root establishes only
+    ///   that some key signed it;
+    /// - `"incomplete"` — an issuer certificate is missing (supply it);
+    /// - `"not_checked"` — the selected mode does not perform this check
+    ///   (an offline run does not fetch the Bitcoin block);
+    /// - `"unavailable"` — the check was attempted and did not complete;
+    /// - `"unevaluable"` — the check cannot be performed by this build at
+    ///   all (an algorithm it does not implement);
+    /// - `"refuted"` — a checkable fact is false.
+    ///
+    /// Derived from the same verdict as `verified` and `reason_code`, so the
+    /// three can never disagree. Prefer this over the RFC 3161-only
+    /// `trust_state`, which is kept for compatibility.
+    state: &'static str,
     /// Stable machine-readable reason; absent when `verified` is `true`.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<&'static str>,
@@ -501,10 +598,59 @@ struct AnchorResultJson {
     claimed_timestamp_nanos: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claimed_timestamp: Option<String>,
+    /// The block's height, emitted **only** when `verified` is `true` — that
+    /// is, when two or more sources reported the same header at that height
+    /// and its Merkle root matched the one the OTS proof computes.
     #[serde(skip_serializing_if = "Option::is_none")]
     block_height: Option<u64>,
+    /// The block's time, emitted only when a corroborated header was
+    /// obtained and matched. Absent otherwise — never a zero rendered as
+    /// `"1970-01-01T00:00:00Z"`, which is a value a script would parse and
+    /// act on for a check that never ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     block_timestamp: Option<String>,
+    /// The block height the OTS proof's earliest attestation **claims**,
+    /// emitted only when `verified` is `false`.
+    ///
+    /// It is read out of the receipt and is attacker-controlled until a
+    /// block at that height has been fetched and matched, so it carries the
+    /// same `claimed_` marking as an unverified anchor's `genTime`: useful
+    /// for diagnostics and for saying what was asserted, never admissible as
+    /// where in the chain this receipt landed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_block_height: Option<u64>,
+    /// The block time that named sources **reported**, for an anchor that is
+    /// not verified — in practice, one refuted by
+    /// `bitcoin_merkle_root_mismatch`.
+    ///
+    /// `reported_`, not `claimed_`: nobody asserted it, this run asked and
+    /// was told. Not `observed_` either, which was the previous name and
+    /// went too far in the other direction — this tool queries HTTP APIs, it
+    /// does not observe the Bitcoin network, and `observed` invited exactly
+    /// the reading the `on-chain` prose beside it used to make explicit.
+    ///
+    /// What it is not is a fact about *this receipt*: the block's Merkle
+    /// root did not match the one the OTS proof computes, so the block
+    /// attests to nothing here. It is kept, and kept renamed, because it is
+    /// real diagnostic material that must not be readable as "this is when
+    /// your evidence existed". `block_sources` says who reported it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reported_block_timestamp: Option<String>,
+    /// Every block-explorer API that answered, and what each one reported.
+    ///
+    /// Always emitted when any source answered, whatever the outcome. This
+    /// tool reads block headers out of HTTP APIs; it validates no proof of
+    /// work and follows no chain of headers, so every Bitcoin value in this
+    /// object is *what these endpoints said*, and a consumer is entitled to
+    /// know which ones and how many.
+    ///
+    /// More than one entry with differing `merkle_root` values means the
+    /// sources contradicted each other: `reason_code` is then
+    /// `bitcoin_providers_disagree`, and no header was established, so
+    /// nothing was compared. That is a finding about the sources, never
+    /// about the receipt.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    block_sources: Vec<BlockSourceJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     // Bitcoin OTS verification chain (only for bitcoin_ots type)
@@ -512,10 +658,24 @@ struct AnchorResultJson {
     target_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     operation_count: Option<usize>,
+    /// The Merkle root computed from the OTS proof. Kept under its plain
+    /// name for a refuted anchor too: it is a deterministic local
+    /// computation over the receipt's own bytes, its name says exactly that,
+    /// and it is one half of the evidence for a mismatch.
     #[serde(skip_serializing_if = "Option::is_none")]
     computed_root: Option<String>,
+    /// The Merkle root that two or more configured sources report for that
+    /// block. Kept under its plain name for the same reason as
+    /// `computed_root`, and one more: it describes the *block*, never the
+    /// receipt; it is emitted only when a corroborated header was obtained;
+    /// and it never appears without `merkle_match` and `block_sources`
+    /// beside it. It is the other half of the mismatch evidence, and
+    /// renaming it would hide the one field a reader needs in order to see
+    /// the refutation.
     #[serde(skip_serializing_if = "Option::is_none")]
     block_merkle_root: Option<String>,
+    /// Whether the two roots above agree. Kept plain: `false` **is** the
+    /// refutation, and it is the most honest field in the object.
     #[serde(skip_serializing_if = "Option::is_none")]
     merkle_match: Option<bool>,
     // RFC 3161 facts (only for rfc3161 type) -- see `Rfc3161AnchorFacts` in
@@ -561,6 +721,20 @@ struct AnchorResultJson {
     terminal_anchor: Option<TerminalAnchorJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     revocation: Option<&'static str>,
+}
+
+/// One block-explorer API's report of a block header.
+#[derive(Serialize)]
+struct BlockSourceJson {
+    /// The endpoint's name, e.g. `"blockstream.info"`.
+    source: String,
+    block_hash: String,
+    merkle_root: String,
+    /// Absent if the reported time did not survive plausibility validation —
+    /// which cannot happen for a value that reached this far, since such a
+    /// response is discarded at intake.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    block_timestamp: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -688,14 +862,41 @@ fn format_timestamp_secs_iso(secs: u64) -> Option<String> {
 
 /// Render one anchor's fact set.
 fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
+    // Both of the anchor's numbers follow the same rule as the RFC 3161
+    // `genTime` above: a plain name is reserved for a fact this run
+    // established ABOUT THIS RECEIPT, and anything short of that is renamed
+    // so it cannot be lifted out and acted on.
+    //
+    // They are renamed differently, because they are different kinds of
+    // not-established:
+    //
+    // - the height is the *receipt's own assertion* about where in the chain
+    //   this anchor lands, read straight out of the OTS proof, so it becomes
+    //   `claimed_block_height`;
+    // - the time is *our observation* of a block we really did fetch, so it
+    //   becomes `reported_block_timestamp`. Calling it "claimed" would be a
+    //   second falsehood -- nobody claimed it, we asked and were told -- and
+    //   calling it "observed" overstates it in the other direction, since
+    //   this tool queries HTTP APIs rather than watching the chain.
+    //
+    // The time used to be serialized unconditionally, and the online path
+    // fetches the block *before* deciding whether its Merkle root matches.
+    // So a refuted anchor -- `bitcoin_merkle_root_mismatch`, the block
+    // proving nothing whatever about this receipt -- still published
+    // `block_timestamp` under the plain name, beside `merkle_match: false`.
+    // "Named sources reported this block" and "this block dates your
+    // evidence" are the distinction this whole tool exists to keep.
     let (
         block_height,
         block_timestamp,
+        claimed_block_height,
+        reported_block_timestamp,
         target_hash,
         operation_count,
         computed_root,
         block_merkle_root,
         merkle_match,
+        block_sources,
     ) = match &anchor.details {
         AnchorDetails::Bitcoin {
             block_height,
@@ -705,16 +906,43 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
             computed_root,
             block_merkle_root,
             merkle_match,
-        } => (
-            Some(*block_height),
-            format_timestamp_secs_iso(*block_timestamp_secs),
-            Some(target_hash.clone()),
-            Some(*operation_count),
-            Some(computed_root.clone()),
-            block_merkle_root.clone(),
-            *merkle_match,
+            block_sources,
+        } => {
+            let established = anchor.verified();
+            let block_time = block_timestamp_secs.and_then(format_timestamp_secs_iso);
+            (
+                established.then_some(*block_height),
+                established.then(|| block_time.clone()).flatten(),
+                (!established).then_some(*block_height),
+                (!established).then_some(block_time).flatten(),
+                Some(target_hash.clone()),
+                Some(*operation_count),
+                Some(computed_root.clone()),
+                block_merkle_root.clone(),
+                *merkle_match,
+                block_sources
+                    .iter()
+                    .map(|r| BlockSourceJson {
+                        source: r.source.clone(),
+                        block_hash: r.block_hash.clone(),
+                        merkle_root: r.merkle_root.clone(),
+                        block_timestamp: format_timestamp_secs_iso(r.block_timestamp_secs),
+                    })
+                    .collect(),
+            )
+        }
+        _ => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
         ),
-        _ => (None, None, None, None, None, None, None),
     };
 
     let (
@@ -759,6 +987,7 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
     AnchorResultJson {
         anchor_type: anchor.anchor_type.clone(),
         verified: anchor.verified(),
+        state: anchor.state().as_str(),
         reason_code: anchor.verdict.reason_code().map(ReasonCode::as_str),
         // Established vs. claimed: the same value, but only one of the two
         // names is ever emitted, decided by the verdict.
@@ -768,6 +997,9 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
         claimed_timestamp: claimed_time.and_then(format_timestamp_iso),
         block_height,
         block_timestamp,
+        claimed_block_height,
+        reported_block_timestamp,
+        block_sources,
         error: anchor.error.clone(),
         target_hash,
         operation_count,
@@ -798,10 +1030,139 @@ fn build_anchor_verification(
     })
 }
 
+/// The three axes, as JSON.
+///
+/// `None` for a receipt with no anchors: there is no quorum to report on,
+/// and the `receipt_unanchored` reason code already says everything there is
+/// to say.
+fn build_assessment(assessment: &TrustAssessment) -> Option<AssessmentJson> {
+    if assessment.total_anchors == 0 {
+        return None;
+    }
+    Some(AssessmentJson {
+        evidence: EvidenceJson {
+            established: assessment.evidence_established(),
+            verified_anchors: assessment.verified_anchors,
+            refuted_anchors: assessment.refuted_anchors(),
+            total_anchors: assessment.total_anchors,
+            refuted_by: assessment.refuted_by().map(ReasonCode::as_str),
+        },
+        policy: PolicyJson {
+            profile: assessment.policy.as_str(),
+            requirement: assessment.policy.requirement(),
+            satisfied: assessment.policy_satisfied(),
+            max_trust_profile: assessment.max_trust_profile(),
+        },
+        coverage: CoverageJson {
+            complete: assessment.coverage_complete(),
+            accepted_with_gaps: assessment.accepted_with_gaps(),
+            unresolved: anchor_list(&assessment.unresolved),
+            refuted: anchor_list(&assessment.refuted),
+        },
+    })
+}
+
+/// The three axes a receipt's anchors are reported on, published separately
+/// because they answer different questions.
+#[derive(Serialize)]
+struct AssessmentJson {
+    evidence: EvidenceJson,
+    policy: PolicyJson,
+    coverage: CoverageJson,
+}
+
+/// ATL v2.0 §5.5: is trust established at all?
+#[derive(Serialize)]
+struct EvidenceJson {
+    /// At least one anchor is a verified anchor.
+    established: bool,
+    /// How many anchors are verified — cryptographic facts checked AND a
+    /// caller-supplied trust root reached. Nothing weaker is counted.
+    verified_anchors: usize,
+    /// How many **anchors** were checked and found false.
+    ///
+    /// Counts anchors only. A receipt can be refuted with this at `0` — by a
+    /// source file whose hash does not match, or a broken inclusion proof —
+    /// and `refuted_by` is what names that case.
+    refuted_anchors: usize,
+    total_anchors: usize,
+    /// The reason code that disqualifies this receipt, from whatever source:
+    /// a refuted anchor, or the receipt itself. Absent when nothing was
+    /// refuted, and always equal to the top-level `reason_code` when
+    /// present.
+    ///
+    /// This is what makes `established: false` beside `verified_anchors: 1`
+    /// legible rather than contradictory: an anchor really did reach a
+    /// trusted root, and a refutation outranks it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refuted_by: Option<&'static str>,
+}
+
+/// Is the anchor quorum the caller selected met?
+#[derive(Serialize)]
+struct PolicyJson {
+    /// `"all-anchors"` (default) or `"single-anchor"`
+    /// (`--allow-single-anchor`).
+    profile: &'static str,
+    /// The requirement in prose, with its spec citation.
+    requirement: &'static str,
+    satisfied: bool,
+    /// ATL v2.0 §5.6: both an RFC 3161 and a Bitcoin OTS anchor are
+    /// verified **and nothing was refuted**. Reported on every run whatever
+    /// the profile, because §5.6 describes the maximum-trust tier rather
+    /// than this tool's acceptance threshold.
+    ///
+    /// The refutation clause is not pedantry. Without it a receipt with two
+    /// verified anchors and a third refuted one reported `status: "invalid"`
+    /// and `max_trust_profile: true` side by side.
+    max_trust_profile: bool,
+}
+
+/// Render one of the coverage lists.
+fn anchor_list(anchors: &[UnresolvedAnchor]) -> Vec<UnresolvedAnchorJson> {
+    anchors
+        .iter()
+        .map(|a| UnresolvedAnchorJson {
+            anchor_type: a.anchor_type.clone(),
+            state: a.state.as_str(),
+            reason_code: a.reason.as_str(),
+        })
+        .collect()
+}
+
+/// Was every anchor the receipt presents carried to a sound result?
+#[derive(Serialize)]
+struct CoverageJson {
+    /// `true` only when `unresolved` and `refuted` are both empty.
+    complete: bool,
+    /// The run was accepted **because** the quorum was lowered: the policy
+    /// is satisfied while coverage is not. Only `--allow-single-anchor` can
+    /// produce this, and every renderer must qualify its success line when
+    /// it holds.
+    accepted_with_gaps: bool,
+    /// Anchors that reached no result at all. Each may be fixable by
+    /// supplying trust material, going online, or not at all — read `state`.
+    unresolved: Vec<UnresolvedAnchorJson>,
+    /// Anchors that were checked and found false. Never empty beside
+    /// `status: "invalid"` caused by an anchor, and never non-empty beside
+    /// `status: "valid"`.
+    refuted: Vec<UnresolvedAnchorJson>,
+}
+
+#[derive(Serialize)]
+struct UnresolvedAnchorJson {
+    #[serde(rename = "type")]
+    anchor_type: String,
+    /// The same vocabulary as an anchor result's `state`.
+    state: &'static str,
+    reason_code: &'static str,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verify::anchor::AnchorVerdict;
+    use crate::verify::anchor::{AnchorVerdict, BlockSourceReport};
+    use crate::verify::policy::AnchorPolicy;
     use atl_core::{PathStatus, Revocation, TerminalAnchor};
     use std::path::{Path, PathBuf};
 
@@ -838,6 +1199,7 @@ mod tests {
             receipt: create_test_receipt(),
             core_result: create_test_verification_result(core_valid),
             anchor_results: vec![],
+            policy: AnchorPolicy::AllAnchors,
         }
     }
 
@@ -874,15 +1236,28 @@ mod tests {
         }
     }
 
+    /// ATL v2.0 §5.5: a receipt with no anchors has no verified anchor, so
+    /// it is `untrusted` and never exit 0. `anchor_status` keeps the plain
+    /// description of the state -- "unanchored" -- which is where a machine
+    /// consumer should read the Receipt-Lite tier from.
     #[test]
-    fn unanchored_receipt_reports_pending() {
+    fn unanchored_receipt_reports_untrusted() {
         let result = single_result(true, true);
         let json = build_single_result_json(&result, VerificationMode::Offline);
-        assert_eq!(json.status, "pending");
+        assert_eq!(json.status, "untrusted");
         assert_eq!(json.reason_code, Some("receipt_unanchored"));
         assert_eq!(json.anchor_status, "unanchored");
-        assert!(json.errors.is_empty(), "pending is not an error state");
+        assert_eq!(
+            json.errors.len(),
+            1,
+            "an outcome that exits non-zero must say why in `errors`"
+        );
+        assert_eq!(json.errors[0].error_type, "receipt_unanchored");
         assert!(json.anchor_verification.is_none());
+        assert!(
+            json.assessment.is_none(),
+            "there is no quorum to report on when no anchor was presented"
+        );
     }
 
     #[test]
@@ -1012,11 +1387,12 @@ mod tests {
     fn batch_summary_counts_untrusted_separately() {
         let result = BatchVerificationResult {
             valid_count: 1,
-            pending_count: 0,
+            unanchored_count: 0,
             untrusted_count: 2,
             invalid_count: 0,
             error_count: 0,
             unmatched_count: 0,
+            policy: AnchorPolicy::AllAnchors,
             consistency: None,
             items: vec![],
         };
@@ -1034,11 +1410,12 @@ mod tests {
     fn batch_with_failures_is_invalid() {
         let result = BatchVerificationResult {
             valid_count: 1,
-            pending_count: 0,
+            unanchored_count: 0,
             untrusted_count: 1,
             invalid_count: 1,
             error_count: 0,
             unmatched_count: 0,
+            policy: AnchorPolicy::AllAnchors,
             consistency: None,
             items: vec![],
         };
@@ -1053,11 +1430,12 @@ mod tests {
     fn batch_items_render_every_bucket() {
         let result = BatchVerificationResult {
             valid_count: 1,
-            pending_count: 0,
+            unanchored_count: 0,
             untrusted_count: 1,
             invalid_count: 1,
             error_count: 1,
             unmatched_count: 2,
+            policy: AnchorPolicy::AllAnchors,
             consistency: None,
             items: vec![
                 BatchItemResult::Valid(single_result(true, true)),
@@ -1091,6 +1469,263 @@ mod tests {
         assert_eq!(item.file_hash_match, Some(false));
     }
 
+    /// Build the exact fact set the **online** path produces when a block
+    /// was corroborated and its Merkle root did not match: a genuinely
+    /// reported block time and root sitting on a refuted anchor.
+    ///
+    /// This composition needs the network to arise for real, so it is
+    /// constructed here instead. It is not a hypothetical shape: it is
+    /// literally what `crate::verify::online` writes on the
+    /// `merkle_match == false` branch, which builds `details` *before* it
+    /// decides the verdict.
+    fn refuted_bitcoin_anchor() -> AnchorVerificationResult {
+        AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verdict: AnchorVerdict::Invalid(ReasonCode::BitcoinMerkleRootMismatch),
+            timestamp_nanos: None,
+            error: Some("Merkle root mismatch: OTS proof does not match block 932897".to_string()),
+            details: AnchorDetails::Bitcoin {
+                block_height: 932_897,
+                block_timestamp_secs: Some(1_768_806_080),
+                target_hash: "sha256:abc123".to_string(),
+                operation_count: 39,
+                computed_root: "sha256:def456".to_string(),
+                block_merkle_root: Some("sha256:999999".to_string()),
+                merkle_match: Some(false),
+                // Non-empty on purpose: a refutation is only reachable from
+                // a corroborated header, so this fact set never arises with
+                // fewer than two sources.
+                block_sources: vec![
+                    source_report("blockstream.info", "999999", 1_768_806_080),
+                    source_report("mempool.space", "999999", 1_768_806_080),
+                ],
+            },
+        }
+    }
+
+    fn source_report(source: &str, root: &str, secs: u64) -> BlockSourceReport {
+        BlockSourceReport {
+            source: source.to_string(),
+            block_hash: "a".repeat(64),
+            merkle_root: root.to_string(),
+            block_timestamp_secs: secs,
+        }
+    }
+
+    /// A Bitcoin anchor whose sources contradicted each other, exactly as
+    /// `verify::online::anchor_from_lookup` builds it: no header was
+    /// established, so none is published, and every conflicting report
+    /// survives.
+    fn contested_bitcoin_anchor(reports: Vec<BlockSourceReport>) -> AnchorVerificationResult {
+        AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinProvidersDisagree),
+            timestamp_nanos: None,
+            error: Some("block-explorer APIs disagree about block 932897".to_string()),
+            details: AnchorDetails::Bitcoin {
+                block_height: 932_897,
+                block_timestamp_secs: None,
+                target_hash: "sha256:abc123".to_string(),
+                operation_count: 39,
+                computed_root: "sha256:def456".to_string(),
+                block_merkle_root: None,
+                merkle_match: None,
+                block_sources: reports,
+            },
+        }
+    }
+
+    /// **A source conflict publishes the conflict and nothing else.**
+    ///
+    /// The JSON renderer had no test for either new state, so the claim that
+    /// they were covered "in both renderers" was true only of the
+    /// human-readable one.
+    #[test]
+    fn a_contested_bitcoin_anchor_publishes_the_conflict_and_no_header() {
+        let json = serde_json::to_value(anchor_result_json(&contested_bitcoin_anchor(vec![
+            source_report("blockstream.info", &"b".repeat(64), 1_768_806_080),
+            source_report("mempool.space", &"c".repeat(64), 1_768_806_080),
+        ])))
+        .unwrap();
+
+        assert_eq!(json["verified"], false);
+        assert_eq!(json["state"], "contested");
+        assert_eq!(json["reason_code"], "bitcoin_providers_disagree");
+
+        // No header was established, so none is published -- not even the
+        // one that happens to be reported by the first source.
+        for absent in [
+            "block_height",
+            "block_timestamp",
+            "reported_block_timestamp",
+            "block_merkle_root",
+            "merkle_match",
+            "timestamp",
+            "timestamp_nanos",
+        ] {
+            assert!(
+                json.get(absent).is_none(),
+                "`{absent}` must not be published when the sources conflict: {json}"
+            );
+        }
+
+        // But every conflicting report survives: the conflict is the finding,
+        // and this array is the only place a machine consumer can see it.
+        let sources = json["block_sources"].as_array().expect("block_sources");
+        assert_eq!(sources.len(), 2, "{json}");
+        assert_eq!(sources[0]["source"], "blockstream.info");
+        assert_eq!(sources[0]["merkle_root"], "b".repeat(64));
+        assert_eq!(sources[1]["source"], "mempool.space");
+        assert_eq!(sources[1]["merkle_root"], "c".repeat(64));
+        assert_eq!(json["claimed_block_height"], 932_897);
+    }
+
+    /// A conflict about nothing but the *time* must reach the JSON too. The
+    /// roots and hashes match here, so a renderer comparing only those would
+    /// show two identical-looking rows.
+    #[test]
+    fn a_time_only_conflict_is_visible_in_the_json() {
+        let json = serde_json::to_value(anchor_result_json(&contested_bitcoin_anchor(vec![
+            source_report("blockstream.info", &"b".repeat(64), 1_768_806_080),
+            source_report("mempool.space", &"b".repeat(64), 1_768_806_081),
+        ])))
+        .unwrap();
+
+        let sources = json["block_sources"].as_array().expect("block_sources");
+        assert_eq!(sources[0]["block_timestamp"], "2026-01-19T07:01:20Z");
+        assert_eq!(
+            sources[1]["block_timestamp"], "2026-01-19T07:01:21Z",
+            "the differing times must both be published, or the conflict is \
+             invisible to a machine consumer: {json}"
+        );
+        assert_eq!(json["state"], "contested");
+    }
+
+    /// **One source settles nothing**, and the JSON says so: the state names
+    /// it, the single report is attributed, and no header is published.
+    #[test]
+    fn an_uncorroborated_bitcoin_anchor_publishes_no_header() {
+        let anchor = AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinSingleSourceOnly),
+            timestamp_nanos: None,
+            error: Some("only blockstream.info reported block 932897".to_string()),
+            details: AnchorDetails::Bitcoin {
+                block_height: 932_897,
+                block_timestamp_secs: None,
+                target_hash: "sha256:abc123".to_string(),
+                operation_count: 39,
+                computed_root: "sha256:def456".to_string(),
+                block_merkle_root: None,
+                merkle_match: None,
+                block_sources: vec![source_report(
+                    "blockstream.info",
+                    &"b".repeat(64),
+                    1_768_806_080,
+                )],
+            },
+        };
+        let json = serde_json::to_value(anchor_result_json(&anchor)).unwrap();
+
+        assert_eq!(json["verified"], false);
+        assert_eq!(json["state"], "uncorroborated");
+        assert_eq!(json["reason_code"], "bitcoin_single_source_only");
+        for absent in [
+            "block_height",
+            "block_timestamp",
+            "reported_block_timestamp",
+            "block_merkle_root",
+            "merkle_match",
+            "timestamp",
+        ] {
+            assert!(json.get(absent).is_none(), "`{absent}`: {json}");
+        }
+        assert_eq!(json["block_sources"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["block_sources"][0]["source"], "blockstream.info");
+        assert_eq!(json["claimed_block_height"], 932_897);
+    }
+
+    /// An anchor with no sources at all emits no `block_sources` key, rather
+    /// than an empty array a consumer might read as "asked, nobody said
+    /// anything about the header".
+    #[test]
+    fn no_sources_means_no_block_sources_key() {
+        let anchor = AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinBlockUnavailable),
+            timestamp_nanos: None,
+            error: Some("no block-explorer API returned block 932897".to_string()),
+            details: AnchorDetails::Bitcoin {
+                block_height: 932_897,
+                block_timestamp_secs: None,
+                target_hash: "sha256:abc123".to_string(),
+                operation_count: 39,
+                computed_root: "sha256:def456".to_string(),
+                block_merkle_root: None,
+                merkle_match: None,
+                block_sources: Vec::new(),
+            },
+        };
+        let json = serde_json::to_value(anchor_result_json(&anchor)).unwrap();
+        assert_eq!(json["state"], "unavailable");
+        assert!(json.get("block_sources").is_none(), "{json}");
+    }
+
+    /// **A refuted Bitcoin anchor publishes no established fact.**
+    ///
+    /// The block was really fetched, so its time is real — and it says
+    /// nothing whatever about this receipt, because the Merkle root did not
+    /// match. `block_timestamp` used to be serialized unconditionally, so
+    /// this value went out under the plain name beside `merkle_match:
+    /// false`: a date offered for evidence the same object refutes.
+    #[test]
+    fn a_refuted_bitcoin_anchor_publishes_no_established_time() {
+        let json = serde_json::to_value(anchor_result_json(&refuted_bitcoin_anchor())).unwrap();
+
+        assert_eq!(json["verified"], false);
+        assert_eq!(json["state"], "refuted");
+        assert_eq!(json["reason_code"], "bitcoin_merkle_root_mismatch");
+
+        for established in [
+            "block_height",
+            "block_timestamp",
+            "timestamp",
+            "timestamp_nanos",
+        ] {
+            assert!(
+                json.get(established).is_none(),
+                "`{established}` must not be published for a refuted anchor: {json}"
+            );
+        }
+
+        // The observation itself is kept, under a name that says what it is.
+        // Not `claimed_`: nobody asserted it, this run read it off the chain.
+        assert_eq!(json["reported_block_timestamp"], "2026-01-19T07:01:20Z");
+        assert_eq!(json["claimed_block_height"], 932_897);
+
+        // The three fields that keep their plain names, because each is
+        // either a local computation or the evidence OF the refutation, and
+        // none of them is presented as a fact about the receipt.
+        assert_eq!(json["merkle_match"], false);
+        assert_eq!(json["computed_root"], "sha256:def456");
+        assert_eq!(json["block_merkle_root"], "sha256:999999");
+    }
+
+    /// The same anchor, verified: every value returns to its plain name. The
+    /// split must not have made the honest case unreportable.
+    #[test]
+    fn a_verified_bitcoin_anchor_keeps_the_plain_names() {
+        let mut anchor = refuted_bitcoin_anchor();
+        anchor.verdict = AnchorVerdict::Valid;
+        anchor.timestamp_nanos = Some(1_768_806_080_000_000_000);
+        let json = serde_json::to_value(anchor_result_json(&anchor)).unwrap();
+
+        assert_eq!(json["block_height"], 932_897);
+        assert_eq!(json["block_timestamp"], "2026-01-19T07:01:20Z");
+        assert!(json.get("claimed_block_height").is_none(), "{json}");
+        assert!(json.get("reported_block_timestamp").is_none(), "{json}");
+    }
+
     #[test]
     fn bitcoin_anchor_reports_its_chain() {
         let anchor = AnchorVerificationResult {
@@ -1100,12 +1735,13 @@ mod tests {
             error: None,
             details: AnchorDetails::Bitcoin {
                 block_height: 932_897,
-                block_timestamp_secs: 1_768_806_080,
+                block_timestamp_secs: Some(1_768_806_080),
                 target_hash: "sha256:abc123".to_string(),
                 operation_count: 39,
                 computed_root: "sha256:def456".to_string(),
                 block_merkle_root: Some("sha256:def456".to_string()),
                 merkle_match: Some(true),
+                block_sources: Vec::new(),
             },
         };
         let json = serde_json::to_value(anchor_result_json(&anchor)).unwrap();

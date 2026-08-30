@@ -23,7 +23,8 @@
 //!     --tsa-trust-store roots.pem --tsa-intermediates bridge.pem
 //! ```
 //!
-//! Exit codes: 0 valid (or pending), 1 refuted, 2 runtime error, 3 untrusted
+//! Exit codes: 0 valid, 1 refuted, 2 runtime error, 3 untrusted (which
+//! includes an unanchored receipt -- ATL v2.0 §5.5)
 //! -- see [`error::ExitCode`].
 
 mod cli;

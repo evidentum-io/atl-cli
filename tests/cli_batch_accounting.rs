@@ -48,48 +48,59 @@ fn run(dir: &TempDir) -> (i32, serde_json::Value) {
     (code, json)
 }
 
+/// ATL v2.0 §5.5: a batch of Receipt-Lites has no verified anchor anywhere,
+/// so it is untrusted (exit 3), not a success. What it is NOT is an
+/// operational failure: nothing failed to be processed, and `summary.errors`
+/// stays zero.
 #[test]
-fn a_successful_pending_batch_reports_no_errors() {
+fn an_unanchored_batch_is_untrusted_but_not_an_operational_failure() {
     let dir = lite_batch();
     let (code, json) = run(&dir);
 
-    // A run that exits 0 must not simultaneously hand a machine consumer a
-    // populated `errors` array -- that contract cannot be acted on.
-    assert_eq!(code, 0, "an unanchored batch is a documented success");
-    assert_eq!(json["status"], "pending");
+    assert_eq!(code, 3, "no verified anchor anywhere: {json}");
+    assert_eq!(json["status"], "untrusted");
+    assert_eq!(json["reason_code"], "batch_items_unanchored");
     assert_eq!(
-        json["errors"].as_array().map(Vec::len),
-        Some(0),
-        "exit 0 must not carry errors: {}",
-        json["errors"]
+        json["summary"]["errors"], 0,
+        "an unanchored receipt was processed fine; it simply has no anchor"
     );
-    assert_eq!(json["summary"]["errors"], 0);
+    assert_eq!(json["summary"]["unanchored"], 1, "{json}");
+    assert_eq!(json["summary"]["valid"], 0);
     for item in json["items"].as_array().unwrap() {
-        assert!(
-            item["error"].is_null(),
-            "a pending item is not an errored item: {item}"
-        );
-        assert_eq!(item["status"], "pending");
+        assert_eq!(item["status"], "untrusted", "{item}");
+        assert_eq!(item["reason_code"], "receipt_unanchored", "{item}");
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn an_unreadable_entry_is_never_silently_dropped() {
     let dir = lite_batch();
     // A dangling symlink is an entry the caller placed in the directory and
     // that we cannot check. Skipping it would remove it from `total`, so a
     // batch could report success having never looked at it.
-    #[cfg(unix)]
     std::os::unix::fs::symlink("/nonexistent/target", dir.path().join("s").join("ghost")).unwrap();
 
-    #[cfg(unix)]
-    {
-        let (code, _json) = run(&dir);
-        assert_eq!(
-            code, 2,
-            "an entry we cannot resolve must fail loudly, not vanish"
-        );
-    }
+    let (code, json) = run(&dir);
+    assert_eq!(
+        code, 2,
+        "an entry we cannot resolve must fail loudly, not vanish"
+    );
+    // Loudly, but not fatally: aborting the walk threw away every other
+    // file in the directory, so an entry we could not stat suppressed
+    // findings about the ones we could. It gets a row of its own, and its
+    // readable neighbour is still verified.
+    assert_eq!(json["summary"]["errors"], 1, "{json}");
+    assert_eq!(json["summary"]["unanchored"], 1, "{json}");
+    assert_eq!(json["summary"]["total"], 2, "{json}");
+    let ghost = json["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["file"] == "ghost")
+        .expect("the entry we could not read must appear in the report");
+    assert_eq!(ghost["status"], "error");
+    assert!(ghost["error"].is_string(), "{ghost}");
 }
 
 // Linux only, and not out of laziness: APFS enforces valid UTF-8 in

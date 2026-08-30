@@ -11,9 +11,12 @@
 use colored::Colorize;
 
 use crate::error::CliResult;
-use crate::verify::anchor::{AnchorDetails, AnchorVerdict, AnchorVerificationResult};
+use crate::verify::anchor::{
+    sources_agree, AnchorDetails, AnchorVerdict, AnchorVerificationResult, BlockSourceReport,
+};
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
-use crate::verify::consistency::ConsistencyResult;
+use crate::verify::consistency::{ConsistencyResult, CrossCheck};
+use crate::verify::policy::TrustAssessment;
 use crate::verify::single::SingleVerificationResult;
 use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
 
@@ -24,8 +27,6 @@ struct ReceiptProofInfo {
     filename: String,
     /// Super root hash string at registration time (e.g., "sha256:abc...")
     super_root: String,
-    /// Data tree index (for ordering receipts in display)
-    data_tree_index: u64,
 }
 
 /// Print single file result
@@ -39,8 +40,9 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     println!("Receipt: {}", result.receipt_path.display());
 
     let verdict = result.verdict();
+    let assessment = result.assessment();
     print!("Status: ");
-    print_receipt_status(verdict, use_color);
+    print_receipt_status(verdict, Some(&assessment), use_color);
 
     // File hash comparison
     println!("File Hash:");
@@ -78,33 +80,138 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     }
 
     // Anchor status for lite receipts
-    if verdict.status == Status::Pending {
+    if verdict.reason_code == Some(ReasonCode::ReceiptUnanchored) {
         print!("  Anchor Status: ");
         print_status_pending("UNANCHORED", use_color);
         println!();
+        // The spec's own words for this tier (ATL v2.0 §5.5, §5.6): a
+        // Receipt-Lite "proves only internal consistency, not temporal
+        // existence", and "a receipt without any verified anchors SHOULD be
+        // treated as untrustworthy". This is why the outcome is `untrusted`
+        // and exit 3: nothing here is refuted, and nothing external attests
+        // to anything either.
         println!(
-            "Note: This receipt is cryptographically valid but lacks external timestamp anchors."
+            "Note: Receipt-Lite. It proves internal consistency only, not temporal existence:"
         );
+        println!("      it carries no anchor, so nothing external attests to when this existed.");
+        println!("      ATL v2.0 §5.5 requires at least one VERIFIED anchor to establish trust,");
+        println!("      so this receipt is reported as untrusted (exit 3), not accepted.");
         println!("      Request an upgraded receipt with TSA or Bitcoin anchoring for independent verification.");
     }
 
     print_anchor_section(&result.anchor_results, use_color);
+    print_assessment(&assessment);
 
     if verdict.status == Status::Untrusted {
-        print_trust_hint(&result.anchor_results);
+        print_trust_hint(result);
     }
 
     Ok(())
 }
 
+/// Print the three axes: evidence, policy, coverage.
+///
+/// Always printed for a receipt that presents anchors, whatever the outcome.
+/// They answer three different questions and a caller may care about any of
+/// them; publishing only the collapsed verdict word is what made a
+/// Receipt-Full verified offline indistinguishable from one whose TSA root
+/// was never supplied.
+fn print_assessment(assessment: &TrustAssessment) {
+    if assessment.total_anchors == 0 {
+        return;
+    }
+    println!();
+    println!("Trust Assessment:");
+    println!(
+        "  Policy:   {} — {}",
+        assessment.policy.as_str(),
+        assessment.policy.requirement()
+    );
+    println!(
+        "  Evidence: {} ({} of {} anchors verified; ATL v2.0 §5.5 needs at least 1)",
+        if assessment.evidence_established() {
+            "ESTABLISHED"
+        } else if assessment.has_refutation() {
+            // Never "NOT ESTABLISHED (0 verified)" here: there may well be
+            // verified anchors, and the count beside it says so. What
+            // disqualifies the receipt is the refutation, and the line must
+            // name that rather than leave a reader to reconcile a refusal
+            // with a non-zero tally.
+            //
+            // The wording covers both sources -- a refuted anchor and a
+            // refuted receipt (a mismatched source file, a broken proof) --
+            // because the reason code printed further up already says which,
+            // and this line's job is to say why the axis refuses.
+            "REFUTED — see the Reason above"
+        } else {
+            "NOT ESTABLISHED"
+        },
+        assessment.verified_anchors,
+        assessment.total_anchors
+    );
+    println!(
+        "  Coverage: {}",
+        if assessment.coverage_complete() {
+            "COMPLETE (every anchor presented was carried to a sound result)"
+        } else {
+            "INCOMPLETE"
+        }
+    );
+    for anchor in &assessment.unresolved {
+        println!(
+            "    - {} not resolved: {} ({})",
+            format_anchor_type(&anchor.anchor_type),
+            anchor.state.as_str(),
+            anchor.reason.as_str()
+        );
+    }
+    // Listed here and not only in the anchor section above: coverage
+    // accounts for every anchor presented, and the one that proves the
+    // receipt wrong is the last that may be left out of that accounting.
+    for anchor in &assessment.refuted {
+        println!(
+            "    - {} REFUTED: {} ({})",
+            format_anchor_type(&anchor.anchor_type),
+            anchor.state.as_str(),
+            anchor.reason.as_str()
+        );
+    }
+    // Deliberately answered YES/NO rather than "ATTAINED"/"NOT ATTAINED":
+    // the two attainment words share a stem, and a reader skimming a refuted
+    // receipt must not catch the word "ATTAINED" anywhere near it.
+    println!(
+        "  Receipt-Full profile (§5.6, both anchor types verified): {}",
+        if assessment.max_trust_profile() {
+            "YES"
+        } else if assessment.has_refutation() {
+            "NO — this receipt was refuted"
+        } else {
+            "NO"
+        }
+    );
+}
+
 /// The headline for an `untrusted` outcome.
+///
+/// The single definition, used by both renderers *and* by the error the
+/// process exits with, so a reader who only skims the headline is told the
+/// same thing however the result reaches them. It used to be duplicated in
+/// `crate::commands::verify`, with nothing keeping the two copies in step.
 ///
 /// "Trust root unavailable" is simply false for the reasons where the check
 /// could not be *performed*: the root may be present and the obstacle an
-/// unimplemented algorithm. Shared by the single-receipt and batch renderers
-/// so a reader who only skims the headline is told the same thing either way.
-fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
+/// unimplemented algorithm, an unfetched Bitcoin block, or a pair of files
+/// that never matched up.
+pub fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
     match verdict.reason_code {
+        // Nothing is missing on this side and nothing could be supplied:
+        // the receipt itself never carried an anchor. ATL v2.0 §5.5.
+        Some(ReasonCode::ReceiptUnanchored) => {
+            "NOT VERIFIED: the receipt carries no anchors (Receipt-Lite)"
+        }
+        Some(ReasonCode::BatchItemsUnanchored) => {
+            "NOT VERIFIED: some receipts carry no anchors (Receipt-Lite)"
+        }
         // A pairing problem, not a trust problem: pointing the reader at
         // --tsa-trust-store here would waste their time entirely.
         Some(ReasonCode::BatchItemsUnmatched) => {
@@ -117,6 +224,24 @@ fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
             | ReasonCode::TsaImprintIndeterminate
             | ReasonCode::TsaTimestampingEkuNotChecked,
         ) => "NOT VERIFIED: the check could not be completed (nothing was refuted)",
+        // No trust root is missing here at all: the TSA chain beside this
+        // anchor may be fully trusted, and what did not happen is the
+        // Bitcoin block lookup (ATL v2.0 §5.5.2). Sending the reader after
+        // a certificate would send them after something that cannot help.
+        Some(ReasonCode::BitcoinBlockNotChecked | ReasonCode::BitcoinBlockUnavailable) => {
+            "NOT VERIFIED: no block header was obtained for the Bitcoin anchor"
+        }
+        // Neither of these is about trust material, and both used to fall
+        // through to "trust root unavailable" -- telling a user to go and
+        // find certificates when two APIs had contradicted each other, or
+        // when only one had answered. No certificate fixes either.
+        Some(ReasonCode::BitcoinProvidersDisagree) => {
+            "NOT VERIFIED: the block-explorer APIs contradict each other (your receipt is not \
+             implicated)"
+        }
+        Some(ReasonCode::BitcoinSingleSourceOnly) => {
+            "NOT VERIFIED: only one block-explorer API answered, so its report is uncorroborated"
+        }
         _ => "NOT VERIFIED: trust root unavailable",
     }
 }
@@ -125,12 +250,34 @@ fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
 ///
 /// `Untrusted` is deliberately worded so it cannot be read as damage to the
 /// evidence: nothing was refuted, this verifier is simply not configured to
-/// finish the check. It is printed in the same warning colour as `PENDING`,
+/// finish the check. It is printed in the warning colour,
 /// never the failure colour.
-fn print_receipt_status(verdict: ReceiptVerdict, use_color: bool) {
+fn print_receipt_status(
+    verdict: ReceiptVerdict,
+    assessment: Option<&TrustAssessment>,
+    use_color: bool,
+) {
     match verdict.status {
-        Status::Valid => print_status("VALID", true, use_color),
-        Status::Pending => print_status_pending("PENDING (unanchored)", use_color),
+        // A success reached only because the quorum was lowered must never
+        // be printed as a bare "VALID". The caller relaxed the policy; the
+        // headline says so, and the Trust Assessment block beneath lists
+        // every anchor that went unresolved. Presenting this as
+        // unconditional acceptance would be exactly the overclaim the flag
+        // was added to make explicit.
+        Status::Valid => match assessment.filter(|a| a.accepted_with_gaps()) {
+            Some(a) => print_status(
+                &format!(
+                    "VALID under policy '{}' ({} of {} anchors verified; {} unresolved)",
+                    a.policy.as_str(),
+                    a.verified_anchors,
+                    a.total_anchors,
+                    a.unresolved.len()
+                ),
+                true,
+                use_color,
+            ),
+            None => print_status("VALID", true, use_color),
+        },
         // "Trust root unavailable" is right for the reasons where material
         // really is missing, and wrong for `TsaChainIndeterminate`, where
         // the check could not be *performed*. Saying the root is
@@ -156,10 +303,24 @@ fn print_receipt_status(verdict: ReceiptVerdict, use_color: bool) {
 /// `*_not_checked` reasons the obstacle is cryptography this build does not
 /// implement, and those arms say so rather than sending the reader after a
 /// certificate that would not help.
-fn print_trust_hint(anchors: &[AnchorVerificationResult]) {
+fn print_trust_hint(result: &SingleVerificationResult) {
     println!();
     println!("The evidence was NOT disproved. This verifier could not finish checking it:");
-    for anchor in anchors {
+
+    // A Receipt-Lite has no anchor to enumerate, and no file the caller
+    // could supply would change that. Falling through to the loop below
+    // printed nothing at all under that headline.
+    if result.receipt.anchors.is_empty() {
+        println!(
+            "  - The receipt carries no anchors at all (Receipt-Lite), so nothing external\n    \
+             attests to when this existed. ATL v2.0 §5.5 requires at least one verified\n    \
+             anchor. No certificate and no network access can supply one: ask the log\n    \
+             operator for an anchored receipt (Receipt-TSA or Receipt-Full)."
+        );
+        return;
+    }
+
+    for anchor in &result.anchor_results {
         let AnchorVerdict::Untrusted(code) = anchor.verdict else {
             continue;
         };
@@ -221,11 +382,119 @@ fn print_trust_hint(anchors: &[AnchorVerificationResult]) {
                  from an external source, naming it with --tsa-trust-store settles it."
             ),
             ReasonCode::BitcoinBlockNotChecked | ReasonCode::BitcoinBlockUnavailable => println!(
-                "  - The Bitcoin block confirming this anchor was not fetched.\n    \
-                 Re-run with network access."
+                "  - No block header was obtained for this anchor, so its OTS proof was\n    \
+                 never compared against one. Re-run with network access."
+            ),
+            ReasonCode::BitcoinProvidersDisagree => println!(
+                "  - The block-explorer APIs returned DIFFERENT headers for this block, so\n    \
+                 no header is established and nothing was compared. Nothing about your\n    \
+                 receipt is refuted by this -- the sources this verifier depends on do not\n    \
+                 agree with each other. See the per-source rows above. This can mean a chain\n    \
+                 fork, a stale index, or a compromised endpoint; no certificate and no\n    \
+                 retry will settle it, and it is worth investigating."
+            ),
+            ReasonCode::BitcoinSingleSourceOnly => println!(
+                "  - Only one block-explorer API answered, so its report of the block header\n    \
+                 is uncorroborated. One endpoint's word cannot establish what Bitcoin\n    \
+                 contains, so the OTS proof was not compared against it. Re-run when more\n    \
+                 than one provider is reachable; no certificate is involved."
             ),
             other => println!("  - Missing trust material ({}).", other.as_str()),
         }
+    }
+}
+
+/// List the block-explorer APIs that answered and what each reported.
+///
+/// Printed on every Bitcoin anchor, agreeing or not. When they agree it is
+/// an attribution — *these* endpoints said so, and this tool did no more
+/// than ask them. When they disagree it is the finding itself, and the only
+/// place a reader can see that their sources contradict each other.
+fn print_block_sources(sources: &[BlockSourceReport]) {
+    for line in block_sources_lines(sources) {
+        println!("{line}");
+    }
+}
+
+/// The lines [`print_block_sources`] emits, as values so they can be
+/// asserted.
+///
+/// The case worth testing — sources contradicting each other — cannot be
+/// provoked on the live network, and a rendering nobody can test is a
+/// rendering nobody checks.
+fn block_sources_lines(sources: &[BlockSourceReport]) -> Vec<String> {
+    if sources.is_empty() {
+        return vec!["        Reported by:       (no block-explorer API answered)".to_string()];
+    }
+
+    let names: Vec<&str> = sources.iter().map(|s| s.source.as_str()).collect();
+    let mut lines = vec![format!(
+        "        Reported by:       {} ({} source{})",
+        names.join(", "),
+        names.len(),
+        if names.len() == 1 { "" } else { "s" }
+    )];
+
+    // Only worth enumerating when they differ; identical rows would be
+    // noise, and the count above already carries the corroboration.
+    //
+    // `sources_agree` is the same predicate the classifier used to decide
+    // `bitcoin_providers_disagree`. It was an inline comparison of the hash
+    // and the root only, so a conflict about nothing but the *time* was
+    // classified as a disagreement and then rendered as if nothing had
+    // happened -- the one event these checks exist to surface, invisible.
+    if !sources_agree(sources) {
+        lines.push("        SOURCES DISAGREE about this block:".to_string());
+        for s in sources {
+            lines.push(format!(
+                "          - {}: merkle_root {} in block {} at {}",
+                s.source,
+                s.merkle_root,
+                s.block_hash,
+                format_timestamp_secs(s.block_timestamp_secs)
+            ));
+        }
+        lines.push(
+            "          Nothing about this receipt is refuted by this: the sources this".to_string(),
+        );
+        lines.push("          verifier depends on do not agree with each other.".to_string());
+    }
+    lines
+}
+
+/// The Bitcoin anchor's closing line: which block, and whether it dates
+/// anything.
+///
+/// A pure function returning a `String` rather than four inline `println!`s,
+/// so the wording can be asserted by a unit test. The case that matters most
+/// — a block fetched whose Merkle root did not match — arises only with
+/// network access, and a rendering nobody can test offline is a rendering
+/// nobody checks.
+///
+/// The height is the receipt's own claim until a block at it has been
+/// fetched *and* matched, so it is labelled as such — the same rule the RFC
+/// 3161 `genTime` follows. A time is printed only when a block was actually
+/// fetched; `block_timestamp_secs` is an `Option`, so there is no zero to
+/// fall back on and nothing can render as 1970.
+///
+/// The third arm is the one worth reading. The block was fetched and its
+/// Merkle root did not match, so its time is entirely real and says nothing
+/// whatever about this receipt. Printing it bare would offer a date for
+/// evidence this very line refutes.
+fn bitcoin_block_line(
+    verified: bool,
+    block_height: u64,
+    block_timestamp_secs: Option<u64>,
+) -> String {
+    match (verified, block_timestamp_secs) {
+        (true, Some(secs)) => format!("Block #{block_height} @ {}", format_timestamp_secs(secs)),
+        (true, None) => format!("Block #{block_height}"),
+        (false, Some(secs)) => format!(
+            "Block #{block_height} @ {} (as reported by the sources below; this block does NOT \
+             date this receipt)",
+            format_timestamp_secs(secs)
+        ),
+        (false, None) => format!("Block #{block_height} (claimed by the proof, not confirmed)"),
     }
 }
 
@@ -359,6 +628,7 @@ fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
             computed_root,
             block_merkle_root,
             merkle_match,
+            block_sources,
         } => {
             println!();
             println!("      Verification Chain:");
@@ -393,14 +663,15 @@ fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
             }
 
             println!("              ↓");
-            if *block_timestamp_secs > 0 {
-                println!(
-                    "        Block #{block_height} @ {}",
-                    format_timestamp_secs(*block_timestamp_secs)
-                );
-            } else {
-                println!("        Block #{block_height}");
-            }
+            println!(
+                "        {}",
+                bitcoin_block_line(anchor.verified(), *block_height, *block_timestamp_secs)
+            );
+            // Name the sources, always. This tool reads block headers out of
+            // HTTP APIs; it validates no proof of work and follows no chain,
+            // so every value above is what these endpoints reported and the
+            // reader is entitled to know which ones.
+            print_block_sources(block_sources);
         }
         AnchorDetails::Unknown => {}
     }
@@ -417,26 +688,35 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
     // "Files: N total" that did not equal the rows listed underneath it.
     let total = result.total_count();
     println!("Files: {total} total");
+    println!(
+        "Policy: {} — {}",
+        result.policy.as_str(),
+        result.policy.requirement()
+    );
     println!();
 
     println!("Results:");
-    print!("  Valid:     ");
+    print!("  Valid:      ");
     print_count(result.valid_count, result.valid_count > 0, use_color);
-    // Its own row: an unanchored receipt is neither accepted nor a problem,
-    // and folding it into "Valid" made a batch of them read as accepted.
-    print!("  Pending:   ");
-    print_count(result.pending_count, true, use_color);
-    print!("  Untrusted: ");
+    // Its own row: a Receipt-Lite is untrusted like the rows below it, but
+    // for a reason no trust material fixes, so it is worth naming apart.
+    print!("  Unanchored: ");
+    print_count(
+        result.unanchored_count,
+        result.unanchored_count == 0,
+        use_color,
+    );
+    print!("  Untrusted:  ");
     print_count(
         result.untrusted_count,
         result.untrusted_count == 0,
         use_color,
     );
-    print!("  Invalid:   ");
+    print!("  Invalid:    ");
     print_count(result.invalid_count, result.invalid_count == 0, use_color);
-    print!("  Errors:    ");
+    print!("  Errors:     ");
     print_count(result.error_count, result.error_count == 0, use_color);
-    print!("  Unmatched: ");
+    print!("  Unmatched:  ");
     println!("{}", result.unmatched_count);
     println!();
 
@@ -454,7 +734,7 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
                 .map(|name| {
                     let matching = result.items.iter().find_map(|item| match item {
                         BatchItemResult::Valid(r)
-                        | BatchItemResult::Pending(r)
+                        | BatchItemResult::Unanchored(r)
                         | BatchItemResult::Untrusted(r)
                             if r.source_path
                                 .file_name()
@@ -464,14 +744,11 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
                         }
                         _ => None,
                     });
-                    let (super_root, data_tree_index) = matching.map_or_else(
-                        || ("none".to_string(), 0),
-                        |sp| (sp.super_root.clone(), sp.data_tree_index),
-                    );
+                    let super_root =
+                        matching.map_or_else(|| "none".to_string(), |sp| sp.super_root.clone());
                     ReceiptProofInfo {
                         filename: name.clone(),
                         super_root,
-                        data_tree_index,
                     }
                 })
                 .collect()
@@ -497,9 +774,24 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
         print_batch_item(i + 1, item, use_color);
     }
 
-    // Overall status
+    // Overall status. A batch accepted only because the quorum was lowered
+    // says so on its own last line, not merely on the rows above it: a
+    // reader who skims the summary must not be handed a bare "VALID" for a
+    // run that left anchors unresolved.
     print!("Overall: ");
-    print_receipt_status(result.verdict(), use_color);
+    let verdict = result.verdict();
+    if verdict.status == Status::Valid && result.accepted_with_gaps() {
+        print_status(
+            &format!(
+                "VALID under policy '{}' (some anchors were not resolved -- see the rows above)",
+                result.policy.as_str()
+            ),
+            true,
+            use_color,
+        );
+    } else {
+        print_receipt_status(verdict, None, use_color);
+    }
 
     Ok(())
 }
@@ -511,12 +803,41 @@ fn print_consistency(
     use_color: bool,
 ) {
     print!("Log Consistency: ");
-    if consistency.is_valid() {
-        print_status(
-            &format!("VERIFIED ({} receipts)", consistency.receipt_count),
-            true,
+    // Nothing was compared: every log instance here is represented by a
+    // single receipt, so no pair satisfies ATL v2.0 §5.4.3 step 2. Saying
+    // `VERIFIED` over zero comparisons would claim work never done.
+    if !consistency.checked() {
+        print_status_pending(
+            &format!(
+                "NOT CHECKED ({} receipts, {} log instance{}: no two from the same one)",
+                consistency.receipt_count,
+                consistency.log_instance_count,
+                if consistency.log_instance_count == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
             use_color,
         );
+        println!();
+        return;
+    }
+    if consistency.is_valid() {
+        let headline = if consistency.single_log_instance() {
+            format!("VERIFIED ({} receipts)", consistency.receipt_count)
+        } else {
+            // Said plainly rather than treated as a fault. A directory
+            // holding receipts from several log instances used to be reported
+            // FAILED and exit 1 -- refuted evidence -- when nothing about any
+            // receipt was false, and when ATL v2.0 §5.4.3 defines no error
+            // for the case. Each log instance is checked on its own.
+            format!(
+                "VERIFIED ({} receipts across {} log instances)",
+                consistency.receipt_count, consistency.log_instance_count
+            )
+        };
+        print_status(&headline, true, use_color);
         // Consistency is a statement about the log's append-only history
         // among the receipts listed below -- not about whether any of them
         // was accepted. A batch where nothing was accepted still prints this
@@ -528,12 +849,30 @@ fn print_consistency(
                  status above)"
             );
         }
-        // Two-part proof explanation
+        // The words come from ATL v2.0 §5.4.3, and stop where it stops.
+        // "Append-only history verified" and "included" claimed containment
+        // of one receipt's Super-Tree in the other's; no receipt carries such
+        // a proof and nothing checks it.
         let cross_count = consistency.cross_results.len();
-        print_checkmark("Same log origin (genesis match)", true, use_color);
+        if consistency.single_log_instance() {
+            print_checkmark(
+                "Same log instance (genesis_super_root match)",
+                true,
+                use_color,
+            );
+        } else {
+            print_checkmark(
+                &format!(
+                    "{} distinct log instances; each checked on its own",
+                    consistency.log_instance_count
+                ),
+                true,
+                use_color,
+            );
+        }
         print_checkmark(
             &format!(
-                "Append-only history verified ({} cross-check{} passed)",
+                "Log history between them was not modified ({} pair{} compared)",
                 cross_count,
                 if cross_count == 1 { "" } else { "s" }
             ),
@@ -549,49 +888,46 @@ fn print_consistency(
 
         // Summary
         println!();
-        if use_color {
-            println!(
-                "    {} All provided receipts form unbroken append-only chain",
-                "→".green()
-            );
+        let summary = if consistency.single_log_instance() {
+            "All provided receipts belong to the same log instance, and the log history \
+             between them was not modified"
         } else {
-            println!("    → All provided receipts form unbroken append-only chain");
+            "Within each log instance, the log history between its receipts was not modified"
+        };
+        if use_color {
+            println!("    {} {summary}", "→".green());
+        } else {
+            println!("    → {summary}");
         }
+        // The limit of the claim, printed with it so it cannot be skimmed
+        // past. Per ATL v2.0 §7.3.2 the primary defence against a Split-View
+        // (fork) attack is external anchoring, not this check.
+        println!(
+            "      (a Split-View attack is not ruled out here; per the spec the defence \
+             against it is a verified external anchor)"
+        );
     } else {
         print_status("FAILED", false, use_color);
 
-        // Determine failure type and find first broken cross-check
+        // A failure here is always a broken history *within* one log
+        // instance: a receipt carrying a different §3.3.2 identifier is
+        // grouped on its own rather than failed against this one.
         let first_failure_idx = consistency
             .cross_results
             .iter()
-            .position(|cr| !cr.history_consistent);
+            .position(|cr| !cr.result.history_consistent);
 
-        if !consistency.same_log {
-            print_checkmark("Different log origins (genesis mismatch)", false, use_color);
-        } else {
-            print_checkmark(
-                "History inconsistent (cross-check failed)",
-                false,
-                use_color,
-            );
-        }
+        print_checkmark(
+            "History inconsistent (cross-check failed)",
+            false,
+            use_color,
+        );
 
         // Proof section (show divergent data)
         if !receipt_infos.is_empty() {
             print_proof_section(receipt_infos, use_color);
 
-            // Cross-check section for failed case
-            if !consistency.same_log {
-                println!();
-                if use_color {
-                    println!(
-                        "    {} Receipts are from different logs or log was forked",
-                        "→".red()
-                    );
-                } else {
-                    println!("    → Receipts are from different logs or log was forked");
-                }
-            } else if !consistency.cross_results.is_empty() {
+            if !consistency.cross_results.is_empty() {
                 // Show ALL cross-checks, marking failure point
                 print_cross_checks_section(
                     &consistency.cross_results,
@@ -636,7 +972,7 @@ fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
         // Every verified bucket prints its item's own verdict, so the
         // bucket and the printed status cannot drift apart.
         BatchItemResult::Valid(result)
-        | BatchItemResult::Pending(result)
+        | BatchItemResult::Unanchored(result)
         | BatchItemResult::Untrusted(result)
         | BatchItemResult::Invalid(result) => {
             println!(
@@ -648,10 +984,22 @@ fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
                     .to_string_lossy()
             );
             let verdict = result.verdict();
+            let assessment = result.assessment();
             print!("    Status: ");
             match verdict.status {
+                // Same qualifier as the single-file headline: a row accepted
+                // only because the quorum was lowered says so on its face.
+                Status::Valid if assessment.accepted_with_gaps() => print_status(
+                    &format!(
+                        "VALID under policy '{}' ({} of {} anchors verified)",
+                        assessment.policy.as_str(),
+                        assessment.verified_anchors,
+                        assessment.total_anchors
+                    ),
+                    true,
+                    use_color,
+                ),
                 Status::Valid => print_status("VALID", true, use_color),
-                Status::Pending => print_status_pending("PENDING (unanchored)", use_color),
                 // Same split as `print_receipt_status`: "trust root
                 // unavailable" is false for a check that could not be
                 // performed, and a batch row is exactly where a reader skims
@@ -664,6 +1012,14 @@ fn print_batch_item(index: usize, item: &BatchItemResult, use_color: bool) {
             }
             if let Some(reason) = verdict.reason_code {
                 println!("    Reason: {}", reason.as_str());
+            }
+            for anchor in &assessment.unresolved {
+                println!(
+                    "    Unresolved anchor: {} — {} ({})",
+                    format_anchor_type(&anchor.anchor_type),
+                    anchor.state.as_str(),
+                    anchor.reason.as_str()
+                );
             }
         }
         BatchItemResult::Error { source, error, .. } => {
@@ -722,14 +1078,14 @@ fn print_proof_section(receipt_infos: &[ReceiptProofInfo], _use_color: bool) {
     println!();
     println!("  Proof:");
 
-    // Sort by data_tree_index for display (receipt order in the log)
-    let mut sorted_infos: Vec<_> = receipt_infos.iter().enumerate().collect();
-    sorted_infos.sort_by_key(|(_, info)| info.data_tree_index);
-
-    for (display_idx, (_, info)) in sorted_infos.iter().enumerate() {
+    // Printed in the order the consistency check walked them, and numbered
+    // from that order. Re-sorting by `data_tree_index` here gave this
+    // section its own index space, so `[1]` in "Proof:" and `[1]` in
+    // "Cross-checks:" below could name different receipts.
+    for (idx, info) in receipt_infos.iter().enumerate() {
         println!(
             "    [{}] {}    registered at super_root {}",
-            display_idx + 1,
+            idx + 1,
             info.filename,
             info.super_root
         );
@@ -739,11 +1095,11 @@ fn print_proof_section(receipt_infos: &[ReceiptProofInfo], _use_color: bool) {
 /// Print the "Cross-checks:" section showing all N-1 cross-verification results
 ///
 /// # Arguments
-/// * `cross_results` - All cross-check results (N-1 for N receipts)
+/// * `cross_results` - Every pairwise check that was actually performed
 /// * `first_failure_idx` - Index of first failed cross-check (None if all passed)
 /// * `use_color` - Whether to use colored output
 fn print_cross_checks_section(
-    cross_results: &[atl_core::CrossReceiptVerificationResult],
+    cross_results: &[CrossCheck],
     first_failure_idx: Option<usize>,
     use_color: bool,
 ) {
@@ -755,8 +1111,11 @@ fn print_cross_checks_section(
     println!("    Cross-checks:");
 
     for (idx, cross) in cross_results.iter().enumerate() {
-        let from_idx = idx + 1;
-        let to_idx = idx + 2;
+        // The participants this check compared, not this row's position:
+        // participants are grouped by log, so positional arithmetic would
+        // name pairs that were never compared.
+        let from_idx = cross.from_index + 1;
+        let to_idx = cross.to_index + 1;
 
         // Determine status: passed, failed, or skipped (after first failure)
         let is_after_failure = first_failure_idx.is_some_and(|fail_idx| idx > fail_idx);
@@ -773,23 +1132,24 @@ fn print_cross_checks_section(
             } else {
                 println!("      [{}] → [{}]: (skipped)", from_idx, to_idx);
             }
-        } else if cross.history_consistent {
-            // Passed
+        } else if cross.result.history_consistent {
+            // §5.4.3's own words. "included" claimed containment of one tree
+            // in the other, which no receipt proves and nothing checks.
             if use_color {
                 println!(
-                    "      [{}] → [{}]: {} included",
+                    "      [{}] → [{}]: {} same log instance",
                     from_idx,
                     to_idx,
                     "✓".green()
                 );
             } else {
-                println!("      [{}] → [{}]: ✓ included", from_idx, to_idx);
+                println!("      [{}] → [{}]: ✓ same log instance", from_idx, to_idx);
             }
         } else {
             // Failed (this is the break point)
             if use_color {
                 println!(
-                    "      [{}] → [{}]: {} NOT included  {} BREAK",
+                    "      [{}] → [{}]: {} history not proven  {} BREAK",
                     from_idx,
                     to_idx,
                     "✗".red(),
@@ -797,7 +1157,7 @@ fn print_cross_checks_section(
                 );
             } else {
                 println!(
-                    "      [{}] → [{}]: ✗ NOT included  ← BREAK",
+                    "      [{}] → [{}]: ✗ history not proven  ← BREAK",
                     from_idx, to_idx
                 );
             }
@@ -870,6 +1230,7 @@ fn format_timestamp_secs(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verify::policy::AnchorPolicy;
     use crate::verify::verdict::ReasonCode;
     use atl_core::{PathStatus, ReceiptAnchor, Revocation, TerminalAnchor};
     use std::path::PathBuf;
@@ -907,6 +1268,7 @@ mod tests {
             receipt: create_test_receipt(),
             core_result: create_test_verification_result(core_valid),
             anchor_results: vec![],
+            policy: AnchorPolicy::AllAnchors,
         }
     }
 
@@ -950,11 +1312,12 @@ mod tests {
     fn batch(valid: usize, untrusted: usize, invalid: usize) -> BatchVerificationResult {
         BatchVerificationResult {
             valid_count: valid,
-            pending_count: 0,
+            unanchored_count: 0,
             untrusted_count: untrusted,
             invalid_count: invalid,
             error_count: 0,
             unmatched_count: 0,
+            policy: AnchorPolicy::AllAnchors,
             consistency: None,
             items: vec![],
         }
@@ -1012,7 +1375,10 @@ mod tests {
         // must differ from both VALID and INVALID.
         for (verdict, expected) in [
             (ReceiptVerdict::VALID, "VALID"),
-            (ReceiptVerdict::pending(), "PENDING (unanchored)"),
+            (
+                ReceiptVerdict::unanchored(),
+                "NOT VERIFIED: the receipt carries no anchors (Receipt-Lite)",
+            ),
             (
                 ReceiptVerdict::untrusted(ReasonCode::TsaRootNotTrusted),
                 "NOT VERIFIED: trust root unavailable",
@@ -1024,8 +1390,8 @@ mod tests {
         ] {
             let _ = expected;
             // Rendering must not panic in either color mode.
-            print_receipt_status(verdict, false);
-            print_receipt_status(verdict, true);
+            print_receipt_status(verdict, None, false);
+            print_receipt_status(verdict, None, true);
         }
     }
 
@@ -1110,20 +1476,183 @@ mod tests {
                 error: None,
                 details: AnchorDetails::Bitcoin {
                     block_height: 932_897,
-                    block_timestamp_secs: if merkle_match.is_some() {
-                        1_768_806_080
-                    } else {
-                        0
-                    },
+                    block_timestamp_secs: merkle_match.map(|_| 1_768_806_080),
                     target_hash: "sha256:abc".to_string(),
                     operation_count: 39,
                     computed_root: "sha256:aa".to_string(),
                     block_merkle_root,
                     merkle_match,
+                    block_sources: Vec::new(),
                 },
             };
             print_anchor_section(std::slice::from_ref(&anchor), false);
             print_anchor_section(std::slice::from_ref(&anchor), true);
+        }
+    }
+
+    /// **A refuted Bitcoin anchor never offers a bare date.**
+    ///
+    /// The `(false, Some)` case arises only online — the block is fetched
+    /// before its Merkle root is compared — so the wording is asserted here
+    /// rather than by a live run. It must carry the observation without
+    /// letting it read as a timestamp for this receipt.
+    #[test]
+    fn the_bitcoin_block_line_never_dates_a_receipt_it_refutes() {
+        let refuted = bitcoin_block_line(false, 932_897, Some(1_768_806_080));
+        assert!(refuted.contains("Block #932897"), "{refuted}");
+        assert!(
+            refuted.contains("as reported by the sources below"),
+            "{refuted}"
+        );
+        assert!(
+            !refuted.contains("on-chain"),
+            "this tool queries HTTP APIs; it does not observe the chain: {refuted}"
+        );
+        assert!(refuted.contains("does NOT date this receipt"), "{refuted}");
+
+        // Verified: the plain reading, with nothing hedged.
+        let verified = bitcoin_block_line(true, 932_897, Some(1_768_806_080));
+        assert!(verified.contains("Block #932897 @ "), "{verified}");
+        assert!(!verified.contains("reported by"), "{verified}");
+        assert!(!verified.contains("NOT"), "{verified}");
+
+        // Offline: no block was fetched, so no time exists to print at all.
+        let unfetched = bitcoin_block_line(false, 932_897, None);
+        assert_eq!(
+            unfetched,
+            "Block #932897 (claimed by the proof, not confirmed)"
+        );
+        for line in [&refuted, &verified, &unfetched] {
+            assert!(!line.contains("1970"), "{line}");
+        }
+    }
+
+    /// **A source conflict must read as a source conflict.** It cannot be
+    /// provoked on the live network, so the wording is pinned here.
+    #[test]
+    fn disagreeing_sources_are_shown_and_never_blamed_on_the_receipt() {
+        fn report(source: &str, root: &str) -> BlockSourceReport {
+            BlockSourceReport {
+                source: source.to_string(),
+                block_hash: "a".repeat(64),
+                merkle_root: root.to_string(),
+                block_timestamp_secs: 1_768_806_080,
+            }
+        }
+
+        let rendered = block_sources_lines(&[
+            report("blockstream.info", &"b".repeat(64)),
+            report("mempool.space", &"c".repeat(64)),
+        ])
+        .join("\n");
+
+        assert!(rendered.contains("SOURCES DISAGREE"), "{rendered}");
+        assert!(rendered.contains("blockstream.info"), "{rendered}");
+        assert!(rendered.contains("mempool.space"), "{rendered}");
+        assert!(
+            rendered.contains("Nothing about this receipt is refuted by this"),
+            "a source conflict must not read as an accusation:\n{rendered}"
+        );
+
+        // Agreeing sources are attributed, not enumerated: the count already
+        // carries the corroboration and identical rows would be noise.
+        let agreeing = block_sources_lines(&[
+            report("blockstream.info", &"b".repeat(64)),
+            report("mempool.space", &"b".repeat(64)),
+        ])
+        .join("\n");
+        assert!(agreeing.contains("Reported by:"), "{agreeing}");
+        assert!(agreeing.contains("(2 sources)"), "{agreeing}");
+        assert!(!agreeing.contains("DISAGREE"), "{agreeing}");
+
+        // And when nobody answered, say exactly that.
+        let none = block_sources_lines(&[]).join("\n");
+        assert!(none.contains("no block-explorer API answered"), "{none}");
+    }
+
+    /// **A disagreement about nothing but the time is still a disagreement.**
+    ///
+    /// The classifier compares the block hash, the Merkle root *and* the
+    /// time; this renderer used to compare only the first two. So a
+    /// time-only conflict produced `bitcoin_providers_disagree` and then
+    /// rendered as though nothing had happened -- no `SOURCES DISAGREE`
+    /// block, no conflicting rows, no reason. Both now call
+    /// `sources_agree`, so what is decided is what is shown.
+    #[test]
+    fn a_time_only_disagreement_is_visible_to_a_reader() {
+        fn at(source: &str, secs: u64) -> BlockSourceReport {
+            BlockSourceReport {
+                source: source.to_string(),
+                block_hash: "a".repeat(64),
+                merkle_root: "b".repeat(64),
+                block_timestamp_secs: secs,
+            }
+        }
+
+        let rendered = block_sources_lines(&[
+            at("blockstream.info", 1_768_806_080),
+            at("mempool.space", 1_768_806_081),
+        ])
+        .join("\n");
+
+        assert!(
+            rendered.contains("SOURCES DISAGREE"),
+            "the hash and root match; only the time differs, and it must still show:\n{rendered}"
+        );
+        // Both times must be on screen, or the reader cannot see what differs.
+        assert!(rendered.contains("2026-01-19T07:01:20Z"), "{rendered}");
+        assert!(rendered.contains("2026-01-19T07:01:21Z"), "{rendered}");
+        assert!(
+            rendered.contains("Nothing about this receipt is refuted by this"),
+            "{rendered}"
+        );
+
+        // Sanity: identical times still read as agreement.
+        let agreeing = block_sources_lines(&[
+            at("blockstream.info", 1_768_806_080),
+            at("mempool.space", 1_768_806_080),
+        ])
+        .join("\n");
+        assert!(!agreeing.contains("DISAGREE"), "{agreeing}");
+    }
+
+    /// The two Bitcoin source reasons must not be advised with certificates.
+    /// They used to fall through to "trust root unavailable" and "Missing
+    /// trust material", sending a user after files that fix neither a
+    /// conflict between two APIs nor a single endpoint answering.
+    #[test]
+    fn the_bitcoin_source_reasons_never_advise_certificates() {
+        for reason in [
+            ReasonCode::BitcoinProvidersDisagree,
+            ReasonCode::BitcoinSingleSourceOnly,
+        ] {
+            let headline = untrusted_headline(ReceiptVerdict::untrusted(reason));
+            assert!(!headline.contains("trust root"), "{reason}: {headline}");
+            assert!(
+                headline.contains("block-explorer"),
+                "the headline must name the real cause: {reason}: {headline}"
+            );
+        }
+        assert!(untrusted_headline(ReceiptVerdict::untrusted(
+            ReasonCode::BitcoinProvidersDisagree
+        ))
+        .contains("your receipt is not implicated"));
+    }
+
+    /// Nothing in the human output may claim this tool watched the Bitcoin
+    /// network. It queries HTTP APIs and says so.    /// Nothing in the human output may claim this tool watched the Bitcoin
+    /// network. It queries HTTP APIs and says so.
+    #[test]
+    fn the_output_never_claims_to_observe_the_chain() {
+        let rendered = block_sources_lines(&[BlockSourceReport {
+            source: "blockstream.info".to_string(),
+            block_hash: "a".repeat(64),
+            merkle_root: "b".repeat(64),
+            block_timestamp_secs: 1_768_806_080,
+        }])
+        .join("\n");
+        for claim in ["on-chain", "on chain", "blockchain", "observed"] {
+            assert!(!rendered.contains(claim), "{claim:?} in:\n{rendered}");
         }
     }
 
@@ -1137,11 +1666,12 @@ mod tests {
     fn batch_items_render_every_bucket() {
         let result = BatchVerificationResult {
             valid_count: 1,
-            pending_count: 0,
+            unanchored_count: 0,
             untrusted_count: 1,
             invalid_count: 1,
             error_count: 1,
             unmatched_count: 2,
+            policy: AnchorPolicy::AllAnchors,
             consistency: None,
             items: vec![
                 BatchItemResult::Valid(single_result(true, true)),

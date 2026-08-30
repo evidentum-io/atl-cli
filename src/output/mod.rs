@@ -58,6 +58,7 @@ mod tests {
     use super::*;
     use crate::cli::{Args, Command, InspectArgs};
     use crate::verify::batch::BatchVerificationResult;
+    use crate::verify::policy::AnchorPolicy;
     use crate::verify::single::SingleVerificationResult;
     use std::path::PathBuf;
 
@@ -93,17 +94,19 @@ mod tests {
             receipt: create_test_receipt(),
             core_result: create_test_verification_result(),
             anchor_results: vec![],
+            policy: AnchorPolicy::AllAnchors,
         }
     }
 
     fn create_test_batch() -> BatchVerificationResult {
         BatchVerificationResult {
             valid_count: 1,
-            pending_count: 0,
+            unanchored_count: 0,
             untrusted_count: 0,
             invalid_count: 0,
             error_count: 0,
             unmatched_count: 0,
+            policy: AnchorPolicy::AllAnchors,
             consistency: None,
             items: vec![],
         }

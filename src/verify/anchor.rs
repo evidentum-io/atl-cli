@@ -5,7 +5,8 @@
 //! network access whatsoever. It therefore runs on every verification,
 //! offline and online alike, and lives here rather than in
 //! [`crate::verify::online`]. Only `bitcoin_ots` anchors need the network,
-//! and only to fetch the block whose Merkle root confirms the OTS proof.
+//! and only to ask block-explorer APIs for the header whose Merkle root the
+//! OTS proof is compared against. Nothing here observes the Bitcoin network.
 //!
 //! Per the ATL trust model (`docs-md/atl-trust-model-decisions.md`, decision
 //! Р1) nothing in this module knows any identity: no root, no fingerprint,
@@ -25,10 +26,79 @@ use subtle::ConstantTimeEq;
 
 use crate::verify::verdict::ReasonCode;
 
+/// One block-explorer API's report of a block header.
+///
+/// A *report*, not a fact: it is what an HTTP endpoint returned. Two of
+/// these agreeing is the strongest statement this tool makes about Bitcoin,
+/// and it is still only "two separately operated endpoints said the same
+/// thing" — their independence from each other is not established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockSourceReport {
+    /// The endpoint's name, e.g. `"blockstream.info"`.
+    pub source: String,
+    /// Block hash as reported (hex, no prefix).
+    pub block_hash: String,
+    /// Merkle root as reported (hex, no prefix).
+    pub merkle_root: String,
+    /// Block time as reported, in seconds since the epoch.
+    pub block_timestamp_secs: u64,
+}
+
+impl BlockSourceReport {
+    /// Two sources describe the same block header.
+    ///
+    /// **The single definition of agreement in this crate.** The classifier
+    /// that decides `bitcoin_providers_disagree` and both renderers that
+    /// show a disagreement call this one function, so what counts as a
+    /// conflict cannot differ between deciding and displaying.
+    ///
+    /// It could, and did. The classifier compared the block hash, the Merkle
+    /// root *and* the time, while the human renderer compared only the first
+    /// two — so a disagreement about nothing but the time produced
+    /// `bitcoin_providers_disagree` with no `SOURCES DISAGREE` block, no
+    /// conflicting rows, and nothing telling the reader why. The event these
+    /// checks exist to surface was silently invisible.
+    ///
+    /// All three fields are compared because all three are block-header
+    /// facts — two correct providers describing the same block cannot differ
+    /// on any of them — and all three are published downstream, so a
+    /// conflict on any one would mean publishing a value this tool's own
+    /// sources contradict.
+    #[must_use]
+    pub fn agrees_with(&self, other: &Self) -> bool {
+        fn same_hex(a: &str, b: &str) -> bool {
+            match (hex::decode(a), hex::decode(b)) {
+                (Ok(a), Ok(b)) if a.len() == b.len() => a.ct_eq(&b).into(),
+                // Unparsable or differently sized: not equal. Both are
+                // rejected upstream by the 64-hex-char check, so this is a
+                // guard rather than a path.
+                _ => false,
+            }
+        }
+        self.block_timestamp_secs == other.block_timestamp_secs
+            && same_hex(&self.block_hash, &other.block_hash)
+            && same_hex(&self.merkle_root, &other.merkle_root)
+    }
+}
+
+/// Every source in `sources` describes the same block header.
+///
+/// `true` for an empty or single-element slice: there is nothing to
+/// contradict. See [`BlockSourceReport::agrees_with`] for why this is the
+/// only place the question is answered.
+#[must_use]
+pub fn sources_agree(sources: &[BlockSourceReport]) -> bool {
+    let Some(first) = sources.first() else {
+        return true;
+    };
+    sources.iter().all(|s| s.agrees_with(first))
+}
+
 /// Verdict for a single anchor.
 ///
 /// The three states mirror [`crate::verify::verdict::Status`] minus
-/// `Pending` (an anchor that exists is never "unanchored"): `Invalid` means
+/// the unanchored case (an anchor that exists is never "unanchored"):
+/// `Invalid` means
 /// a fact about the anchor was checked and is false; `Untrusted` means
 /// **nothing was refuted** and the check could not be finished.
 ///
@@ -50,7 +120,8 @@ pub enum AnchorVerdict {
 }
 
 impl AnchorVerdict {
-    /// `true` only for [`Self::Valid`].
+    /// `true` only for [`Self::Valid`] — that is, only for a **verified
+    /// anchor** in the sense [`AnchorState::Verified`] defines.
     #[must_use]
     pub const fn is_valid(self) -> bool {
         matches!(self, Self::Valid)
@@ -63,6 +134,201 @@ impl AnchorVerdict {
             Self::Valid => None,
             Self::Untrusted(code) | Self::Invalid(code) => Some(code),
         }
+    }
+
+    /// The anchor's state, at the granularity a caller can act on.
+    ///
+    /// [`Self::Untrusted`] is one verdict covering several genuinely
+    /// different situations; this projects it onto the distinctions that
+    /// call for different reactions. The verdict remains the authority — the
+    /// state is derived from it and never the other way round.
+    #[must_use]
+    pub const fn state(self) -> AnchorState {
+        match self {
+            Self::Valid => AnchorState::Verified,
+            Self::Invalid(_) => AnchorState::Refuted,
+            Self::Untrusted(reason) => AnchorState::from_reason(reason),
+        }
+    }
+}
+
+/// What became of one anchor, at the granularity that determines what — if
+/// anything — a caller should do about it.
+///
+/// # `Verified` is a load-bearing word
+///
+/// ATL v2.0 §5.5 requires "at least one anchor MUST be verified to establish
+/// trust in the receipt". This crate answers that question with exactly one
+/// state, [`Self::Verified`], defined as: **the cryptographic facts were
+/// checked AND the certificate path reached a trust anchor supplied by the
+/// verifier's own trust store.**
+///
+/// Both halves are required. A token whose CMS signature and certificate
+/// chain are flawless but whose terminal certificate no trust store names
+/// proves only that some key signed it; which key, and whether anyone should
+/// care, is exactly what was not established. That state has its own name
+/// here — [`Self::CryptographicallyConsistent`] — and it is never counted as
+/// a verified anchor, in the §5.5 tally or anywhere else.
+///
+/// # A gap in the specification, recorded here
+///
+/// §5.5's five steps for an RFC 3161 anchor say "verify the cryptographic
+/// signature of the Time Stamping Authority" and stop. They never mention
+/// building a certificate path, nor where a verifier obtains the trust
+/// anchors that path must reach. Read literally, a self-signed certificate
+/// generated by an attacker satisfies step 4. This implementation therefore
+/// applies a stricter rule than the text states, and the gap is written up
+/// in the CHANGELOG and README rather than left as a comment — the
+/// specification is what needs fixing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnchorState {
+    /// Cryptographic facts checked **and** a caller-supplied trust root
+    /// reached. The only state that counts towards ATL v2.0 §5.5.
+    Verified,
+    /// Every checkable fact holds, and the path terminates in a certificate
+    /// no trust store names. Nothing is refuted and nothing is missing from
+    /// the token: what is missing is a reason to believe the terminal.
+    ///
+    /// Deliberately not called "verified": see the type-level docs.
+    CryptographicallyConsistent,
+    /// Path construction ran out of certificates before reaching any
+    /// terminal — an issuer certificate is simply absent. The one state a
+    /// caller fixes by supplying `--tsa-intermediates`.
+    Incomplete,
+    /// The check was not performed, because the selected mode does not
+    /// perform it: an offline run does not fetch the Bitcoin block that
+    /// would confirm an OTS proof.
+    NotChecked,
+    /// The check was attempted and did not complete — the Bitcoin block
+    /// lookup failed. Distinct from [`Self::NotChecked`]: here the tool
+    /// tried, so a retry is meaningful.
+    Unavailable,
+    /// A block-explorer API answered, but only one did, so nothing
+    /// corroborates it. One endpoint's word is not proof of what Bitcoin
+    /// contains — in either direction. A retry with better connectivity is
+    /// the remedy.
+    Uncorroborated,
+    /// The block-explorer APIs answered and **contradicted each other**
+    /// about the block header. Nothing about the receipt is refuted; the
+    /// sources this verifier depends on do not agree, so there is no
+    /// established header to compare against.
+    ///
+    /// Its own state because the reaction differs from every neighbour: a
+    /// retry will most likely reproduce it, no certificate helps, and the
+    /// conflict itself is a finding — a fork, a stale index, or a
+    /// compromised endpoint.
+    Contested,
+    /// The check cannot be performed at all by this build: a hash,
+    /// signature, public-key algorithm or curve `atl-core` does not
+    /// implement, or a fact that depends on one that could not be
+    /// established. No certificate and no network access changes this.
+    Unevaluable,
+    /// At least one checkable fact about the anchor is false.
+    Refuted,
+    /// Not resolved, for a reason none of the above names.
+    ///
+    /// No reason code reaches this arm today. It exists so that adding one
+    /// to [`ReasonCode`] cannot silently be reported as a stronger state
+    /// than it is: the weakest honest claim is "not resolved — read the
+    /// reason code".
+    Unresolved,
+}
+
+impl AnchorState {
+    /// Project an [`AnchorVerdict::Untrusted`] reason code onto the state it
+    /// describes.
+    ///
+    /// The match is **exhaustive on purpose**. It used to end in a wildcard,
+    /// which meant a newly added [`ReasonCode`] would quietly come out as
+    /// the vague `Unresolved` with nothing to warn anyone: the compiler
+    /// cannot object to an arm that already covers everything. Listing every
+    /// variant makes adding a reason code a build failure here, and forces
+    /// whoever adds it to decide what a caller can actually do about it.
+    #[must_use]
+    pub const fn from_reason(reason: ReasonCode) -> Self {
+        match reason {
+            ReasonCode::TsaRootNotTrusted => Self::CryptographicallyConsistent,
+            ReasonCode::TsaChainIncomplete => Self::Incomplete,
+            ReasonCode::BitcoinBlockNotChecked => Self::NotChecked,
+            ReasonCode::BitcoinBlockUnavailable => Self::Unavailable,
+            ReasonCode::BitcoinSingleSourceOnly => Self::Uncorroborated,
+            ReasonCode::BitcoinProvidersDisagree => Self::Contested,
+            // Four shapes of "this build cannot evaluate it": an
+            // unimplemented hash for the imprint, an unimplemented signature
+            // or key algorithm for the CMS signature or for a certificate on
+            // the path, and the EKU check that never ran because no signer
+            // could be established for it to run against.
+            ReasonCode::TsaImprintIndeterminate
+            | ReasonCode::CmsSignatureIndeterminate
+            | ReasonCode::TsaChainIndeterminate
+            | ReasonCode::TsaTimestampingEkuNotChecked => Self::Unevaluable,
+
+            // Everything below is either a refutation or a receipt-/batch-
+            // level aggregate, and none of them reaches this function: a
+            // refuted anchor gets `Refuted` straight from
+            // [`AnchorVerdict::state`], and the aggregates never appear on an
+            // anchor at all. They are enumerated rather than swept up by a
+            // wildcard so the exhaustiveness above is real.
+            //
+            // The answer for them is the weakest honest one -- "not
+            // resolved, read the reason code" -- because inferring a
+            // refutation from an `Untrusted` verdict would assert on this
+            // side of the code exactly the thing the verdict declined to
+            // assert on the other.
+            ReasonCode::FileHashMismatch
+            | ReasonCode::InclusionProofInvalid
+            | ReasonCode::SuperInclusionProofInvalid
+            | ReasonCode::SuperConsistencyProofInvalid
+            | ReasonCode::CheckpointRootHashMismatch
+            | ReasonCode::CheckpointTreeSizeMismatch
+            | ReasonCode::CheckpointSignatureInvalid
+            | ReasonCode::MetadataHashMismatch
+            | ReasonCode::ReceiptMalformed
+            | ReasonCode::ReceiptVerificationFailed
+            | ReasonCode::AnchorTargetInvalid
+            | ReasonCode::AnchorHashMalformed
+            | ReasonCode::AnchorTargetHashMismatch
+            | ReasonCode::TsaTokenUnparsable
+            | ReasonCode::TsaImprintMismatch
+            | ReasonCode::TsaImprintMalformed
+            | ReasonCode::CmsSignatureInvalid
+            | ReasonCode::TsaTimestampingEkuInvalid
+            | ReasonCode::TsaChainInvalidAtGenTime
+            | ReasonCode::SuperProofMissing
+            | ReasonCode::BitcoinOtsProofInvalid
+            | ReasonCode::BitcoinMerkleRootMismatch
+            | ReasonCode::ReceiptUnanchored
+            | ReasonCode::BatchItemsInvalid
+            | ReasonCode::BatchItemsErrored
+            | ReasonCode::BatchItemsUntrusted
+            | ReasonCode::BatchItemsUnanchored
+            | ReasonCode::BatchItemsUnmatched
+            | ReasonCode::BatchNothingVerified
+            | ReasonCode::LogConsistencyFailed => Self::Unresolved,
+        }
+    }
+
+    /// The stable wire string for this state.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::CryptographicallyConsistent => "cryptographically_consistent",
+            Self::Incomplete => "incomplete",
+            Self::NotChecked => "not_checked",
+            Self::Unavailable => "unavailable",
+            Self::Uncorroborated => "uncorroborated",
+            Self::Contested => "contested",
+            Self::Unevaluable => "unevaluable",
+            Self::Refuted => "refuted",
+            Self::Unresolved => "unresolved",
+        }
+    }
+}
+
+impl std::fmt::Display for AnchorState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -86,9 +352,9 @@ pub struct AnchorVerificationResult {
     ///
     /// Only treat it as an established time when [`Self::verdict`] is
     /// [`AnchorVerdict::Valid`]; the renderers emit it under a `claimed_*`
-    /// name otherwise. For a `bitcoin_ots` anchor it is the confirming
-    /// block's time, and is left `None` unless a block was actually fetched
-    /// and matched.
+    /// name otherwise. For a `bitcoin_ots` anchor it is the time of the
+    /// header the sources agreed on, and is left `None` unless a
+    /// corroborated header was obtained and matched.
     pub timestamp_nanos: Option<u64>,
     /// Human-readable elaboration. Never load-bearing: branch on
     /// [`Self::verdict`], not on this text.
@@ -98,10 +364,18 @@ pub struct AnchorVerificationResult {
 }
 
 impl AnchorVerificationResult {
-    /// `true` only when this anchor is fully accepted.
+    /// `true` only when this anchor is a **verified anchor** in the ATL v2.0
+    /// §5.5 sense: cryptographic facts checked *and* a caller-supplied trust
+    /// root reached. See [`AnchorState::Verified`].
     #[must_use]
     pub const fn verified(&self) -> bool {
         self.verdict.is_valid()
+    }
+
+    /// This anchor's state, derived from its verdict.
+    #[must_use]
+    pub const fn state(&self) -> AnchorState {
+        self.verdict.state()
     }
 }
 
@@ -149,21 +423,58 @@ pub enum AnchorDetails {
         revocation: Revocation,
     },
     /// Bitcoin OpenTimestamps anchor facts.
+    ///
+    /// # What "the block" means here, exactly
+    ///
+    /// This tool does not observe the Bitcoin network. It queries
+    /// block-explorer HTTP APIs and reads a block header out of their JSON.
+    /// It validates no proof of work, follows no chain of headers, and has
+    /// no independent way to know that what an endpoint returned is what
+    /// Bitcoin contains. Every field below is therefore *what named sources
+    /// reported*, and [`Self::Bitcoin::block_sources`] names them.
+    ///
+    /// Saying more than that — "observed on-chain", "confirmed against the
+    /// blockchain" — was a claim about work this tool has never done, and
+    /// the wording throughout this crate was corrected accordingly.
     Bitcoin {
-        /// Block height named by the earliest attestation.
+        /// Block height **claimed** by the earliest attestation in the OTS
+        /// proof, as read out of the receipt.
+        ///
+        /// Not an established fact until a block at that height has actually
+        /// been fetched and its Merkle root matched (`merkle_match ==
+        /// Some(true)`). Until then it is the receipt's own assertion about
+        /// where in the chain this anchor lands, and the renderers publish
+        /// it under a `claimed_` name — the same rule the RFC 3161 `genTime`
+        /// follows.
         block_height: u64,
-        /// Block time in seconds, or `0` when no block was fetched.
-        block_timestamp_secs: u64,
+        /// Block time in seconds, or `None` when no block was fetched.
+        ///
+        /// `Option`, not a `0` sentinel. As a `u64` it defaulted to `0` for
+        /// an unfetched block and was rendered as
+        /// `block_timestamp: "1970-01-01T00:00:00Z"` — a machine-parsable
+        /// value that looks like a real timestamp, published for a check
+        /// that never ran. That is worse than no field at all.
+        block_timestamp_secs: Option<u64>,
         /// The anchor's `target_hash`, as written in the receipt.
         target_hash: String,
         /// Number of hash operations in the OTS Merkle path.
         operation_count: usize,
         /// Merkle root computed from the OTS proof (`sha256:` prefixed).
         computed_root: String,
-        /// The real block's Merkle root, or `None` if no block was fetched.
+        /// The Merkle root the sources report for that block, or `None` when
+        /// no single agreed header was obtained.
         block_merkle_root: Option<String>,
-        /// Whether the two roots match, or `None` if no block was fetched.
+        /// Whether the two roots match, or `None` if no single agreed header
+        /// was obtained (no source answered, or the sources contradicted
+        /// each other).
         merkle_match: Option<bool>,
+        /// Every block-explorer API that answered, and what each reported.
+        ///
+        /// Always published, never summarised away. When the sources agree
+        /// the entries are identical and the list is simply an attribution —
+        /// *these* endpoints said so. When they disagree the list is the
+        /// finding itself, and the only place a user can see it.
+        block_sources: Vec<BlockSourceReport>,
     },
     /// The anchor was rejected before any fact set could be established.
     Unknown,
@@ -744,7 +1055,7 @@ pub fn prepare_bitcoin_ots(
 ///
 /// A structurally sound OTS proof whose block was never fetched is
 /// [`AnchorVerdict::Untrusted`], not `Valid`: the proof's computed Merkle
-/// root has not been compared against any real block, so nothing external
+/// root has not been compared against any block header, so nothing external
 /// corroborates it yet. Reporting it as accepted would be the same silent
 /// overclaim as printing `mode: online` without going online.
 pub fn verify_bitcoin_ots_offline(
@@ -763,18 +1074,19 @@ pub fn verify_bitcoin_ots_offline(
         verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinBlockNotChecked),
         timestamp_nanos: None,
         error: Some(
-            "Bitcoin block not fetched: the OTS proof's merkle root was not confirmed against \
-             the blockchain (re-run with network access)"
+            "Bitcoin block not fetched: the OTS proof's merkle root was not compared against \
+             any block header (re-run with network access)"
                 .to_string(),
         ),
         details: AnchorDetails::Bitcoin {
             block_height: prepared.attestation.block_height,
-            block_timestamp_secs: 0,
+            block_timestamp_secs: None,
             target_hash: target_hash.to_string(),
             operation_count: prepared.operation_count,
             computed_root: prepared.computed_root,
             block_merkle_root: None,
             merkle_match: None,
+            block_sources: Vec::new(),
         },
     }
 }

@@ -72,9 +72,13 @@ fn run(
         "verify".to_string(),
         source.to_string_lossy().into_owned(),
         receipt.to_string_lossy().into_owned(),
-        "--offline".to_string(),
         "--json".to_string(),
     ];
+    // `--offline` by default, so no test contacts the network -- but a test
+    // that asks for `--online` gets it, since the two conflict.
+    if !extra.contains(&"--online") {
+        args.push("--offline".to_string());
+    }
     args.extend(extra.iter().map(|s| (*s).to_string()));
 
     let output = Command::cargo_bin("atl-cli")
@@ -131,34 +135,36 @@ fn an_unparsable_receipt_exits_2_in_both_modes() {
     assert_eq!(batch_status.as_deref(), Some("error"));
 }
 
-/// **Blocker regression.** A Receipt-Lite carries no anchors, so it makes no
-/// external-time claim. Both modes must say `pending`; the batch must not
-/// promote it to `valid` by folding it into the valid count.
+/// **ATL v2.0 §5.5, in both modes.** A Receipt-Lite carries no anchors, so
+/// it has no verified anchor, and "a receipt without any verified anchors
+/// SHOULD be treated as untrustworthy". Both modes say `untrusted` and both
+/// exit 3 -- the batch must neither promote it to `valid` nor keep the old
+/// exit-0 `pending`.
 #[test]
-fn an_unanchored_receipt_is_pending_in_both_modes() {
+fn an_unanchored_receipt_is_untrusted_in_both_modes() {
     let p = pair("testfile.txt", "receipt-lite.atl", None);
 
     let (single_code, single_status) = single(&p, &[]);
     let (batch_code, batch_status) = batch(&p, &[]);
 
-    assert_eq!(single_status.as_deref(), Some("pending"));
+    assert_eq!(single_status.as_deref(), Some("untrusted"));
     assert_eq!(
         batch_status.as_deref(),
-        Some("pending"),
+        Some("untrusted"),
         "a batch of unanchored receipts is not an accepted batch"
     );
     assert_ne!(
         batch_status.as_deref(),
         Some("valid"),
-        "`valid` means every anchor reached a trust root; this receipt has no anchors"
+        "`valid` means the anchor quorum was met; this receipt has no anchors"
     );
-    // The documented Receipt-Lite decision: exit 0 in both modes.
-    assert_eq!(single_code, 0);
-    assert_eq!(batch_code, 0);
+    assert_eq!(single_code, 3);
+    assert_eq!(batch_code, 3);
 }
 
-/// The `pending` count must be visible in its own right, not hidden inside
-/// `valid`.
+/// The unanchored count must be visible in its own right, neither hidden
+/// inside `valid` nor merged into the general untrusted count: no trust
+/// material a caller could supply would change it.
 #[test]
 fn an_unanchored_receipt_is_counted_in_its_own_bucket() {
     let p = pair("testfile.txt", "receipt-lite.atl", None);
@@ -176,13 +182,14 @@ fn an_unanchored_receipt_is_counted_in_its_own_bucket() {
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
 
-    assert_eq!(json["summary"]["pending"], 1);
+    assert_eq!(json["summary"]["unanchored"], 1);
     assert_eq!(
         json["summary"]["valid"], 0,
         "an unanchored receipt must not be counted as accepted"
     );
+    assert_eq!(json["summary"]["untrusted"], 0);
     assert_eq!(json["summary"]["total"], 1);
-    assert_eq!(json["reason_code"], "batch_items_pending");
+    assert_eq!(json["reason_code"], "batch_items_unanchored");
 }
 
 /// An anchored receipt with no trust material is `untrusted` in both modes,
@@ -231,6 +238,125 @@ fn a_fully_verified_receipt_agrees_across_modes_and_still_succeeds() {
         "success must remain reachable in single mode"
     );
     assert_eq!(batch_code, 0, "success must remain reachable in batch mode");
+}
+
+/// A failure to settle the verification mode must not discard a verdict
+/// already reached — and must not reach a different one in each mode.
+///
+/// `execute_single` used to call `determine_mode_for_receipt(...)?` *after*
+/// the offline pass. A refuted receipt verified with `--online` while the
+/// connectivity probe failed therefore exited 2 with no output at all, while
+/// the very same file verified as a directory printed its summary and exited
+/// with the refutation code. The refutation was already in hand both times,
+/// and only the calling convention decided whether it survived.
+///
+/// Connectivity is made to fail without touching the network: the probe
+/// builds a `reqwest` client, which honours the proxy environment, so
+/// pointing every proxy variable at a closed local port refuses all three
+/// probe requests immediately. No test-only branch exists in the tool for
+/// this.
+mod mode_failure {
+    use super::{pair, Pair};
+    use assert_cmd::Command;
+
+    /// A port nothing listens on, so every probe request is refused at once.
+    const DEAD_PROXY: &str = "http://127.0.0.1:1";
+
+    fn run_online(source: &std::path::Path, receipt: &std::path::Path) -> (i32, Option<String>) {
+        let output = Command::cargo_bin("atl-cli")
+            .unwrap()
+            .env("ALL_PROXY", DEAD_PROXY)
+            .env("HTTP_PROXY", DEAD_PROXY)
+            .env("HTTPS_PROXY", DEAD_PROXY)
+            .env("http_proxy", DEAD_PROXY)
+            .env("https_proxy", DEAD_PROXY)
+            .args([
+                "verify",
+                source.to_str().unwrap(),
+                receipt.to_str().unwrap(),
+                "--json",
+                "--online",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        let code = output.status.code().unwrap();
+        let status = serde_json::from_slice::<serde_json::Value>(&output.stdout)
+            .ok()
+            .and_then(|j| j["status"].as_str().map(str::to_owned));
+        (code, status)
+    }
+
+    fn single(p: &Pair) -> (i32, Option<String>) {
+        run_online(&p.source, &p.receipt)
+    }
+
+    fn batch(p: &Pair) -> (i32, Option<String>) {
+        run_online(&p.source_dir, &p.receipt_dir)
+    }
+
+    /// `receipt-full.atl` carries a `bitcoin_ots` anchor, so `--online` has
+    /// something to require — and the source file is the wrong one, so the
+    /// receipt is refuted before the mode is ever settled.
+    #[test]
+    fn a_refutation_survives_a_mode_failure_in_both_modes() {
+        let p = pair("testfile2.txt", "receipt-full.atl", None);
+
+        let (single_code, single_status) = single(&p);
+        let (batch_code, batch_status) = batch(&p);
+
+        assert_eq!(
+            single_status.as_deref(),
+            Some("invalid"),
+            "the summary must still be printed, not thrown away"
+        );
+        assert_eq!(batch_status.as_deref(), Some("invalid"));
+        assert_eq!(
+            single_code, 1,
+            "the refutation must outrank the mode failure"
+        );
+        assert_eq!(batch_code, 1);
+    }
+
+    /// And a receipt nothing refutes still fails: the check the caller asked
+    /// for was not finished, so the run must not come out clean.
+    #[test]
+    fn a_mode_failure_never_yields_success() {
+        let p = pair("testfile.txt", "receipt-full.atl", None);
+
+        let (single_code, single_status) = single(&p);
+        let (batch_code, batch_status) = batch(&p);
+
+        assert_ne!(single_code, 0, "an unfinished check is never a success");
+        assert_ne!(batch_code, 0);
+        assert_eq!(single_code, batch_code, "and both modes must agree");
+        assert_eq!(single_status.as_deref(), Some("untrusted"));
+        assert_eq!(batch_status.as_deref(), Some("untrusted"));
+    }
+
+    /// The mode reported is the one that ran. A probe that never succeeded
+    /// means no network check happened, so `online` would be a claim about
+    /// work never done.
+    #[test]
+    fn a_failed_probe_never_reports_mode_online() {
+        let p = pair("testfile.txt", "receipt-full.atl", None);
+        let output = Command::cargo_bin("atl-cli")
+            .unwrap()
+            .env("ALL_PROXY", DEAD_PROXY)
+            .env("HTTPS_PROXY", DEAD_PROXY)
+            .args([
+                "verify",
+                p.source.to_str().unwrap(),
+                p.receipt.to_str().unwrap(),
+                "--json",
+                "--online",
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["mode"], "offline", "{json}");
+    }
 }
 
 /// "AAA Certificate Services" — the Comodo root this receipt's chain leads

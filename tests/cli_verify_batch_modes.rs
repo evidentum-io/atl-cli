@@ -104,7 +104,8 @@ fn unanchored_batch_reports_offline() {
     let dir = batch_dir("testfile.txt", "receipt-lite.atl");
     let json = run_batch(&dir, &["--online"]);
     assert_eq!(json["mode"], "offline");
-    assert_eq!(json["items"][0]["status"], "pending");
+    assert_eq!(json["items"][0]["status"], "untrusted");
+    assert_eq!(json["items"][0]["reason_code"], "receipt_unanchored");
 }
 
 /// A Bitcoin OTS anchor that was never confirmed against a block must be

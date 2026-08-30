@@ -50,7 +50,7 @@
 //!   with the receipt's root at all;
 //! - `TimestampingEku::NotChecked` — no signer certificate could be
 //!   established, so its EKU was never examined;
-//! - a `bitcoin_ots` anchor whose confirming block was not fetched
+//! - a `bitcoin_ots` anchor whose block header was not fetched
 //!   (`BitcoinBlockNotChecked`) or could not be fetched
 //!   (`BitcoinBlockUnavailable`).
 //!
@@ -60,9 +60,27 @@
 //! an intermediate certificate would send them after something that does not
 //! exist. What unites every case is that nothing was refuted.
 //!
-//! [`Status::Pending`] is a receipt with no anchors at all (Receipt-Lite).
+//! A receipt with **no anchors at all** (Receipt-Lite) is
+//! [`Status::Untrusted`] with reason [`ReasonCode::ReceiptUnanchored`].
+//! ATL v2.0 §5.5 is explicit: "At least one anchor MUST be verified to
+//! establish trust in the receipt", and "A receipt without any verified
+//! anchors SHOULD be treated as untrustworthy". A receipt carrying no
+//! anchors has zero verified anchors by definition, so it cannot be a
+//! successful terminal outcome of `verify`. It used to exit 0 under the word
+//! `pending`, which accepted precisely what §5.5 says to treat as
+//! untrustworthy.
 //!
-//! [`Status::Valid`] is acceptance.
+//! "Pending" survives as a *description* of the receipt's state — it is
+//! genuinely not yet anchored, and the prose and the `anchor_status` field
+//! still say so — but it is no longer a status and no longer exit 0.
+//!
+//! [`Status::Valid`] is acceptance. Acceptance is relative to the anchor
+//! policy in force ([`crate::verify::policy::AnchorPolicy`]): under the
+//! default every anchor the receipt presents must be verified; under
+//! `--allow-single-anchor` one is enough. A `Valid` reached under the
+//! relaxed policy while some anchor went unresolved is still `Valid`, and
+//! every renderer is required to say on what terms — see
+//! [`crate::verify::policy::TrustAssessment::accepted_with_gaps`].
 //!
 //! # `PathStatus::Incomplete` and `chain_valid_at_gen_time`
 //!
@@ -147,7 +165,8 @@ pub enum ReasonCode {
     /// The OTS proof itself is malformed or does not start from the
     /// expected hash.
     BitcoinOtsProofInvalid,
-    /// The OTS proof's computed Merkle root does not match the real block's.
+    /// The OTS proof's computed Merkle root does not match the one that two
+    /// or more of the configured block-explorer APIs report for that block.
     BitcoinMerkleRootMismatch,
 
     // --- Nothing refuted, check not finished (Untrusted) ---
@@ -189,15 +208,45 @@ pub enum ReasonCode {
     /// does not necessarily help; see the anchor's `error` text for what
     /// actually stopped the check.
     TsaChainIndeterminate,
-    /// The OTS proof is structurally sound but no Bitcoin block was fetched,
-    /// so its Merkle root was never confirmed against the chain.
+    /// The OTS proof is structurally sound but no block header was fetched,
+    /// so its Merkle root was never compared against one.
     BitcoinBlockNotChecked,
     /// A Bitcoin block lookup was attempted and failed (network/API error),
     /// so the anchor could not be confirmed either way.
     BitcoinBlockUnavailable,
+    /// The block-explorer APIs queried for this block **contradicted each
+    /// other** about its header.
+    ///
+    /// Emphatically not a refutation. Nothing about the receipt was shown to
+    /// be false: the sources this verifier depends on disagree, so there is
+    /// no established header to compare the OTS proof against. Refuting
+    /// evidence on the strength of a source conflict would let a single
+    /// wrong or compromised API turn sound evidence into an accusation.
+    ///
+    /// It is nonetheless an event the user must see — it can mean a chain
+    /// fork, a stale index, or a compromised endpoint — so the conflicting
+    /// reports are published per source rather than summarised away.
+    BitcoinProvidersDisagree,
+    /// Only one block-explorer API answered, so its report of the block
+    /// header is uncorroborated.
+    ///
+    /// A single source decides nothing here, in either direction. It cannot
+    /// make the anchor `verified`, because one endpoint's word is not proof
+    /// of what Bitcoin contains; and it cannot make the receipt `invalid`
+    /// either, for exactly the same reason — a fact that is not established
+    /// cannot be established as false.
+    BitcoinSingleSourceOnly,
 
     // --- Receipt-level aggregates ---
-    /// The receipt carries no anchors at all (Receipt-Lite).
+    /// The receipt carries no anchors at all (Receipt-Lite), so it has zero
+    /// **verified anchors** and ATL v2.0 §5.5's floor is not met.
+    ///
+    /// Maps to [`Status::Untrusted`] and exit code 3. It is not a
+    /// refutation: the receipt's proofs may be entirely sound, and nothing
+    /// about it has been shown false. What is absent is any external
+    /// attestation that the entry existed at a point in time — which is the
+    /// whole claim an ATL receipt is for. §5.5: "A receipt without any
+    /// verified anchors SHOULD be treated as untrustworthy."
     ReceiptUnanchored,
     /// At least one batch item was refuted.
     BatchItemsInvalid,
@@ -219,15 +268,13 @@ pub enum ReasonCode {
     /// performed. See that item's own reason code for which.
     BatchItemsUntrusted,
     /// At least one batch item carries no anchors at all (Receipt-Lite), so
-    /// the batch as a whole makes no external-time claim.
+    /// the batch as a whole contains a receipt with zero verified anchors.
     ///
-    /// Never folded into the valid count: [`Status::Valid`] is defined as
-    /// "every anchor reached a configured trust root", and an item with no
-    /// anchors has no such anchor to reach one. A batch of Receipt-Lites
-    /// reported `valid` while single-file mode called the very same receipt
-    /// `pending` — the same word changing meaning with the calling
-    /// convention.
-    BatchItemsPending,
+    /// [`Status::Untrusted`], exit code 3 — the same answer single-file mode
+    /// gives for the same receipt, for the same ATL v2.0 §5.5 reason. It was
+    /// `pending` and exit 0 on both paths until that was recognised as
+    /// accepting what §5.5 says to treat as untrustworthy.
+    BatchItemsUnanchored,
     /// At least one path the caller named was never verified at all: a
     /// source file with no matching receipt, or a receipt with no matching
     /// source file.
@@ -283,10 +330,12 @@ impl ReasonCode {
             Self::TsaChainIndeterminate => "tsa_chain_indeterminate",
             Self::BitcoinBlockNotChecked => "bitcoin_block_not_checked",
             Self::BitcoinBlockUnavailable => "bitcoin_block_unavailable",
+            Self::BitcoinProvidersDisagree => "bitcoin_providers_disagree",
+            Self::BitcoinSingleSourceOnly => "bitcoin_single_source_only",
             Self::ReceiptUnanchored => "receipt_unanchored",
             Self::BatchItemsInvalid => "batch_items_invalid",
             Self::BatchItemsUntrusted => "batch_items_untrusted",
-            Self::BatchItemsPending => "batch_items_pending",
+            Self::BatchItemsUnanchored => "batch_items_unanchored",
             Self::BatchItemsUnmatched => "batch_items_unmatched",
             Self::BatchNothingVerified => "batch_nothing_verified",
             Self::BatchItemsErrored => "batch_items_errored",
@@ -301,30 +350,36 @@ impl std::fmt::Display for ReasonCode {
     }
 }
 
-/// The five terminal states a verification can end in.
+/// The four terminal states a verification can end in.
 ///
 /// Ordered by severity so aggregation over a batch is a `max`: a refutation
 /// outranks a runtime failure, which outranks an unfinished check, which
-/// outranks an unanchored receipt, which outranks acceptance.
+/// outranks acceptance.
 ///
 /// `Error` is deliberately *below* `Invalid`. A neighbouring file that could
 /// not be opened must never conceal a receipt that was checked and refuted —
 /// the same refutations-before-inabilities rule that governs every other
 /// aggregate in this crate.
+///
+/// There is no `Pending`. A receipt with no anchors is `Untrusted`, for the
+/// ATL v2.0 §5.5 reason given in the module docs; keeping a separate
+/// exit-0 word for it was how this tool accepted receipts the specification
+/// says to treat as untrustworthy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Status {
-    /// Accepted: every fact holds and every anchor reached a configured
-    /// trust root.
+    /// Accepted: every fact holds and the anchor policy in force is
+    /// satisfied. Under the default policy that means every anchor the
+    /// receipt presents reached a caller-supplied trust root; under
+    /// `--allow-single-anchor` it means at least one did.
     Valid,
-    /// No anchors at all (Receipt-Lite). The proofs may still be sound; the
-    /// receipt simply makes no external-time claim.
-    Pending,
-    /// Not refuted, not accepted. Either material is missing on the
-    /// verifier's side (an untrusted terminal root, an incomplete
-    /// certificate path, an unfetched Bitcoin block) **or** a fact could not
-    /// be evaluated at all (an imprint, CMS signature or certificate
-    /// signature using cryptography this verifier does not implement). The
-    /// reason code says which; what unites them is that nothing was refuted.
+    /// Not refuted, not accepted. Three shapes reach here: the receipt
+    /// presents no anchors at all (§5.5's floor cannot be met); material is
+    /// missing on the verifier's side (an untrusted terminal root, an
+    /// incomplete certificate path, an unfetched Bitcoin block); or a fact
+    /// could not be evaluated at all (an imprint, CMS signature or
+    /// certificate signature using cryptography this verifier does not
+    /// implement). The reason code says which; what unites them is that
+    /// nothing was refuted.
     Untrusted,
     /// Could not be processed: a file that would not open, or a receipt that
     /// would not parse. Not a statement about the evidence at all — the tool
@@ -346,7 +401,6 @@ impl Status {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Valid => "valid",
-            Self::Pending => "pending",
             Self::Untrusted => "untrusted",
             Self::Error => "error",
             Self::Invalid => "invalid",
@@ -357,15 +411,19 @@ impl Status {
     ///
     /// `Untrusted` gets its own code (3) precisely so a script can tell
     /// "this evidence is broken" (1) from "I could not finish checking it"
-    /// (3) without parsing JSON. Code 3 covers both missing trust material
-    /// and a check that could not be performed at all — read the reason code
-    /// before telling a user to go and supply something. `Error` is the
-    /// operational code (2): the tool failed to process an input, which says
-    /// nothing about the evidence. `Pending` keeps the historical code 0.
+    /// (3) without parsing JSON. Code 3 covers missing trust material, a
+    /// check that could not be performed at all, **and** a receipt with no
+    /// anchors — read the reason code before telling a user to go and supply
+    /// something. `Error` is the operational code (2): the tool failed to
+    /// process an input, which says nothing about the evidence.
+    ///
+    /// Exactly one status exits 0. That is the point: a caller who tests
+    /// `if atl-cli verify ...` is asking "was this evidence accepted", and
+    /// only `Valid` answers yes.
     #[must_use]
     pub const fn exit_code(self) -> ExitCode {
         match self {
-            Self::Valid | Self::Pending => ExitCode::Valid,
+            Self::Valid => ExitCode::Valid,
             Self::Untrusted => ExitCode::Untrusted,
             // Exit 2, exactly as single-file mode returns for the same
             // input. A retry system reading 1 as "the evidence is bad" and 2
@@ -419,11 +477,16 @@ impl ReceiptVerdict {
         }
     }
 
-    /// The unanchored (Receipt-Lite) verdict.
+    /// The verdict for a receipt carrying no anchors at all (Receipt-Lite).
+    ///
+    /// [`Status::Untrusted`], exit 3, reason `receipt_unanchored`. Named
+    /// separately from [`Self::untrusted`] so the call site reads as the
+    /// ATL v2.0 §5.5 rule it implements, and so nothing can quietly turn it
+    /// back into a success.
     #[must_use]
-    pub const fn pending() -> Self {
+    pub const fn unanchored() -> Self {
         Self {
-            status: Status::Pending,
+            status: Status::Untrusted,
             reason_code: Some(ReasonCode::ReceiptUnanchored),
         }
     }
@@ -439,8 +502,11 @@ impl ReceiptVerdict {
     }
 
     /// `true` only for [`Status::Valid`]. Nothing else — in particular not
-    /// [`Status::Untrusted`] — may ever be presented as a verified receipt.
+    /// [`Status::Untrusted`], which now covers the unanchored receipt too —
+    /// may ever be presented as a verified receipt.
     #[must_use]
+    #[allow(dead_code)] // exercised by unit tests; the runtime path reads
+                        // `status` directly
     pub const fn is_valid(self) -> bool {
         matches!(self.status, Status::Valid)
     }
@@ -467,10 +533,33 @@ mod tests {
         assert_eq!(verdict.status.as_str(), "untrusted");
     }
 
+    /// ATL v2.0 §5.5: "A receipt without any verified anchors SHOULD be
+    /// treated as untrustworthy." A Receipt-Lite has none, so it must not
+    /// be a successful outcome of `verify`.
+    #[test]
+    fn an_unanchored_receipt_is_untrusted_and_never_exits_zero() {
+        let verdict = ReceiptVerdict::unanchored();
+        assert_eq!(verdict.status, Status::Untrusted);
+        assert_eq!(verdict.status.as_str(), "untrusted");
+        assert_eq!(verdict.reason_code, Some(ReasonCode::ReceiptUnanchored));
+        assert!(!verdict.is_valid());
+        assert_eq!(verdict.exit_code(), ExitCode::Untrusted);
+        assert_eq!(verdict.exit_code().code(), 3);
+    }
+
+    /// Exactly one status may exit 0.
+    #[test]
+    fn only_valid_exits_zero() {
+        for status in [Status::Untrusted, Status::Error, Status::Invalid] {
+            assert_ne!(status.exit_code().code(), 0, "{status} must not exit 0");
+        }
+        assert_eq!(Status::Valid.exit_code().code(), 0);
+    }
+
     #[test]
     fn exit_codes_are_the_documented_ones() {
         assert_eq!(ReceiptVerdict::VALID.exit_code().code(), 0);
-        assert_eq!(ReceiptVerdict::pending().exit_code().code(), 0);
+        assert_eq!(ReceiptVerdict::unanchored().exit_code().code(), 3);
         assert_eq!(
             ReceiptVerdict::untrusted(ReasonCode::TsaChainIncomplete)
                 .exit_code()
@@ -489,8 +578,7 @@ mod tests {
     fn severity_ordering_makes_invalid_dominate() {
         assert!(Status::Invalid > Status::Error);
         assert!(Status::Error > Status::Untrusted);
-        assert!(Status::Untrusted > Status::Pending);
-        assert!(Status::Pending > Status::Valid);
+        assert!(Status::Untrusted > Status::Valid);
     }
 
     /// A runtime failure exits 2 in every mode, and never claims the
@@ -539,10 +627,12 @@ mod tests {
             ReasonCode::TsaChainIndeterminate,
             ReasonCode::BitcoinBlockNotChecked,
             ReasonCode::BitcoinBlockUnavailable,
+            ReasonCode::BitcoinProvidersDisagree,
+            ReasonCode::BitcoinSingleSourceOnly,
             ReasonCode::ReceiptUnanchored,
             ReasonCode::BatchItemsInvalid,
             ReasonCode::BatchItemsErrored,
-            ReasonCode::BatchItemsPending,
+            ReasonCode::BatchItemsUnanchored,
             ReasonCode::BatchItemsUnmatched,
             ReasonCode::BatchNothingVerified,
             ReasonCode::BatchItemsUntrusted,
