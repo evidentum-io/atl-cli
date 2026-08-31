@@ -609,16 +609,71 @@ struct AnchorResultJson {
     /// act on for a check that never ran.
     #[serde(skip_serializing_if = "Option::is_none")]
     block_timestamp: Option<String>,
-    /// The block height the OTS proof's earliest attestation **claims**,
-    /// emitted only when `verified` is `false`.
+    /// The block height the **OTS proof's** earliest Bitcoin attestation
+    /// carries, emitted only when `verified` is `false`.
     ///
-    /// It is read out of the receipt and is attacker-controlled until a
-    /// block at that height has been fetched and matched, so it carries the
-    /// same `claimed_` marking as an unverified anchor's `genTime`: useful
-    /// for diagnostics and for saying what was asserted, never admissible as
-    /// where in the chain this receipt landed.
+    /// Named for its claimant. It was `claimed_block_height`, which said
+    /// that *something* claimed it without saying what — and the prose
+    /// beside it attributed it to the receipt, which was simply wrong: the
+    /// receipt's own `bitcoin_block_height` was read nowhere in this crate
+    /// and is now published separately as `receipt_block_height`. Two
+    /// distinct assertions had one name between them, and the one that could
+    /// be attacked independently was invisible.
+    ///
+    /// Attacker-controlled until a block at that height has been fetched and
+    /// matched, so it keeps the un-established marking an unverified
+    /// anchor's `genTime` gets: never admissible as where in the chain this
+    /// receipt landed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    claimed_block_height: Option<u64>,
+    proof_block_height: Option<u64>,
+    /// Every block height the OTS proof attests to, in proof order.
+    ///
+    /// The evidence for `bitcoin_claimed_height_contradicts_proof`. A proof
+    /// may carry several Bitcoin attestations, and the receipt's claim holds
+    /// if it matches **any** of them (ATL v2.0 §5.5.2 step 5 says "match the
+    /// proof" and sets no rule preferring one attestation over another). A
+    /// reader told the claim matches nothing must be able to see this set,
+    /// or the finding cannot be checked.
+    ///
+    /// Empty — and so omitted — only when no attestation was read at all,
+    /// which means the anchor was rejected before its proof decoded.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    proof_block_heights: Vec<u64>,
+    /// The block height **the receipt itself states**, in its
+    /// `bitcoin_block_height` field.
+    ///
+    /// Emitted for every `bitcoin_ots` anchor, verified or not — and,
+    /// deliberately, for one rejected before its proof ever decoded. Those
+    /// are the anchors where a reader most wants to see what the receipt
+    /// asserted, and they used to publish nothing: the early rejections
+    /// built an `AnchorDetails::Unknown`, whose serialization drops every
+    /// Bitcoin field, so this documented promise was false exactly where it
+    /// mattered.
+    ///
+    /// It is the receipt's own assertion, checked against
+    /// `proof_block_heights` (ATL v2.0 §5.5.2 step 5); a claim matching none
+    /// of them is `bitcoin_claimed_height_contradicts_proof` — a refutation
+    /// reachable offline, since an OTS attestation carries the height in its
+    /// own bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_block_height: Option<u64>,
+    /// The block time **the receipt itself states**, in its
+    /// `bitcoin_block_time` field, verbatim.
+    ///
+    /// Verbatim rather than normalised: beside `claimed_time_check:
+    /// "unreadable"` the exact string is the finding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_block_time: Option<String>,
+    /// What became of that claimed time: `"matches"`, `"contradicted"`,
+    /// `"not_compared"` or `"unreadable"`.
+    ///
+    /// Four-valued because "compared and different" and "never compared" are
+    /// different findings and only the first refutes anything. The block
+    /// time is in no OTS proof, so offline — and whenever no corroborated
+    /// header was obtained — the value is `"not_compared"`, and the anchor
+    /// is untrusted for the reason it already was, never invalid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claimed_time_check: Option<&'static str>,
     /// The block time that named sources **reported**, for an anchor that is
     /// not verified — in practice, one refuted by
     /// `bitcoin_merkle_root_mismatch`.
@@ -860,6 +915,32 @@ fn format_timestamp_secs_iso(secs: u64) -> Option<String> {
         .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
+/// Every `bitcoin_ots` field of [`AnchorResultJson`], gathered before the
+/// object is assembled.
+///
+/// A named struct rather than a tuple: the fields are numbers and strings of
+/// the same shapes, several of them differ only in *whose claim they are*,
+/// and a positional tuple is how a value ends up published under a
+/// neighbour's name. [`Default`] supplies the all-absent case for an anchor
+/// that is not `bitcoin_ots`.
+#[derive(Default)]
+struct BitcoinJson {
+    block_height: Option<u64>,
+    block_timestamp: Option<String>,
+    proof_block_height: Option<u64>,
+    proof_block_heights: Vec<u64>,
+    reported_block_timestamp: Option<String>,
+    receipt_block_height: Option<u64>,
+    receipt_block_time: Option<String>,
+    claimed_time_check: Option<&'static str>,
+    target_hash: Option<String>,
+    operation_count: Option<usize>,
+    computed_root: Option<String>,
+    block_merkle_root: Option<String>,
+    merkle_match: Option<bool>,
+    block_sources: Vec<BlockSourceJson>,
+}
+
 /// Render one anchor's fact set.
 fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
     // Both of the anchor's numbers follow the same rule as the RFC 3161
@@ -870,9 +951,11 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
     // They are renamed differently, because they are different kinds of
     // not-established:
     //
-    // - the height is the *receipt's own assertion* about where in the chain
-    //   this anchor lands, read straight out of the OTS proof, so it becomes
-    //   `claimed_block_height`;
+    // - the height is the *OTS proof's* attestation about where in the chain
+    //   this anchor lands, so it becomes `proof_block_height`. The receipt's
+    //   own `bitcoin_block_height` is a separate assertion and travels under
+    //   `receipt_block_height`; this comment used to conflate the two and
+    //   name a field, `claimed_block_height`, that said neither;
     // - the time is *our observation* of a block we really did fetch, so it
     //   becomes `reported_block_timestamp`. Calling it "claimed" would be a
     //   second falsehood -- nobody claimed it, we asked and were told -- and
@@ -886,20 +969,13 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
     // `block_timestamp` under the plain name, beside `merkle_match: false`.
     // "Named sources reported this block" and "this block dates your
     // evidence" are the distinction this whole tool exists to keep.
-    let (
-        block_height,
-        block_timestamp,
-        claimed_block_height,
-        reported_block_timestamp,
-        target_hash,
-        operation_count,
-        computed_root,
-        block_merkle_root,
-        merkle_match,
-        block_sources,
-    ) = match &anchor.details {
+    let bitcoin = match &anchor.details {
         AnchorDetails::Bitcoin {
-            block_height,
+            proof_block_height,
+            proof_block_heights,
+            receipt_block_height,
+            receipt_block_time,
+            claimed_time_check,
             block_timestamp_secs,
             target_hash,
             operation_count,
@@ -910,17 +986,24 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
         } => {
             let established = anchor.verified();
             let block_time = block_timestamp_secs.and_then(format_timestamp_secs_iso);
-            (
-                established.then_some(*block_height),
-                established.then(|| block_time.clone()).flatten(),
-                (!established).then_some(*block_height),
-                (!established).then_some(block_time).flatten(),
-                Some(target_hash.clone()),
-                Some(*operation_count),
-                Some(computed_root.clone()),
-                block_merkle_root.clone(),
-                *merkle_match,
-                block_sources
+            BitcoinJson {
+                block_height: established.then_some(*proof_block_height).flatten(),
+                block_timestamp: established.then(|| block_time.clone()).flatten(),
+                proof_block_height: (!established).then_some(*proof_block_height).flatten(),
+                proof_block_heights: proof_block_heights.clone(),
+                reported_block_timestamp: (!established).then_some(block_time).flatten(),
+                // The receipt's own two assertions, published whatever the
+                // outcome: they are what step 5 checks, and a reader cannot
+                // audit that check without seeing them.
+                receipt_block_height: Some(*receipt_block_height),
+                receipt_block_time: Some(receipt_block_time.clone()),
+                claimed_time_check: Some(claimed_time_check.as_str()),
+                target_hash: Some(target_hash.clone()),
+                operation_count: *operation_count,
+                computed_root: computed_root.clone(),
+                block_merkle_root: block_merkle_root.clone(),
+                merkle_match: *merkle_match,
+                block_sources: block_sources
                     .iter()
                     .map(|r| BlockSourceJson {
                         source: r.source.clone(),
@@ -929,20 +1012,9 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
                         block_timestamp: format_timestamp_secs_iso(r.block_timestamp_secs),
                     })
                     .collect(),
-            )
+            }
         }
-        _ => (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Vec::new(),
-        ),
+        AnchorDetails::Rfc3161 { .. } | AnchorDetails::Unknown => BitcoinJson::default(),
     };
 
     let (
@@ -995,17 +1067,21 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
         timestamp: established_time.and_then(format_timestamp_iso),
         claimed_timestamp_nanos: claimed_time,
         claimed_timestamp: claimed_time.and_then(format_timestamp_iso),
-        block_height,
-        block_timestamp,
-        claimed_block_height,
-        reported_block_timestamp,
-        block_sources,
+        block_height: bitcoin.block_height,
+        block_timestamp: bitcoin.block_timestamp,
+        proof_block_height: bitcoin.proof_block_height,
+        proof_block_heights: bitcoin.proof_block_heights,
+        reported_block_timestamp: bitcoin.reported_block_timestamp,
+        receipt_block_height: bitcoin.receipt_block_height,
+        receipt_block_time: bitcoin.receipt_block_time,
+        claimed_time_check: bitcoin.claimed_time_check,
+        block_sources: bitcoin.block_sources,
         error: anchor.error.clone(),
-        target_hash,
-        operation_count,
-        computed_root,
-        block_merkle_root,
-        merkle_match,
+        target_hash: bitcoin.target_hash,
+        operation_count: bitcoin.operation_count,
+        computed_root: bitcoin.computed_root,
+        block_merkle_root: bitcoin.block_merkle_root,
+        merkle_match: bitcoin.merkle_match,
         trust_state: anchor.details.rfc3161_trust_state(),
         message_imprint,
         cms_signature,
@@ -1161,7 +1237,7 @@ struct UnresolvedAnchorJson {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::verify::anchor::{AnchorVerdict, BlockSourceReport};
+    use crate::verify::anchor::{AnchorVerdict, BlockSourceReport, ClaimedTimeCheck};
     use crate::verify::policy::AnchorPolicy;
     use atl_core::{PathStatus, Revocation, TerminalAnchor};
     use std::path::{Path, PathBuf};
@@ -1485,11 +1561,15 @@ mod tests {
             timestamp_nanos: None,
             error: Some("Merkle root mismatch: OTS proof does not match block 932897".to_string()),
             details: AnchorDetails::Bitcoin {
-                block_height: 932_897,
+                proof_block_height: Some(932_897),
+                proof_block_heights: vec![932_897],
+                receipt_block_height: 932_897,
+                receipt_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+                claimed_time_check: ClaimedTimeCheck::Matches,
                 block_timestamp_secs: Some(1_768_806_080),
                 target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
+                operation_count: Some(39),
+                computed_root: Some("sha256:def456".to_string()),
                 block_merkle_root: Some("sha256:999999".to_string()),
                 merkle_match: Some(false),
                 // Non-empty on purpose: a refutation is only reachable from
@@ -1523,11 +1603,15 @@ mod tests {
             timestamp_nanos: None,
             error: Some("block-explorer APIs disagree about block 932897".to_string()),
             details: AnchorDetails::Bitcoin {
-                block_height: 932_897,
+                proof_block_height: Some(932_897),
+                proof_block_heights: vec![932_897],
+                receipt_block_height: 932_897,
+                receipt_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+                claimed_time_check: ClaimedTimeCheck::Matches,
                 block_timestamp_secs: None,
                 target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
+                operation_count: Some(39),
+                computed_root: Some("sha256:def456".to_string()),
                 block_merkle_root: None,
                 merkle_match: None,
                 block_sources: reports,
@@ -1577,7 +1661,11 @@ mod tests {
         assert_eq!(sources[0]["merkle_root"], "b".repeat(64));
         assert_eq!(sources[1]["source"], "mempool.space");
         assert_eq!(sources[1]["merkle_root"], "c".repeat(64));
-        assert_eq!(json["claimed_block_height"], 932_897);
+        assert_eq!(json["proof_block_height"], 932_897);
+        // Both claimants, distinguishable. The receipt states a
+        // height of its own, and it used to be published nowhere.
+        assert_eq!(json["receipt_block_height"], 932_897);
+        assert_eq!(json["receipt_block_time"], "2026-01-19T07:01:20+00:00");
     }
 
     /// A conflict about nothing but the *time* must reach the JSON too. The
@@ -1611,11 +1699,15 @@ mod tests {
             timestamp_nanos: None,
             error: Some("only blockstream.info reported block 932897".to_string()),
             details: AnchorDetails::Bitcoin {
-                block_height: 932_897,
+                proof_block_height: Some(932_897),
+                proof_block_heights: vec![932_897],
+                receipt_block_height: 932_897,
+                receipt_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+                claimed_time_check: ClaimedTimeCheck::Matches,
                 block_timestamp_secs: None,
                 target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
+                operation_count: Some(39),
+                computed_root: Some("sha256:def456".to_string()),
                 block_merkle_root: None,
                 merkle_match: None,
                 block_sources: vec![source_report(
@@ -1642,7 +1734,11 @@ mod tests {
         }
         assert_eq!(json["block_sources"].as_array().map(Vec::len), Some(1));
         assert_eq!(json["block_sources"][0]["source"], "blockstream.info");
-        assert_eq!(json["claimed_block_height"], 932_897);
+        assert_eq!(json["proof_block_height"], 932_897);
+        // Both claimants, distinguishable. The receipt states a
+        // height of its own, and it used to be published nowhere.
+        assert_eq!(json["receipt_block_height"], 932_897);
+        assert_eq!(json["receipt_block_time"], "2026-01-19T07:01:20+00:00");
     }
 
     /// An anchor with no sources at all emits no `block_sources` key, rather
@@ -1656,11 +1752,15 @@ mod tests {
             timestamp_nanos: None,
             error: Some("no block-explorer API returned block 932897".to_string()),
             details: AnchorDetails::Bitcoin {
-                block_height: 932_897,
+                proof_block_height: Some(932_897),
+                proof_block_heights: vec![932_897],
+                receipt_block_height: 932_897,
+                receipt_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+                claimed_time_check: ClaimedTimeCheck::Matches,
                 block_timestamp_secs: None,
                 target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
+                operation_count: Some(39),
+                computed_root: Some("sha256:def456".to_string()),
                 block_merkle_root: None,
                 merkle_match: None,
                 block_sources: Vec::new(),
@@ -1701,7 +1801,11 @@ mod tests {
         // The observation itself is kept, under a name that says what it is.
         // Not `claimed_`: nobody asserted it, this run read it off the chain.
         assert_eq!(json["reported_block_timestamp"], "2026-01-19T07:01:20Z");
-        assert_eq!(json["claimed_block_height"], 932_897);
+        assert_eq!(json["proof_block_height"], 932_897);
+        // Both claimants, distinguishable. The receipt states a
+        // height of its own, and it used to be published nowhere.
+        assert_eq!(json["receipt_block_height"], 932_897);
+        assert_eq!(json["receipt_block_time"], "2026-01-19T07:01:20+00:00");
 
         // The three fields that keep their plain names, because each is
         // either a local computation or the evidence OF the refutation, and
@@ -1734,11 +1838,15 @@ mod tests {
             timestamp_nanos: Some(1_768_806_080_000_000_000),
             error: None,
             details: AnchorDetails::Bitcoin {
-                block_height: 932_897,
+                proof_block_height: Some(932_897),
+                proof_block_heights: vec![932_897],
+                receipt_block_height: 932_897,
+                receipt_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+                claimed_time_check: ClaimedTimeCheck::Matches,
                 block_timestamp_secs: Some(1_768_806_080),
                 target_hash: "sha256:abc123".to_string(),
-                operation_count: 39,
-                computed_root: "sha256:def456".to_string(),
+                operation_count: Some(39),
+                computed_root: Some("sha256:def456".to_string()),
                 block_merkle_root: Some("sha256:def456".to_string()),
                 merkle_match: Some(true),
                 block_sources: Vec::new(),

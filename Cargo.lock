@@ -104,10 +104,11 @@ dependencies = [
 
 [[package]]
 name = "atl-cli"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "assert_cmd",
  "atl-core",
+ "base64",
  "chrono",
  "clap",
  "colored",
@@ -129,9 +130,9 @@ dependencies = [
 
 [[package]]
 name = "atl-core"
-version = "0.26.0"
+version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d334f7daf6e2dc7ec2af90a29014899651cba41365bf69d38955c36a4cee914"
+checksum = "02268d0554aa0d9946bf7cc1dab624eb2ab436cce0b33277f68d3e3a9eb7322f"
 dependencies = [
  "base64",
  "bitcoin_hashes",

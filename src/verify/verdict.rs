@@ -168,6 +168,32 @@ pub enum ReasonCode {
     /// The OTS proof's computed Merkle root does not match the one that two
     /// or more of the configured block-explorer APIs report for that block.
     BitcoinMerkleRootMismatch,
+    /// The `bitcoin_block_height` the receipt states is not the height the
+    /// receipt's own OTS proof attests to (ATL v2.0 §5.5.2 step 5).
+    ///
+    /// A refutation, and one that needs no network: an `OpenTimestamps`
+    /// Bitcoin attestation carries the height in its own bytes, so the two
+    /// numbers can be compared by pure computation. Until this check
+    /// existed, a receipt could announce block 900000 while carrying a proof
+    /// that attests to 932897 and nothing would notice — the tool simply
+    /// republished the receipt's assertion.
+    ///
+    /// Deliberately not `bitcoin_merkle_root_mismatch`: nothing here was
+    /// compared against a block. What was compared is the receipt against
+    /// its own evidence.
+    BitcoinClaimedHeightContradictsProof,
+    /// The `bitcoin_block_time` the receipt states is not the time of the
+    /// block header two or more configured sources agree on (ATL v2.0
+    /// §5.5.2 step 5).
+    ///
+    /// A refutation, and — unlike the height — one that is only ever reached
+    /// online: the block time appears nowhere in an OTS proof, so it can be
+    /// compared only against a header that was actually obtained. Offline,
+    /// and whenever no corroborated header was obtained, the comparison does
+    /// not happen and nothing is refuted on this ground; that state is
+    /// reported by the anchor's own `claimed_time_check`, never by this
+    /// code.
+    BitcoinClaimedTimeContradictsBlock,
 
     // --- Nothing refuted, check not finished (Untrusted) ---
     //
@@ -236,6 +262,21 @@ pub enum ReasonCode {
     /// either, for exactly the same reason — a fact that is not established
     /// cannot be established as false.
     BitcoinSingleSourceOnly,
+    /// The receipt's own `bitcoin_block_time` could not be read as a
+    /// timestamp by this build, so ATL v2.0 §5.5.2 step 5's time half could
+    /// not be carried out.
+    ///
+    /// An inability, not a refutation, and the distinction is the whole
+    /// point: ISO 8601 admits forms this verifier does not parse, so a
+    /// string this build cannot read is evidence about this build's parser
+    /// first. Refuting a receipt on the strength of it would assert a
+    /// comparison that never ran — exactly what the `claimed_` naming and
+    /// the three-valued fact types elsewhere in this crate exist to prevent.
+    ///
+    /// It still costs the anchor its `Valid`: a step the specification
+    /// requires was not performed, so the anchor is `untrusted` rather than
+    /// accepted.
+    BitcoinClaimedTimeUnreadable,
 
     // --- Receipt-level aggregates ---
     /// The receipt carries no anchors at all (Receipt-Lite), so it has zero
@@ -323,6 +364,10 @@ impl ReasonCode {
             Self::SuperProofMissing => "super_proof_missing",
             Self::BitcoinOtsProofInvalid => "bitcoin_ots_proof_invalid",
             Self::BitcoinMerkleRootMismatch => "bitcoin_merkle_root_mismatch",
+            Self::BitcoinClaimedHeightContradictsProof => {
+                "bitcoin_claimed_height_contradicts_proof"
+            }
+            Self::BitcoinClaimedTimeContradictsBlock => "bitcoin_claimed_time_contradicts_block",
             Self::TsaRootNotTrusted => "tsa_root_not_trusted",
             Self::TsaChainIncomplete => "tsa_chain_incomplete",
             Self::TsaImprintIndeterminate => "tsa_imprint_indeterminate",
@@ -332,6 +377,7 @@ impl ReasonCode {
             Self::BitcoinBlockUnavailable => "bitcoin_block_unavailable",
             Self::BitcoinProvidersDisagree => "bitcoin_providers_disagree",
             Self::BitcoinSingleSourceOnly => "bitcoin_single_source_only",
+            Self::BitcoinClaimedTimeUnreadable => "bitcoin_claimed_time_unreadable",
             Self::ReceiptUnanchored => "receipt_unanchored",
             Self::BatchItemsInvalid => "batch_items_invalid",
             Self::BatchItemsUntrusted => "batch_items_untrusted",

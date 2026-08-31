@@ -13,6 +13,7 @@ use colored::Colorize;
 use crate::error::CliResult;
 use crate::verify::anchor::{
     sources_agree, AnchorDetails, AnchorVerdict, AnchorVerificationResult, BlockSourceReport,
+    ClaimedTimeCheck,
 };
 use crate::verify::batch::{BatchItemResult, BatchVerificationResult};
 use crate::verify::consistency::{ConsistencyResult, CrossCheck};
@@ -242,6 +243,12 @@ pub fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
         Some(ReasonCode::BitcoinSingleSourceOnly) => {
             "NOT VERIFIED: only one block-explorer API answered, so its report is uncorroborated"
         }
+        // Also not about trust material: the obstacle is a timestamp string
+        // this build's parser cannot read, and no certificate touches it.
+        Some(ReasonCode::BitcoinClaimedTimeUnreadable) => {
+            "NOT VERIFIED: the receipt's own Bitcoin block time could not be read, so it was \
+             not compared"
+        }
         _ => "NOT VERIFIED: trust root unavailable",
     }
 }
@@ -399,6 +406,12 @@ fn print_trust_hint(result: &SingleVerificationResult) {
                  contains, so the OTS proof was not compared against it. Re-run when more\n    \
                  than one provider is reachable; no certificate is involved."
             ),
+            ReasonCode::BitcoinClaimedTimeUnreadable => println!(
+                "  - The receipt's own bitcoin_block_time could not be read as a timestamp by\n    \
+                 this build, so ATL v2.0 §5.5.2 step 5 could not compare it with the block\n    \
+                 header. This is a limitation of this verifier, NOT a finding about your\n    \
+                 receipt: nothing about it was refuted. No certificate is involved."
+            ),
             other => println!("  - Missing trust material ({}).", other.as_str()),
         }
     }
@@ -471,9 +484,10 @@ fn block_sources_lines(sources: &[BlockSourceReport]) -> Vec<String> {
 /// network access, and a rendering nobody can test offline is a rendering
 /// nobody checks.
 ///
-/// The height is the receipt's own claim until a block at it has been
+/// The height is the **OTS proof's** claim until a block at it has been
 /// fetched *and* matched, so it is labelled as such — the same rule the RFC
-/// 3161 `genTime` follows. A time is printed only when a block was actually
+/// 3161 `genTime` follows. What the *receipt* states is a separate assertion
+/// and gets its own line, from [`receipt_claim_lines`]. A time is printed only when a block was actually
 /// fetched; `block_timestamp_secs` is an `Option`, so there is no zero to
 /// fall back on and nothing can render as 1970.
 ///
@@ -496,6 +510,73 @@ fn bitcoin_block_line(
         ),
         (false, None) => format!("Block #{block_height} (claimed by the proof, not confirmed)"),
     }
+}
+
+/// What the *receipt itself* states about its Bitcoin anchor, and what came
+/// of checking it (ATL v2.0 §5.5.2 step 5).
+///
+/// A separate line from [`bitcoin_block_line`] because it reports a separate
+/// claimant. The proof says one height; the receipt says another; until
+/// these lines existed the receipt's two fields were never read at all, so a
+/// receipt could announce any block it liked and the output would print the
+/// proof's block beside it without comment.
+///
+/// Each outcome is worded for what actually happened. "Not compared" is
+/// never dressed up as agreement, and a contradiction is never softened:
+/// those two mistakes in opposite directions are the ones this whole
+/// taxonomy exists to prevent.
+fn receipt_claim_lines(
+    receipt_block_height: u64,
+    proof_block_heights: &[u64],
+    receipt_block_time: &str,
+    claimed_time_check: ClaimedTimeCheck,
+) -> Vec<String> {
+    // The claim holds if the proof attests to that block at all -- see
+    // `atl_core::ots::attestation_for_claimed_height` for why "any", not
+    // "the earliest". With nothing decoded there is nothing to compare, and
+    // the line says that rather than implying a contradiction.
+    let height = if proof_block_heights.is_empty() {
+        format!(
+            "        Receipt states:    block #{receipt_block_height} (NOT compared: no \
+             attestation was read from the proof)"
+        )
+    } else if proof_block_heights.contains(&receipt_block_height) {
+        format!(
+            "        Receipt states:    block #{receipt_block_height} (attested by the OTS proof)"
+        )
+    } else {
+        let attested = proof_block_heights
+            .iter()
+            .map(|h| format!("#{h}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "        Receipt states:    block #{receipt_block_height} -- CONTRADICTED by the \
+             receipt's own OTS proof, which attests to {attested}"
+        )
+    };
+
+    let time = match claimed_time_check {
+        ClaimedTimeCheck::Matches => format!(
+            "        Receipt states:    block time {receipt_block_time} (agrees with the header \
+             the sources below report)"
+        ),
+        ClaimedTimeCheck::Contradicted => format!(
+            "        Receipt states:    block time {receipt_block_time} -- CONTRADICTED by the \
+             header the sources below report"
+        ),
+        ClaimedTimeCheck::NotCompared => format!(
+            "        Receipt states:    block time {receipt_block_time} (NOT compared: no block \
+             header was obtained, and no OTS proof carries a block time)"
+        ),
+        ClaimedTimeCheck::Unreadable => format!(
+            "        Receipt states:    block time {receipt_block_time} (NOT compared: this \
+             build could not read it as a timestamp -- a limit of this verifier, not a finding \
+             about the receipt)"
+        ),
+    };
+
+    vec![height, time]
 }
 
 /// Print the per-anchor section, if the receipt has anchors.
@@ -621,7 +702,11 @@ fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
             }
         }
         AnchorDetails::Bitcoin {
-            block_height,
+            proof_block_height,
+            proof_block_heights,
+            receipt_block_height,
+            receipt_block_time,
+            claimed_time_check,
             block_timestamp_secs,
             target_hash,
             operation_count,
@@ -633,8 +718,16 @@ fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
             println!();
             println!("      Verification Chain:");
             println!("        Target Hash:       {target_hash}");
-            println!("              ↓ OTS proof ({operation_count} operations)");
-            println!("        Computed Root:     {computed_root}");
+            // Absent for an anchor rejected before its proof decoded, or one
+            // whose proof attests to no block the receipt named. Saying so
+            // beats printing a `None` or an invented zero.
+            match (operation_count, computed_root) {
+                (Some(count), Some(root)) => {
+                    println!("              ↓ OTS proof ({count} operations)");
+                    println!("        Computed Root:     {root}");
+                }
+                _ => println!("              ↓ OTS proof (no attestation selected)"),
+            }
 
             match (block_merkle_root, merkle_match) {
                 (Some(block_root), Some(true)) => {
@@ -663,10 +756,23 @@ fn print_anchor_details(anchor: &AnchorVerificationResult, use_color: bool) {
             }
 
             println!("              ↓");
-            println!(
-                "        {}",
-                bitcoin_block_line(anchor.verified(), *block_height, *block_timestamp_secs)
-            );
+            if let Some(height) = *proof_block_height {
+                println!(
+                    "        {}",
+                    bitcoin_block_line(anchor.verified(), height, *block_timestamp_secs)
+                );
+            }
+            // What the receipt asserts about that block, and whether it
+            // survived comparison. Printed for every outcome, because a
+            // reader who cannot see the claim cannot audit the check.
+            for line in receipt_claim_lines(
+                *receipt_block_height,
+                proof_block_heights,
+                receipt_block_time,
+                *claimed_time_check,
+            ) {
+                println!("{line}");
+            }
             // Name the sources, always. This tool reads block headers out of
             // HTTP APIs; it validates no proof of work and follows no chain,
             // so every value above is what these endpoints reported and the
@@ -1475,11 +1581,15 @@ mod tests {
                 timestamp_nanos: Some(1_768_806_080_000_000_000),
                 error: None,
                 details: AnchorDetails::Bitcoin {
-                    block_height: 932_897,
+                    proof_block_height: Some(932_897),
+                    proof_block_heights: vec![932_897],
+                    receipt_block_height: 932_897,
+                    receipt_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+                    claimed_time_check: ClaimedTimeCheck::Matches,
                     block_timestamp_secs: merkle_match.map(|_| 1_768_806_080),
                     target_hash: "sha256:abc".to_string(),
-                    operation_count: 39,
-                    computed_root: "sha256:aa".to_string(),
+                    operation_count: Some(39),
+                    computed_root: Some("sha256:aa".to_string()),
                     block_merkle_root,
                     merkle_match,
                     block_sources: Vec::new(),
@@ -1637,6 +1747,18 @@ mod tests {
             ReasonCode::BitcoinProvidersDisagree
         ))
         .contains("your receipt is not implicated"));
+    }
+
+    /// The same rule for the step-5 time check that could not be performed:
+    /// the obstacle is this build's timestamp parser, and no certificate
+    /// touches it. It must not fall through to "trust root unavailable".
+    #[test]
+    fn an_unreadable_claimed_time_is_never_advised_with_certificates() {
+        let headline = untrusted_headline(ReceiptVerdict::untrusted(
+            ReasonCode::BitcoinClaimedTimeUnreadable,
+        ));
+        assert!(!headline.contains("trust root"), "{headline}");
+        assert!(headline.contains("block time"), "{headline}");
     }
 
     /// Nothing in the human output may claim this tool watched the Bitcoin

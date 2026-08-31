@@ -9,6 +9,137 @@ Section references are to the ATL Protocol v2.0 specification.
 
 ## [Unreleased]
 
+### Fixed — the receipt's claims about its own Bitcoin anchor were never checked
+
+ATL v2.0 §5.5.2 lists five steps for a Bitcoin OpenTimestamps anchor. Step 5
+reads:
+
+> Verify that `bitcoin_block_height` and `bitcoin_block_time` match the
+> proof.
+
+Neither field appeared anywhere in this crate's production code. Both call
+sites destructured `ReceiptAnchor::BitcoinOts` with `..` and dropped them. A
+receipt could state block 900000 while carrying an OTS proof that attests to
+932897, and nothing would notice: the tool printed the proof's block and left
+the receipt's own assertion unread.
+
+The two halves of step 5 are not symmetrical, and conflating them would
+produce the exact defect this taxonomy exists to prevent.
+
+**Height — refutable, offline included.** An OpenTimestamps Bitcoin
+attestation encodes the height in its own bytes, so the comparison is pure
+computation. A receipt whose stated height its own proof contradicts is now
+`invalid` (exit 1), reason `bitcoin_claimed_height_contradicts_proof`, in
+offline and online runs alike, and before any block-explorer request is made.
+
+A proof may carry several Bitcoin attestations, and the claim holds if it
+matches **any** of them: §5.5.2 says "match the proof" and singles none out —
+the word *attestation* does not appear in the specification at all. A first
+version compared against the lowest, which would have refuted a receipt
+naming a block genuinely present in its own proof, on a criterion nobody set.
+The rule now lives once, in `atl_core::ots::attestation_for_claimed_height`,
+and the attestation the receipt names is the one this run verifies against.
+
+**Time — not refutable without a header.** No proof carries a block time. The
+comparison is possible only against a header two or more configured sources
+agree on, so:
+
+| situation | `claimed_time_check` | outcome |
+|---|---|---|
+| corroborated header, times equal | `matches` | no effect |
+| corroborated header, times differ | `contradicted` | `invalid`, exit 1, `bitcoin_claimed_time_contradicts_block` |
+| no corroborated header (offline, failed lookup, single source, sources disagree) | `not_compared` | no effect — the anchor keeps the untrusted reason it already had |
+| receipt's own string unparsable by this build | `unreadable` | `untrusted`, exit 3, `bitcoin_claimed_time_unreadable` |
+
+Times are compared as **instants at nanosecond resolution**, using
+`atl-core`'s parser rather than a second one kept here. A Bitcoin header
+carries a whole-second time, so a receipt claiming `07:01:20.000000001`
+names an instant the header does not contain, and the outcome is
+`contradicted`. An explicit zero fraction (`.0`, `.000000000`) names the same
+instant and matches. Precision finer than a nanosecond cannot be represented
+exactly, so it is refused rather than truncated and arrives as `unreadable` —
+truncating would put a different instant back into the `matches` branch.
+
+A hostile timestamp is answered, not crashed on. `bitcoin_block_time` and an
+anchor's `timestamp` are unvalidated strings from the receipt; a
+`bitcoin_block_time` of `"\u{1F4A5}abc"` used to abort the process with
+SIGABRT inside `atl-core`'s parser. Any such string is now `unreadable` —
+exit 3, nothing refuted — and the property is pinned by an integration test
+that rejects a signal-death as well as a panic.
+
+**Two different instants may never be reported as equal.** A first version of
+this check compared whole seconds only, so `07:01:20.000000001` against a
+block stamped `07:01:20` came out `matches`, `valid`, exit 0 — the check
+added to stop unverified claims being republished as verified was itself
+republishing one.
+
+An offline run does **not** refute a receipt whose block time is wrong, and
+that is deliberate: the comparison did not happen, and an unperformed
+comparison cannot fail. Equally, a timestamp string this build cannot parse
+is a fact about the parser — ISO 8601 admits spellings it does not read — so
+it is an inability, not a refutation. It still costs the anchor its
+acceptance, because a required step did not happen. Times are compared as
+instants, so `+00:00` and `Z` spellings of one moment match.
+
+Where both a Merkle-root mismatch and a time contradiction hold, the verdict
+is `invalid` either way and `bitcoin_merkle_root_mismatch` is reported as the
+more informative cause; the time comparison's own result is still published.
+
+### Changed — BREAKING
+
+#### `claimed_block_height` is now `proof_block_height`, beside two new fields
+
+The old name said that *something* claimed the height without saying what,
+and the prose beside it attributed it to the receipt — which was simply
+wrong, since the receipt's own `bitcoin_block_height` was read nowhere. Two
+distinct assertions had one name between them, and the one an attacker could
+move independently was invisible.
+
+| field | whose claim | when emitted |
+|---|---|---|
+| `block_height` | established fact (header fetched and matched) | `verified: true` only |
+| `proof_block_height` | the OTS proof's earliest Bitcoin attestation | `verified: false` only |
+| `receipt_block_height` | the receipt's `bitcoin_block_height` | every `bitcoin_ots` anchor |
+| `receipt_block_time` | the receipt's `bitcoin_block_time`, verbatim | every `bitcoin_ots` anchor |
+| `claimed_time_check` | what became of that time | every `bitcoin_ots` anchor |
+| `proof_block_heights` | every height the proof attests to | whenever any attestation was read |
+
+`proof_block_height` is **absent** when no attestation matches the receipt's
+claim: nothing was selected, and naming one — the lowest, say — would be
+publishing a number the protocol never asked for. `proof_block_heights` is
+the evidence for that refutation, and the reader needs it to check the
+finding.
+
+"every `bitcoin_ots` anchor" includes one rejected before its proof ever
+decoded — a wrong `target`, a `target_hash` that does not pin to the receipt.
+Those used to report `AnchorDetails::Unknown`, whose serialization drops
+every Bitcoin field, so the receipt's claims were hidden precisely at the
+damaged anchors where they are most worth seeing. Proof-derived fields
+(`computed_root`, `operation_count`, `proof_block_heights`) are honestly
+absent there rather than zeroed.
+
+Scripts reading `claimed_block_height` must read `proof_block_height`, and
+should consider whether they wanted `receipt_block_height` all along.
+
+#### An unsupported `spec_version` is an error, not a refutation
+
+The CLI's own gate admitted every `2.x`; `atl-core`'s admitted only `2.0.0`.
+While the server emits `2.0.0` this was invisible, but a `2.0.1` receipt
+would have passed the CLI's door and then been reported by the core verifier
+as a **defective receipt** (`receipt_malformed`, exit 1) — "we do not
+implement that revision" published as "your evidence is broken".
+
+Both gates now ask one predicate, `atl_core::is_supported_spec_version`, and
+it matches exactly. §4.2 defines `spec_version` and stops there: no
+compatibility rule, no statement that a verifier must accept later revisions
+within a major version. With nothing written down to rely on, accepting
+`2.0.1` would assert a verification carried out under rules this build has
+never seen. Such a receipt is refused as an unusable input — exit 2, the same
+as an unreadable file — never exit 1.
+
+Widening the accepted set is a specification change first; §4.2 has to state
+the compatibility rule before an implementation can lean on one.
+
 ### Changed — BREAKING
 
 #### An unanchored receipt is no longer a successful outcome
