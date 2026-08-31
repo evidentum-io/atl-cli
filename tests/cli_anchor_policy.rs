@@ -574,9 +574,18 @@ fn an_unverified_bitcoin_anchor_publishes_nothing_as_established() {
         "a zero sentinel rendered as a real-looking timestamp: {bitcoin}"
     );
 
-    // The claim itself is still available, under a name that cannot be
-    // mistaken for an established fact.
-    assert_eq!(bitcoin["claimed_block_height"], 932_897, "{bitcoin}");
+    // Both claims are still available, each under a name that says whose it
+    // is and neither of which can be mistaken for an established fact.
+    assert_eq!(bitcoin["proof_block_height"], 932_897, "{bitcoin}");
+    assert_eq!(bitcoin["receipt_block_height"], 932_897, "{bitcoin}");
+    assert_eq!(
+        bitcoin["receipt_block_time"], "2026-01-19T07:01:20+00:00",
+        "{bitcoin}"
+    );
+    // Offline there is no block header, so the receipt's stated time was not
+    // compared with anything -- and that must be said, not implied by
+    // silence and not dressed up as agreement.
+    assert_eq!(bitcoin["claimed_time_check"], "not_compared", "{bitcoin}");
 }
 
 /// **The elaboration must come from the verdict's own cause.**

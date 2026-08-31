@@ -355,7 +355,7 @@ fn map_core_error(error: &VerificationError) -> Option<ReasonCode> {
 /// - File does not exist
 /// - File exceeds size limit (10 MB)
 /// - File cannot be parsed as JSON
-/// - Receipt version is not 2.x.x
+/// - `spec_version` is not the revision this build implements
 pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
     // Check file exists
     if !path.exists() {
@@ -379,11 +379,24 @@ pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
     let receipt: Receipt =
         serde_json::from_str(&contents).map_err(|e| CliError::ReceiptParseError(e.to_string()))?;
 
-    // Validate version
-    if !receipt.spec_version.starts_with("2.") {
+    // Validate version.
+    //
+    // Asked of `atl-core`, never decided here. This gate used to admit every
+    // `2.x` while the core verifier admitted only `2.0.0`, so a `2.0.1`
+    // receipt got through the door and was then reported as a *defective
+    // receipt* (`receipt_malformed`, exit 1) rather than as a revision this
+    // build does not implement. Two parts of one system disagreeing about
+    // what they accept is how "could not check" became "checked and false".
+    //
+    // ATL v2.0 §4.2 defines `spec_version` and stops there: no compatibility
+    // rule, no statement that a verifier must accept later revisions of the
+    // same major version. With nothing written down to rely on, the accepted
+    // set is exactly what this build implements -- see
+    // `atl_core::is_supported_spec_version`.
+    if !atl_core::is_supported_spec_version(&receipt.spec_version) {
         return Err(CliError::UnsupportedReceiptVersion {
             version: receipt.spec_version.clone(),
-            expected: "2.x.x".to_string(),
+            expected: atl_core::RECEIPT_SPEC_VERSION.to_string(),
         });
     }
 

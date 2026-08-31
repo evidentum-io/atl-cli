@@ -13,7 +13,9 @@
 //! no TSA name. All trust material arrives as a caller-supplied
 //! [`TrustStore`], built from `--tsa-trust-store` / `--tsa-intermediates`.
 
-use atl_core::core::ots::BitcoinAttestation;
+use atl_core::core::ots::{
+    attestation_for_claimed_height, attested_block_heights, BitcoinAttestation,
+};
 use atl_core::core::verify::anchors::bitcoin_ots::verify_ots_anchor_impl;
 use atl_core::core::verify::anchors::rfc3161::verify_rfc3161_token;
 use atl_core::core::verify::iso8601::parse_iso8601_to_nanos;
@@ -261,7 +263,12 @@ impl AnchorState {
             ReasonCode::TsaImprintIndeterminate
             | ReasonCode::CmsSignatureIndeterminate
             | ReasonCode::TsaChainIndeterminate
-            | ReasonCode::TsaTimestampingEkuNotChecked => Self::Unevaluable,
+            | ReasonCode::TsaTimestampingEkuNotChecked
+            // A fifth shape of the same thing: the receipt's own
+            // `bitcoin_block_time` is a string this build's parser cannot
+            // read, so the comparison §5.5.2 step 5 asks for never ran. No
+            // certificate and no network access changes it.
+            | ReasonCode::BitcoinClaimedTimeUnreadable => Self::Unevaluable,
 
             // Everything below is either a refutation or a receipt-/batch-
             // level aggregate, and none of them reaches this function: a
@@ -297,6 +304,8 @@ impl AnchorState {
             | ReasonCode::SuperProofMissing
             | ReasonCode::BitcoinOtsProofInvalid
             | ReasonCode::BitcoinMerkleRootMismatch
+            | ReasonCode::BitcoinClaimedHeightContradictsProof
+            | ReasonCode::BitcoinClaimedTimeContradictsBlock
             | ReasonCode::ReceiptUnanchored
             | ReasonCode::BatchItemsInvalid
             | ReasonCode::BatchItemsErrored
@@ -379,6 +388,51 @@ impl AnchorVerificationResult {
     }
 }
 
+/// What became of the *time* half of ATL v2.0 §5.5.2 step 5: the receipt's
+/// `bitcoin_block_time` against the time of the block header.
+///
+/// Four-valued rather than a boolean, for the reason every fact type in this
+/// crate is: "compared and different" and "never compared" are different
+/// findings, and only the first is a refutation. The block time appears
+/// nowhere in an OTS proof — it exists only in the block header — so offline
+/// there is nothing to compare against, and the honest report of that is
+/// [`Self::NotCompared`], never a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimedTimeCheck {
+    /// Compared against the time of a header two or more configured sources
+    /// agreed on, and equal.
+    Matches,
+    /// Compared against such a header, and different. A refutation.
+    Contradicted,
+    /// Not compared, because no corroborated header was obtained: an
+    /// offline run, a failed lookup, a single uncorroborated source, or
+    /// sources that contradicted each other. An inability.
+    NotCompared,
+    /// Not compared, because the receipt's own `bitcoin_block_time` is a
+    /// string this build's parser cannot read. Also an inability — see
+    /// [`ReasonCode::BitcoinClaimedTimeUnreadable`].
+    Unreadable,
+}
+
+impl ClaimedTimeCheck {
+    /// The stable wire string for this outcome.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Matches => "matches",
+            Self::Contradicted => "contradicted",
+            Self::NotCompared => "not_compared",
+            Self::Unreadable => "unreadable",
+        }
+    }
+}
+
+impl std::fmt::Display for ClaimedTimeCheck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Facts established about an anchor, reported rather than collapsed into a
 /// single boolean — this is what lets the CLI tell "refuted" apart from
 /// "not corroborated".
@@ -437,16 +491,52 @@ pub enum AnchorDetails {
     /// blockchain" — was a claim about work this tool has never done, and
     /// the wording throughout this crate was corrected accordingly.
     Bitcoin {
-        /// Block height **claimed** by the earliest attestation in the OTS
-        /// proof, as read out of the receipt.
+        /// Block height carried by the earliest Bitcoin attestation **in
+        /// the OTS proof**.
+        ///
+        /// The proof's number, not the receipt's — the two are separate
+        /// assertions and are now compared with each other (§5.5.2 step 5);
+        /// see `receipt_block_height`. This field used to be published as
+        /// `claimed_block_height` with prose calling it "the receipt's own
+        /// assertion", which named the wrong claimant: the receipt's own
+        /// height field was not read anywhere in this crate.
+        ///
+        /// `None` when no attestation matches the receipt's claim (the
+        /// height refutation) or when the proof never decoded: there is then
+        /// no single attestation this run worked with, and inventing one —
+        /// the lowest, say — would be picking a number the protocol never
+        /// asked for. `proof_block_heights` carries the full set either way.
         ///
         /// Not an established fact until a block at that height has actually
         /// been fetched and its Merkle root matched (`merkle_match ==
-        /// Some(true)`). Until then it is the receipt's own assertion about
-        /// where in the chain this anchor lands, and the renderers publish
-        /// it under a `claimed_` name — the same rule the RFC 3161 `genTime`
-        /// follows.
-        block_height: u64,
+        /// Some(true)`). Until then the renderers publish it under the
+        /// `proof_` name — the same rule the RFC 3161 `genTime` follows.
+        proof_block_height: Option<u64>,
+        /// Every block height the OTS proof attests to, in proof order.
+        ///
+        /// Empty only when the proof never decoded. This is the evidence for
+        /// a height refutation: a reader told the receipt's claim matches
+        /// nothing must be able to see what the proof does attest to.
+        proof_block_heights: Vec<u64>,
+        /// Block height **the receipt states** for this anchor, in its
+        /// `bitcoin_block_height` field.
+        ///
+        /// The receipt's own assertion about where in the chain this anchor
+        /// lands, published verbatim and never as an established fact. It is
+        /// checked against `proof_block_height` before anything else is
+        /// reported about the anchor, so a fact set that reaches a reader
+        /// with the two disagreeing cannot also carry a `Valid` verdict.
+        receipt_block_height: u64,
+        /// Block time **the receipt states**, in its `bitcoin_block_time`
+        /// field, verbatim and unparsed.
+        ///
+        /// Kept as the receipt wrote it rather than normalised: what a
+        /// reader needs to see beside `claimed_time_check: "unreadable"` is
+        /// the exact string that could not be read.
+        receipt_block_time: String,
+        /// What became of the receipt's `bitcoin_block_time` — compared and
+        /// equal, compared and different, or not compared at all.
+        claimed_time_check: ClaimedTimeCheck,
         /// Block time in seconds, or `None` when no block was fetched.
         ///
         /// `Option`, not a `0` sentinel. As a `u64` it defaulted to `0` for
@@ -457,10 +547,12 @@ pub enum AnchorDetails {
         block_timestamp_secs: Option<u64>,
         /// The anchor's `target_hash`, as written in the receipt.
         target_hash: String,
-        /// Number of hash operations in the OTS Merkle path.
-        operation_count: usize,
-        /// Merkle root computed from the OTS proof (`sha256:` prefixed).
-        computed_root: String,
+        /// Number of hash operations in the selected attestation's Merkle
+        /// path, or `None` when no attestation was selected.
+        operation_count: Option<usize>,
+        /// Merkle root computed from the OTS proof (`sha256:` prefixed), or
+        /// `None` when the proof did not decode or no attestation matched.
+        computed_root: Option<String>,
         /// The Merkle root the sources report for that block, or `None` when
         /// no single agreed header was obtained.
         block_merkle_root: Option<String>,
@@ -934,12 +1026,41 @@ pub struct PreparedOts {
     pub attestation: BitcoinAttestation,
     /// Merkle root computed from the OTS proof, `sha256:` prefixed.
     pub computed_root: String,
-    /// Number of hash operations in the OTS Merkle path.
+    /// Number of hash operations in the selected attestation's Merkle path.
     pub operation_count: usize,
+    /// Every block height the proof attests to, in proof order. Published
+    /// alongside the selected one so a reader can see the whole set.
+    pub attested_block_heights: Vec<u64>,
+    /// The height the receipt states, carried forward so every outcome can
+    /// publish it beside the proof's own. Equal to
+    /// `attestation.block_height` by the time this struct exists — the
+    /// attestation was *selected by* this claim, and a claim matching no
+    /// attestation is a refutation that never reaches here.
+    pub receipt_block_height: u64,
+    /// The block time the receipt states, verbatim. Nothing offline can
+    /// check it; the online pass compares it with the header it obtained.
+    pub receipt_block_time: String,
 }
 
 /// Run every network-free check a `bitcoin_ots` anchor admits: target
-/// pinning, OTS proof decoding, and extraction of the earliest attestation.
+/// pinning, OTS proof decoding, extraction of the earliest attestation, and
+/// the height half of ATL v2.0 §5.5.2 step 5.
+///
+/// # Step 5 splits by what the network is needed for
+///
+/// Step 5 asks that "`bitcoin_block_height` and `bitcoin_block_time` match
+/// the proof". The height is *in* the proof — an `OpenTimestamps` Bitcoin
+/// attestation encodes it — so comparing it with the receipt's own field is
+/// pure computation and belongs here, where both the offline and the online
+/// path run it. A receipt whose stated height its own proof contradicts is
+/// **refuted**, offline included.
+///
+/// The block time is in no proof; it exists only in the block header. It can
+/// therefore be compared only after a header has been obtained, which is the
+/// online pass's job ([`crate::verify::online`]). Offline the comparison
+/// does not happen, and the honest report of that is
+/// [`ClaimedTimeCheck::NotCompared`] — never a mismatch, because "we could
+/// not check" must never be published as "we checked and it failed".
 ///
 /// Returns `Err(result)` with a finished rejection when a check fails, so
 /// both the offline and the online path share exactly these rules.
@@ -954,33 +1075,60 @@ pub fn prepare_bitcoin_ots(
     target_hash: &str,
     ots_proof: &str,
     super_root: Option<&str>,
+    receipt_block_height: u64,
+    receipt_block_time: &str,
 ) -> Result<PreparedOts, AnchorVerificationResult> {
+    // Every rejection below carries a Bitcoin fact set rather than
+    // `AnchorDetails::Unknown`, so the receipt's own two claims are
+    // published for a damaged anchor as well as a sound one. They used to be
+    // dropped exactly here -- at the anchors where a reader most wants to
+    // see what the receipt asserted.
+    let reject = |verdict: AnchorVerdict, error: String, proof: Option<&BitcoinAttestation>| {
+        AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verdict,
+            timestamp_nanos: None,
+            error: Some(error),
+            details: AnchorDetails::Bitcoin {
+                proof_block_height: proof.map(|a| a.block_height),
+                proof_block_heights: proof.map(|a| vec![a.block_height]).unwrap_or_default(),
+                receipt_block_height,
+                receipt_block_time: receipt_block_time.to_string(),
+                claimed_time_check: ClaimedTimeCheck::NotCompared,
+                block_timestamp_secs: None,
+                target_hash: target_hash.to_string(),
+                operation_count: proof.map(|a| a.merkle_path.len()),
+                computed_root: None,
+                block_merkle_root: None,
+                merkle_match: None,
+                block_sources: Vec::new(),
+            },
+        }
+    };
+
     if target != ANCHOR_TARGET_SUPER_ROOT {
-        return Err(rejected(
-            "bitcoin_ots",
+        return Err(reject(
             AnchorVerdict::Invalid(ReasonCode::AnchorTargetInvalid),
-            None,
             format!("Invalid target '{target}', expected '{ANCHOR_TARGET_SUPER_ROOT}'"),
+            None,
         ));
     }
 
     let Some(expected_super_root) = super_root else {
-        return Err(rejected(
-            "bitcoin_ots",
+        return Err(reject(
             AnchorVerdict::Invalid(ReasonCode::SuperProofMissing),
-            None,
             "Receipt has no super_proof".to_string(),
+            None,
         ));
     };
 
     let claimed_hash = match decode_hash_hex(target_hash) {
         Ok(h) => h,
         Err(e) => {
-            return Err(rejected(
-                "bitcoin_ots",
+            return Err(reject(
                 AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed),
-                None,
                 e,
+                None,
             ))
         }
     };
@@ -988,55 +1136,94 @@ pub fn prepare_bitcoin_ots(
     let expected_hash = match decode_hash_hex(expected_super_root) {
         Ok(h) => h,
         Err(e) => {
-            return Err(rejected(
-                "bitcoin_ots",
+            return Err(reject(
                 AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed),
-                None,
                 format!("invalid super_proof.super_root: {e}"),
+                None,
             ))
         }
     };
 
     if !constant_time_eq(&claimed_hash, &expected_hash) {
-        return Err(rejected(
-            "bitcoin_ots",
+        return Err(reject(
             AnchorVerdict::Invalid(ReasonCode::AnchorTargetHashMismatch),
-            None,
             "target_hash does not match super_root".to_string(),
+            None,
         ));
     }
 
     let ots_result = match verify_ots_anchor_impl(ots_proof, &expected_hash) {
         Ok(r) => r,
         Err(e) => {
-            return Err(rejected(
-                "bitcoin_ots",
+            return Err(reject(
                 AnchorVerdict::Invalid(ReasonCode::BitcoinOtsProofInvalid),
-                None,
                 format!("OTS verification failed: {e}"),
+                None,
             ))
         }
     };
 
-    let Some(earliest) = ots_result
-        .attestations
-        .iter()
-        .min_by_key(|a| a.block_height)
-    else {
-        return Err(rejected(
-            "bitcoin_ots",
+    if ots_result.attestations.is_empty() {
+        return Err(reject(
             AnchorVerdict::Invalid(ReasonCode::BitcoinOtsProofInvalid),
-            None,
             "No Bitcoin attestations in OTS proof".to_string(),
+            None,
         ));
+    }
+    let attested = attested_block_heights(&ots_result.attestations);
+
+    // ATL v2.0 §5.5.2 step 5, height half. Two independent assertions -- the
+    // receipt's `bitcoin_block_height` and what its own OTS proof attests to
+    // -- and no network is needed to compare them.
+    //
+    // The rule is `atl-core`'s `attestation_for_claimed_height`, not a
+    // second copy kept here: the claim holds if it matches ANY attestation.
+    // This code once compared against the lowest, a criterion §5.5.2 nowhere
+    // states, under which a receipt naming a block genuinely present in its
+    // own proof was refuted by an invented rule.
+    let Some(attestation) =
+        attestation_for_claimed_height(&ots_result.attestations, receipt_block_height)
+    else {
+        let heights = attested
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(AnchorVerificationResult {
+            anchor_type: "bitcoin_ots".to_string(),
+            verdict: AnchorVerdict::Invalid(ReasonCode::BitcoinClaimedHeightContradictsProof),
+            timestamp_nanos: None,
+            error: Some(format!(
+                "the receipt states bitcoin_block_height {receipt_block_height}, but its own \
+                 OTS proof attests to no such block (attested: [{heights}])"
+            )),
+            // The full fact set: the claim and every attested height are the
+            // evidence for this refutation, and a reader cannot check the
+            // finding without seeing which claim came from where.
+            details: AnchorDetails::Bitcoin {
+                // No attestation was selected, so there is no single
+                // "the proof's height" to name. The set is what there is.
+                proof_block_height: None,
+                proof_block_heights: attested,
+                receipt_block_height,
+                receipt_block_time: receipt_block_time.to_string(),
+                claimed_time_check: ClaimedTimeCheck::NotCompared,
+                block_timestamp_secs: None,
+                target_hash: target_hash.to_string(),
+                operation_count: None,
+                computed_root: None,
+                block_merkle_root: None,
+                merkle_match: None,
+                block_sources: Vec::new(),
+            },
+        });
     };
 
-    let Some(last_hash) = earliest.merkle_path.last() else {
-        return Err(rejected(
-            "bitcoin_ots",
+    let Some(last_hash) = attestation.merkle_path.last() else {
+        return Err(reject(
             AnchorVerdict::Invalid(ReasonCode::BitcoinOtsProofInvalid),
-            None,
             "Empty merkle path in attestation".to_string(),
+            Some(attestation),
         ));
     };
 
@@ -1046,8 +1233,11 @@ pub fn prepare_bitcoin_ots(
 
     Ok(PreparedOts {
         computed_root: format!("sha256:{}", hex::encode(reversed)),
-        operation_count: earliest.merkle_path.len(),
-        attestation: earliest.clone(),
+        operation_count: attestation.merkle_path.len(),
+        attestation: attestation.clone(),
+        attested_block_heights: attested,
+        receipt_block_height,
+        receipt_block_time: receipt_block_time.to_string(),
     })
 }
 
@@ -1063,8 +1253,17 @@ pub fn verify_bitcoin_ots_offline(
     target_hash: &str,
     ots_proof: &str,
     super_root: Option<&str>,
+    receipt_block_height: u64,
+    receipt_block_time: &str,
 ) -> AnchorVerificationResult {
-    let prepared = match prepare_bitcoin_ots(target, target_hash, ots_proof, super_root) {
+    let prepared = match prepare_bitcoin_ots(
+        target,
+        target_hash,
+        ots_proof,
+        super_root,
+        receipt_block_height,
+        receipt_block_time,
+    ) {
         Ok(p) => p,
         Err(result) => return result,
     };
@@ -1075,15 +1274,24 @@ pub fn verify_bitcoin_ots_offline(
         timestamp_nanos: None,
         error: Some(
             "Bitcoin block not fetched: the OTS proof's merkle root was not compared against \
-             any block header (re-run with network access)"
+             any block header, and neither was the block time the receipt states (re-run with \
+             network access)"
                 .to_string(),
         ),
         details: AnchorDetails::Bitcoin {
-            block_height: prepared.attestation.block_height,
+            proof_block_height: Some(prepared.attestation.block_height),
+            proof_block_heights: prepared.attested_block_heights,
+            receipt_block_height: prepared.receipt_block_height,
+            receipt_block_time: prepared.receipt_block_time,
+            // Offline there is no header, so §5.5.2 step 5's time half was
+            // not carried out. Reporting that as anything but "not
+            // compared" would be the overclaim this whole taxonomy exists
+            // to prevent.
+            claimed_time_check: ClaimedTimeCheck::NotCompared,
             block_timestamp_secs: None,
             target_hash: target_hash.to_string(),
-            operation_count: prepared.operation_count,
-            computed_root: prepared.computed_root,
+            operation_count: Some(prepared.operation_count),
+            computed_root: Some(prepared.computed_root),
             block_merkle_root: None,
             merkle_match: None,
             block_sources: Vec::new(),
@@ -1138,8 +1346,17 @@ pub fn verify_anchors_offline(
                 target,
                 target_hash,
                 ots_proof,
+                bitcoin_block_height,
+                bitcoin_block_time,
                 ..
-            } => verify_bitcoin_ots_offline(target, target_hash, ots_proof, super_root),
+            } => verify_bitcoin_ots_offline(
+                target,
+                target_hash,
+                ots_proof,
+                super_root,
+                *bitcoin_block_height,
+                bitcoin_block_time,
+            ),
         })
         .collect()
 }
@@ -1908,6 +2125,8 @@ mod tests {
             TEST_ROOT_HASH,
             "base64:proof",
             Some(TEST_ROOT_HASH),
+            0,
+            "2026-01-19T07:01:20Z",
         );
         let err = wrong_target.err().expect("must reject");
         assert_eq!(
@@ -1915,12 +2134,158 @@ mod tests {
             AnchorVerdict::Invalid(ReasonCode::AnchorTargetInvalid)
         );
 
-        let no_super = prepare_bitcoin_ots("super_root", TEST_ROOT_HASH, "base64:proof", None);
+        let no_super = prepare_bitcoin_ots(
+            "super_root",
+            TEST_ROOT_HASH,
+            "base64:proof",
+            None,
+            0,
+            "2026-01-19T07:01:20Z",
+        );
         let err = no_super.err().expect("must reject");
         assert_eq!(
             err.verdict,
             AnchorVerdict::Invalid(ReasonCode::SuperProofMissing)
         );
+    }
+
+    /// Build a real, serializable OTS proof whose single fork carries a
+    /// Bitcoin attestation at each of `heights`, all under `start_digest`.
+    ///
+    /// Synthetic, but not a stub: it goes out as bytes and comes back
+    /// through `atl-core`'s own parser and extractor, so what the test
+    /// exercises is the production path and not a hand-made attestation
+    /// list. Real Evidentum proofs carry exactly one attestation, which is
+    /// why the multi-attestation case needs constructing at all.
+    fn multi_attestation_proof(start_digest: [u8; 32], heights: &[u64]) -> String {
+        use atl_core::core::ots::{
+            Attestation, DetachedTimestampFile, DigestType, Op, Step, StepData, Timestamp,
+        };
+        use base64::engine::general_purpose::STANDARD;
+        use base64::Engine;
+
+        let branch = |height: u64, marker: u8| Step {
+            // One hash op per branch, so each attestation has a non-empty
+            // merkle path -- the shape `prepare_bitcoin_ots` requires.
+            data: StepData::Op(Op::Sha256),
+            output: vec![marker; 32],
+            next: vec![Step {
+                data: StepData::Attestation(Attestation::Bitcoin { height }),
+                output: vec![marker; 32],
+                next: vec![],
+            }],
+        };
+
+        let file = DetachedTimestampFile {
+            digest_type: DigestType::Sha256,
+            timestamp: Timestamp {
+                start_digest: start_digest.to_vec(),
+                first_step: Step {
+                    data: StepData::Fork,
+                    output: start_digest.to_vec(),
+                    next: heights
+                        .iter()
+                        .enumerate()
+                        .map(|(i, h)| {
+                            branch(
+                                *h,
+                                u8::try_from(i).expect("few branches").wrapping_add(0xa0),
+                            )
+                        })
+                        .collect(),
+                },
+            },
+        };
+        format!(
+            "base64:{}",
+            STANDARD.encode(file.to_bytes().expect("fixture serializes"))
+        )
+    }
+
+    /// **A claim matching any attestation holds (ATL v2.0 §5.5.2 step 5).**
+    ///
+    /// A proof may carry several Bitcoin attestations. The specification
+    /// says "match the proof" and never singles one out — the word
+    /// *attestation* does not appear in it at all — so a receipt naming a
+    /// block its own proof genuinely attests to must not be refuted. This
+    /// code once compared against `min()`, which refuted every claim but the
+    /// lowest: an accusation on a criterion nobody set.
+    #[test]
+    fn any_attested_height_satisfies_the_receipt_claim() {
+        let digest = [0x11; 32];
+        let target = format!("sha256:{}", hex::encode(digest));
+        let proof = multi_attestation_proof(digest, &[932_897, 932_910, 1_000_000]);
+
+        for claimed in [932_897, 932_910, 1_000_000] {
+            let prepared = prepare_bitcoin_ots(
+                "super_root",
+                &target,
+                &proof,
+                Some(&target),
+                claimed,
+                "2026-01-19T07:01:20+00:00",
+            )
+            .unwrap_or_else(|e| panic!("height {claimed} is attested: {:?}", e.error));
+
+            // The attestation SELECTED is the one the receipt named, not the
+            // lowest: everything downstream -- the computed root and the
+            // block this run looks up -- must describe the claimed block.
+            assert_eq!(prepared.attestation.block_height, claimed);
+            assert_eq!(prepared.receipt_block_height, claimed);
+            assert_eq!(
+                prepared.attested_block_heights,
+                vec![932_897, 932_910, 1_000_000]
+            );
+        }
+    }
+
+    /// Only a height attested by **none** of them is refuted — including one
+    /// that merely sits between two attested heights, which is what makes
+    /// this different from a range check.
+    #[test]
+    fn a_height_no_attestation_carries_is_refuted_with_the_whole_set() {
+        let digest = [0x11; 32];
+        let target = format!("sha256:{}", hex::encode(digest));
+        let proof = multi_attestation_proof(digest, &[932_897, 932_910]);
+
+        for claimed in [900_000u64, 932_900, 2_097_151] {
+            let rejection = prepare_bitcoin_ots(
+                "super_root",
+                &target,
+                &proof,
+                Some(&target),
+                claimed,
+                "2026-01-19T07:01:20+00:00",
+            )
+            .err()
+            .unwrap_or_else(|| panic!("height {claimed} is attested by nothing"));
+
+            assert_eq!(
+                rejection.verdict,
+                AnchorVerdict::Invalid(ReasonCode::BitcoinClaimedHeightContradictsProof)
+            );
+            let AnchorDetails::Bitcoin {
+                proof_block_height,
+                proof_block_heights,
+                receipt_block_height,
+                ..
+            } = &rejection.details
+            else {
+                panic!("a refuted Bitcoin anchor must still carry a Bitcoin fact set");
+            };
+            assert_eq!(*receipt_block_height, claimed);
+            // No attestation was selected, so none is named as "the"
+            // proof's height; the set is the evidence.
+            assert_eq!(*proof_block_height, None);
+            assert_eq!(proof_block_heights, &vec![932_897, 932_910]);
+            let error = rejection
+                .error
+                .expect("a refutation must say what it refuted");
+            assert!(
+                error.contains("932897") && error.contains("932910"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -1930,6 +2295,8 @@ mod tests {
             TEST_ROOT_HASH,
             "base64:proof",
             Some(OTHER_HASH),
+            0,
+            "2026-01-19T07:01:20Z",
         )
         .err()
         .expect("must reject");

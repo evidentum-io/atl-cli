@@ -1,0 +1,53 @@
+{
+  "anchors": [
+    {
+      "target": "data_tree_root",
+      "target_hash": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+      "timestamp": "💥abc",
+      "token_der": "base64:AAAA",
+      "tsa_url": "http://timestamp.sectigo.com",
+      "type": "rfc3161"
+    },
+    {
+      "bitcoin_block_height": 932897,
+      "bitcoin_block_time": "2026-01-19T07:01:20+00:00",
+      "ots_proof": "base64:AE9wZW5UaW1lc3RhbXBzAABQcm9vZgC/ieLohOiSlAEI17k2GASGQ1LLoyPj5fpWqitkv5KZ+nGx34tIzJfF7rvwCNLSLuKSXhRtCPAQsAFgZKIUf5uxWbQ3o/406gjxBGltuWDwCCcu3ebDL8K1CPEgJmBK2RSfo8fM0Chc2FYZV7ao4M6kin7r7F7dQqcXfZsI8SCmnscJao5Krx8hMVQrKBoju18P41SwoV+e96LFmDkQ7gjxIFg943NLTbrGsb0Tu9dgdg/GL6jVQbAxdi0GD9CfDLEJCPAgJd+8o5eL2f1EtX4TUFckWRILnqgZ/mTI1xATyJpsPWwI8SArobiTnqnftZq6GQYNrQa4TojbMgcOfXUE5QIgumm4HwjxIIJpYdyJhNMHPd/IZ8aqMqYp1z39O5hf9e4YWif2n2IICPAg5YojlMOombHZ9MZbWGvGaUVVBQI821ybdor/EHzSp7oI8SCVEhgLqfRcHr87kyTITvJbOEwIwq+OqyKnu481NGxCJQjwIJ++rFz7oIPceMnjpX+SjphDlmJu3G9UIMzOnq9q3RVpCPAg2n81GPtKhJyZ6q774UPc2o784snSv29nEVw7Y7/gqm0I8SDKiBj8VZXQzMGxXecESUeG7d/Z1VQwe1A4O6K7wJUzxQjwIPailoYuk/25CAfsgaQFdznBGN51B0wxzh/4JcMf5dbjCPFZAQAAAAG1bjYPiA0CbvxAq71i8pik1+HLb6OKCbEhEH2sprhwXAAAAAAA/v///wLlGwEAAAAAABYAFOheAZmytIXYIwsqK5Ny7hrrrMYiAAAAAAAAAAAiaiDwBBg8DgAICPAg7IASv76310jjW0QN5HqExD4FKimb4uguna7kktTom7cICPAgYklvkKteUo7Ph9+q7S1BqTtR3LnjcT6Hmdq2woNm9kwICPEg3mikM5iuqpncpOQKBsveql6t6uf6RKHeH+fGrtj9iLoICPAgefsBhDid+zb2xDR5C1W6+zBLcRRo8/IGmgesvcwoqXYICPAgEb1A0VyT9xpMIQda96eB6qZNlUmOVb1GOaXZWLoeFRUICPEgad9Fo7aa9SaB/UD+1dbbwPuDks4JR1h+49/D9xQp1LQICPAg1ezEZeGoZDQfhrF5CWiMPk1UjFa395tMsfCRmWEYM2AICPAg/X5qX5OO9Wg57p7JRfQUk4Xp1xN6dL6J6FZ20OJP6aUICPEgnxf4RUMnH9CtR4goFv3eC2+dkMlKZt3UuEhVLUsILtMICPEgWO/v3CJddd1JfZcz/ysvbNI9HCo0GilTraTcRiLks+YICPEgjzowDXmO1ag+8CEUcOoZT3s1XnxRTdtBNnr4ARVwhWkICAAFiJYNc9cZAQOh+Dg=",
+      "target": "super_root",
+      "target_hash": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+      "timestamp": "💥abc",
+      "type": "bitcoin_ots"
+    }
+  ],
+  "entry": {
+    "id": "896d398f-f983-467b-a376-60e795e66d3b",
+    "metadata": {
+      "customer_id": 1,
+      "customer_name": "OVCI_MUST_DIE"
+    },
+    "metadata_hash": "sha256:e94841a4d4ff89f1b9bdd69515a33358aeedfe60bebb7306d48da5081c4ef998",
+    "payload_hash": "sha256:94ee059335e587e501cc4bf90613e0814f00a7b08bc7c648fd865a2af6a22cc2"
+  },
+  "proof": {
+    "checkpoint": {
+      "key_id": "sha256:4dc428464553c56998da8c02d6eeb8da8e3b4bf1585c250bd24d5f4f68b6dfda",
+      "origin": "sha256:cd00fe57b229db72c9c29529cdfd3b387089704f063f1c1463c030d233e86694",
+      "root_hash": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+      "signature": "base64:Mwzk1OCniC0yhE6dj6B/lFIaK0Zog+4pXNGyBtG+ztDyjDNT0XfiF5vCyhnWaUCRf0h5aBRibkxPefvxVZLVAA==",
+      "timestamp": 1768848020494571000,
+      "tree_size": 1
+    },
+    "inclusion_path": [],
+    "leaf_index": 0,
+    "root_hash": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+    "tree_size": 1
+  },
+  "spec_version": "2.0.0",
+  "super_proof": {
+    "consistency_to_origin": [],
+    "data_tree_index": 0,
+    "genesis_super_root": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+    "inclusion": [],
+    "super_root": "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+    "super_tree_size": 1
+  }
+}

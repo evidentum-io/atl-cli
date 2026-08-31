@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 rust-version = "1.92.0"
 license = "Apache-2.0"
@@ -19,7 +19,7 @@ path = "test_data/fixtures/generate_test_data.rs"
 
 [dependencies]
 # Core - always required (with online features)
-atl-core = { version = "0.26", features = ["rfc3161-verify", "bitcoin-ots"] }
+atl-core = { version = "0.27", features = ["rfc3161-verify", "bitcoin-ots"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -48,6 +48,12 @@ futures = { version = "0.3", optional = true }
 once_cell = { version = "1", optional = true }
 
 [dev-dependencies]
+# Only to build the synthetic multi-attestation OTS proof in
+# `verify::anchor`'s tests: real Evidentum proofs carry a single Bitcoin
+# attestation, so the "claim matches any attestation" rule (ATL v2.0 §5.5.2
+# step 5) has no production fixture to exercise it. Same major line as the
+# one `atl-core` decodes with.
+base64 = "0.22"
 assert_cmd = "2"
 predicates = "3"
 tempfile = "3"

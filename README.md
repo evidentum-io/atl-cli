@@ -310,16 +310,22 @@ reserved for a fact this run established **about this receipt**.
 | when | height | time |
 |---|---|---|
 | verified (block fetched, Merkle root matched) | `block_height` | `block_timestamp` |
-| no block fetched (offline) | `claimed_block_height` | *absent* |
-| header corroborated, Merkle root **did not** match | `claimed_block_height` | `reported_block_timestamp` |
+| no block fetched (offline) | `proof_block_height` | *absent* |
+| header corroborated, Merkle root **did not** match | `proof_block_height` | `reported_block_timestamp` |
+| the receipt's claimed height matches no attestation | *absent* — see `proof_block_heights` | *absent* |
 
-The two are renamed differently because they are different kinds of
-not-established. The height is the *receipt's own assertion* about where in
-the chain the anchor lands, read out of the OTS proof — hence `claimed_`. The
-time in the third row is what named sources *reported*; calling it "claimed"
-would be a second falsehood, since nobody claimed it, we asked and were told.
-Nor "observed" — that was the earlier name and overstated it in the other
-direction, since this tool reads HTTP APIs rather than watching the chain.
+Beside these, and emitted for **every** `bitcoin_ots` anchor whatever the
+outcome, are the receipt's own two assertions: `receipt_block_height` and
+`receipt_block_time`. See "The receipt's own claims about its Bitcoin anchor"
+below for why they are separate fields.
+
+The two un-established names differ because they are different kinds of
+not-established. The height is what the *OTS proof* attests to — hence
+`proof_`. The time in the third row is what named sources *reported*; calling
+it "claimed" would be a falsehood, since nobody claimed it, we asked and were
+told. Nor "observed" — that was an earlier name and overstated it in the
+other direction, since this tool reads HTTP APIs rather than watching the
+chain.
 
 That third row is the sharp case. The online path fetches the block **before**
 deciding whether its Merkle root matches, so a receipt refuted by
@@ -356,6 +362,70 @@ established. The claim itself is still available as `claimed_timestamp` —
 useful for diagnostics and for saying what was claimed, never admissible as
 when something existed. Human output labels it `Claimed genTime (not
 established)`.
+
+## The receipt's own claims about its Bitcoin anchor
+
+ATL v2.0 §5.5.2 step 5 requires a verifier to "verify that
+`bitcoin_block_height` and `bitcoin_block_time` match the proof". Until
+this release neither field was read anywhere in the tool: a receipt could
+announce block 900000 while carrying an OTS proof that attests to 932897, and
+the output printed the proof's block without ever mentioning the
+disagreement. A claim the receipt makes about its own evidence went
+unexamined.
+
+The two halves of step 5 are not symmetrical, and the tool now says which is
+which.
+
+**The height is checkable offline.** An OpenTimestamps Bitcoin attestation
+carries the block height in its own bytes, so comparing it with the receipt's
+`bitcoin_block_height` is pure computation. A disagreement is therefore a
+fact that was checked and is false: `status: "invalid"`, exit 1, reason code
+`bitcoin_claimed_height_contradicts_proof` — with or without network access.
+The two numbers are published side by side as `receipt_block_height` and
+`proof_block_height`, so the finding can be audited rather than taken on
+trust.
+
+A proof may carry several Bitcoin attestations, and the claim holds if it
+matches **any** of them — §5.5.2 says "match the proof" and singles none out.
+`proof_block_heights` publishes the whole attested set, which is what makes a
+refutation auditable; `proof_block_height` names the attestation this run
+verified against, and is absent when none matched.
+
+**The time is not.** No OTS proof carries a block time; it exists only in the
+block header, which means the comparison is possible only after two or more
+configured sources have agreed on one. A new field, `claimed_time_check`,
+reports what happened:
+
+| value | meaning | effect |
+|---|---|---|
+| `matches` | compared with a corroborated header, and equal | none |
+| `contradicted` | compared, and different | `invalid`, exit 1, `bitcoin_claimed_time_contradicts_block` |
+| `not_compared` | no corroborated header was obtained (offline, lookup failed, one source only, or sources disagreed) | none — the anchor stays untrusted for the reason it already was |
+| `unreadable` | this build could not parse the receipt's own timestamp string | `untrusted`, exit 3, `bitcoin_claimed_time_unreadable` |
+
+`not_compared` is the row that matters. Offline the comparison does not
+happen, and an unperformed comparison cannot fail: a receipt whose stated
+block time is nonsense is **not** refuted by an offline run, because nothing
+about it was checked. Saying otherwise would report "we could not check" as
+"we checked and it failed", which is the one thing this tool must never do.
+
+`unreadable` is the mirror-image caution. RFC 3339 admits spellings this
+build does not parse, so a string it cannot read is evidence about the
+parser, not about the receipt — never a refutation. It does still cost the
+anchor its acceptance, because a step the specification requires did not
+happen.
+
+Comparison is between **instants at nanosecond resolution**, not strings, so
+`2026-01-19T07:01:20+00:00` and `2026-01-19T07:01:20Z` are a match. A Bitcoin
+header carries a whole-second time, so a receipt claiming
+`07:01:20.000000001` names an instant the header does not contain and is
+`contradicted`; an explicit `.000000000` names the same instant and matches;
+and precision finer than a nanosecond is refused rather than truncated,
+arriving as `unreadable`. Truncating it would report two different instants
+as one.
+
+Human output prints both claims under `Receipt states:`, saying in each case
+whether the claim agreed, was contradicted, or was not compared at all.
 
 ## Batch mode says the same thing single-file mode does
 
