@@ -1,0 +1,35 @@
+# cargo-audit configuration.
+#
+# RUSTSEC-2023-0071 ("Marvin Attack: potential key recovery through timing
+# sidechannels", rsa crate) has no fixed version available. It is ignored
+# here deliberately, with a justification narrower than the advisory: the
+# advisory covers *any* operation performed with an RSA *private* key --
+# decryption and signing alike -- because the non-constant-time
+# implementation leaks information about that key to an attacker who can
+# observe the timing.
+#
+# This crate holds no private key of any kind. `atl-cli` only ever verifies:
+# it takes a receipt, a source file and (optionally) a trust store, and
+# decides whether the receipt holds. There is no key generation, no signing
+# and no decryption anywhere in `src/`. Its Ed25519 use is checkpoint
+# signature *verification*, which never touches `rsa` at all.
+#
+# `rsa` is not a direct dependency (see Cargo.toml); it arrives transitively
+# through `atl-core`'s `rfc3161-verify` feature. `atl-core` uses it in
+# exactly one place -- RFC 3161 TSA token verification -- and only through
+# `RsaPublicKey` with `Pkcs1v15Sign`, i.e. PKCS#1 v1.5 signature
+# verification against the public key carried in the TSA certificate.
+# Verification is modular exponentiation with the public exponent over data
+# the attacker already holds, so there is no private key on that path for a
+# side channel to leak.
+#
+# Note that `atl-cli` does verify attacker-supplied input by design -- a
+# receipt is a file someone hands the user. That widens who can *trigger*
+# the RSA code path, but not what it leaks: with no private key in the
+# process, Marvin has nothing to recover.
+#
+# Remove this ignore -- do not extend it -- the moment this crate or
+# `atl-core` grows an RSA decryption or RSA signing path, because at that
+# point the advisory applies in full.
+[advisories]
+ignore = ["RUSTSEC-2023-0071"]
