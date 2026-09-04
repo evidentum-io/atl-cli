@@ -171,13 +171,34 @@ pub struct VerifyArgs {
     /// deliver what it offered, and this tool says so rather than quietly
     /// settling for less.
     ///
+    /// # One reason to prefer this flag
+    ///
+    /// The default profile is defined over the anchors a receipt PRESENTS,
+    /// and a receipt's anchors are covered by neither the leaf hash nor the
+    /// checkpoint blob -- anybody who relays a receipt can append one, with
+    /// no key. So a relay can take an accepted receipt from valid (exit 0)
+    /// to untrusted (exit 3) under the default, by appending an anchor that
+    /// does not verify. It is a denial of verification and never an
+    /// accusation: the status never becomes invalid, nothing reports the
+    /// receipt as refuted, and the reason is the fixed anchor_quorum_unmet,
+    /// which names this profile and no anchor.
+    ///
+    /// This flag is immune. It asks §5.5's own question -- at least one
+    /// verified anchor -- and appending cannot lower a count. If you need an
+    /// outcome a relay cannot move at all, pass it.
+    ///
     /// What this flag does NOT do:
     ///
-    /// - It never rescues a refuted anchor. One disproved fact makes the
-    ///   receipt "invalid" (exit 1) whatever the quorum is, and every trust
-    ///   axis reports false beside it.
-    /// - It never accepts a receipt with no anchors at all: a quorum of one
-    ///   cannot be met by none.
+    /// - It never counts a refuted anchor. An anchor that was checked and
+    ///   found false is not a verified anchor under any quorum, it is listed
+    ///   in the coverage axis with its own reason, and the run is not
+    ///   complete. (It does not make the receipt "invalid" either: nothing
+    ///   signs or hashes a receipt's anchors, so an anchor that fails is one
+    ///   anybody who relayed the receipt could have attached. Only the
+    ///   receipt itself being disproved is exit 1.)
+    /// - It never accepts a receipt with no VERIFIED anchor: a quorum of one
+    ///   cannot be met by none, and a receipt presenting anchors that all
+    ///   fail has none either. Both report receipt_unanchored.
     /// - It never hides an unverified anchor. Every anchor that reached no
     ///   result is still listed, with its reason, and the run is reported as
     ///   a success RELATIVE TO THIS POLICY -- never as an unqualified VALID.
@@ -215,15 +236,18 @@ pub struct VerifyArgs {
     /// Certificates given here confer NO trust of their own: chain
     /// construction may walk through them, but the chain must still reach a
     /// certificate named by --tsa-trust-store to be reported "Trusted".
-    /// Use this when a token's chain reports status "untrusted" with reason
+    /// Use this when an ANCHOR reports state "incomplete" with reason
     /// "tsa_chain_incomplete" -- some TSAs (notably Sectigo and DigiCert)
     /// ship tokens whose topmost certificate is cross-signed by a legacy
-    /// root that the token itself does not include.
+    /// root that the token itself does not include. Read that from the
+    /// anchor, in anchor_verification.results[] or the Coverage list; the
+    /// receipt's own reason code names no anchor.
     ///
-    /// It will NOT help with reason "tsa_chain_indeterminate" or
-    /// "cms_signature_indeterminate": there the check could not be performed
-    /// at all (commonly a signature algorithm this verifier does not
-    /// implement, such as SHA-1 on a long-lived root).
+    /// It will NOT help with an anchor whose reason is
+    /// "tsa_chain_indeterminate" or "cms_signature_indeterminate" (state
+    /// "unevaluable"): there the check could not be performed at all
+    /// (commonly a signature algorithm this verifier does not implement,
+    /// such as SHA-1 on a long-lived root).
     /// A certificate passed here is checked like any other link on the
     /// path; the same certificate passed to --tsa-trust-store is an
     /// external trusted input and is not re-checked (RFC 5280 6.1), which

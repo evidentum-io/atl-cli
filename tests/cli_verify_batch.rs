@@ -44,7 +44,7 @@ fn test_batch_all_unanchored_consistent() {
 
     let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(json["status"], "untrusted");
-    assert_eq!(json["reason_code"], "batch_items_unanchored");
+    assert_eq!(json["reason_code"], "batch_items_untrusted");
     assert_ne!(
         json["status"], "valid",
         "receipts with no anchors have no verified anchor"

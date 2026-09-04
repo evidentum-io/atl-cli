@@ -10,15 +10,14 @@
 use std::time::Duration;
 
 use atl_core::core::verify::iso8601::parse_iso8601_to_nanos;
-use atl_core::ReceiptAnchor;
+use atl_core::AnchorFacts;
 
 use crate::error::CliResult;
 use crate::net::bitcoin::BlockLookup;
 use crate::verify::anchor::BlockSourceReport;
 use crate::verify::anchor::PreparedOts;
 use crate::verify::anchor::{
-    prepare_bitcoin_ots, requires_network, AnchorDetails, AnchorVerdict, AnchorVerificationResult,
-    ClaimedTimeCheck,
+    AnchorDetails, AnchorVerdict, AnchorVerificationResult, ClaimedTimeCheck,
 };
 use crate::verify::single::SingleVerificationResult;
 use crate::verify::verdict::ReasonCode;
@@ -38,15 +37,33 @@ impl Default for OnlineConfig {
     }
 }
 
-/// `true` if any anchor in `receipt` needs network access to be verified to
-/// completion.
+/// `true` if this receipt has anything left for the network to settle.
 ///
 /// A receipt anchored only by RFC 3161 is fully verifiable offline, so the
 /// CLI must not probe connectivity for it — that probe was contacting
 /// external hosts for a check that never leaves the process.
+///
+/// # Why it reads the facts and not the anchor list
+///
+/// It used to be `anchors().iter().any(requires_network)`: any `bitcoin_ots`
+/// anchor at all. But a receipt's `anchors` array is covered by neither the
+/// leaf hash nor the checkpoint blob, so **anybody who relays a receipt can
+/// append one** — and appending a `bitcoin_ots` anchor to a Receipt-Lite
+/// made this tool build a runtime, probe connectivity and report
+/// `mode: "online"` for a receipt whose every check had already finished
+/// locally. A stranger with no key could make somebody else's verifier emit
+/// traffic, and change what the run said it had done.
+///
+/// The honest question is not "is a Bitcoin anchor present" but "is there an
+/// anchor a block header would still settle", and that is exactly
+/// [`PreparedOts::from_facts`] — the same predicate
+/// [`verify_anchors_online`] uses to build its work list, so the decision to
+/// go online and the decision to look anything up can no longer disagree. An
+/// appended anchor that does not bind to this receipt is refuted offline and
+/// yields no lookup, so it now yields no network access either.
 #[must_use]
-pub fn receipt_requires_network(receipt: &atl_core::Receipt) -> bool {
-    receipt.anchors.iter().any(requires_network)
+pub fn receipt_requires_network(facts: &[AnchorFacts]) -> bool {
+    facts.iter().any(|f| PreparedOts::from_facts(f).is_some())
 }
 
 /// Check one `bitcoin_ots` anchor against the block header that the
@@ -69,45 +86,35 @@ pub fn receipt_requires_network(receipt: &atl_core::Receipt) -> bool {
 /// | exactly one | `Untrusted(BitcoinSingleSourceOnly)` | one endpoint's word settles nothing |
 /// | none | `Untrusted(BitcoinBlockUnavailable)` | nothing to compare against |
 ///
-/// Only the first row may produce a refutation, and that is the whole point
-/// of the table. A mismatch reported by a single uncorroborated endpoint is
-/// **not** a refutation: if one source is not enough to accept evidence, it
-/// is not enough to accuse it either, and a wrong or compromised API would
-/// otherwise be able to turn sound evidence into `invalid`. That is the
-/// worst failure this tool has, and it is now unreachable through one
-/// endpoint.
+/// The `Valid` / `Invalid` in the first row are this **anchor's** verdict,
+/// not the receipt's: a refuted anchor leaves the receipt `untrusted`, never
+/// `invalid` (see [`crate::verify::single::SingleVerificationResult::verdict`]).
+///
+/// Only the first row may produce a refutation at all, and that is the whole
+/// point of the table. A mismatch reported by a single uncorroborated
+/// endpoint is **not** a refutation: if one source is not enough to accept
+/// evidence, it is not enough to accuse it either. A wrong or compromised
+/// API would otherwise be able to publish `state: "refuted"` against a sound
+/// anchor — an accusation on one endpoint's word, and the worst thing this
+/// module can do. It is unreachable through one endpoint.
 async fn verify_bitcoin_ots_online(
-    target: &str,
+    prepared: &PreparedOts,
     target_hash: &str,
-    ots_proof: &str,
-    super_root: Option<&str>,
-    receipt_block_height: u64,
-    receipt_block_time: &str,
     config: &OnlineConfig,
 ) -> AnchorVerificationResult {
-    // Every network-free check first, sharing exactly the offline rules --
-    // including §5.5.2 step 5's height half, which needs no network and so
-    // refutes a receipt whose stated height its own proof contradicts before
-    // a single request is made.
-    let prepared = match prepare_bitcoin_ots(
-        target,
-        target_hash,
-        ots_proof,
-        super_root,
-        receipt_block_height,
-        receipt_block_time,
-    ) {
-        Ok(p) => p,
-        Err(result) => return result,
-    };
-
+    // Every network-free check has already run: `PreparedOts` is built only
+    // from an anchor `atl-core` bound to this receipt, decoded, and did not
+    // refute -- §5.5.2 step 5's height half included, which needs no network
+    // and so settles THE ANCHOR whose stated height its own proof
+    // contradicts before a single request is made. The receipt's own status
+    // is decided elsewhere and by other facts.
     let lookup = crate::net::bitcoin::lookup_block(
         prepared.attestation.block_height,
         config.request_timeout,
     )
     .await;
 
-    anchor_from_lookup(&prepared, target_hash, lookup)
+    anchor_from_lookup(prepared, target_hash, lookup)
 }
 
 /// Turn one block lookup into the anchor's result.
@@ -121,9 +128,10 @@ fn anchor_from_lookup(
     target_hash: &str,
     lookup: BlockLookup,
 ) -> AnchorVerificationResult {
-    // The proof's height. It equals the receipt's -- `prepare_bitcoin_ots`
-    // refutes the anchor outright when they differ -- so a lookup by this
-    // number is a lookup for the block both of them name.
+    // The proof's height. It equals the receipt's -- `atl-core` refutes the
+    // anchor outright when they differ, and `PreparedOts::from_facts` is
+    // never built from a refuted anchor -- so a lookup by this number is a
+    // lookup for the block both of them name.
     let claimed_height = prepared.attestation.block_height;
 
     // Everything a not-yet-compared outcome reports: the local computation,
@@ -397,36 +405,27 @@ pub async fn verify_anchors_online(
     result: &mut SingleVerificationResult,
     config: &OnlineConfig,
 ) -> CliResult<()> {
-    let super_root = result
+    // The facts the offline pass was built from, not a second set: two fact
+    // sets are two things that can disagree about one receipt.
+    let pending: Vec<(usize, String, PreparedOts)> = result
         .receipt
-        .super_proof
-        .as_ref()
-        .map(|sp| sp.super_root.clone());
+        .anchors()
+        .iter()
+        .zip(&result.anchor_facts)
+        .enumerate()
+        .filter_map(|(index, (anchor, facts))| {
+            // `None` for every anchor the network cannot settle: one that is
+            // not `bitcoin_ots`, and one already refuted -- a refutation
+            // stands whatever a block explorer reports, and fetching a
+            // header for it would invite the header to overwrite the
+            // finding.
+            PreparedOts::from_facts(facts)
+                .map(|prepared| (index, anchor.target_hash().to_string(), prepared))
+        })
+        .collect();
 
-    for (index, anchor) in result.receipt.anchors.iter().enumerate() {
-        let ReceiptAnchor::BitcoinOts {
-            target,
-            target_hash,
-            ots_proof,
-            bitcoin_block_height,
-            bitcoin_block_time,
-            ..
-        } = anchor
-        else {
-            continue;
-        };
-
-        let confirmed = verify_bitcoin_ots_online(
-            target,
-            target_hash,
-            ots_proof,
-            super_root.as_deref(),
-            *bitcoin_block_height,
-            bitcoin_block_time,
-            config,
-        )
-        .await;
-
+    for (index, target_hash, prepared) in pending {
+        let confirmed = verify_bitcoin_ots_online(&prepared, &target_hash, config).await;
         if let Some(slot) = result.anchor_results.get_mut(index) {
             *slot = confirmed;
         }
@@ -451,43 +450,46 @@ mod tests {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn create_test_receipt() -> Receipt {
+        receipt_with_anchors(vec![])
+    }
+
+    /// A minimal receipt whose `proof.root_hash` is [`TEST_ROOT_HASH`].
+    ///
+    /// `Receipt` exposes no setters and no `&mut` accessors, so "the same
+    /// receipt plus an anchor" is spelled as "assemble a new receipt from
+    /// the parts" — which is exactly what a relay appending one has to do.
+    fn receipt_with_anchors(anchors: Vec<atl_core::ReceiptAnchor>) -> Receipt {
         let test_uuid = "550e8400-e29b-41d4-a716-446655440000"
             .parse()
             .expect("Valid UUID");
+        let zero = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-        Receipt {
-            spec_version: "2.0.0".to_string(),
-            upgrade_url: None,
-            entry: ReceiptEntry {
+        atl_core::ReceiptBuilder::new(
+            "2.0.0".to_string(),
+            ReceiptEntry {
                 id: test_uuid,
                 payload_hash: TEST_ROOT_HASH.to_string(),
-                metadata_hash:
-                    "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                        .to_string(),
+                metadata_hash: zero.to_string(),
                 metadata: serde_json::json!({}),
             },
-            proof: ReceiptProof {
+            ReceiptProof {
                 tree_size: 1,
                 root_hash: TEST_ROOT_HASH.to_string(),
                 inclusion_path: vec![],
                 leaf_index: 0,
                 checkpoint: CheckpointJson {
-                    origin:
-                        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                            .to_string(),
+                    origin: zero.to_string(),
                     tree_size: 1,
                     root_hash: TEST_ROOT_HASH.to_string(),
                     timestamp: 1_234_567_890,
                     signature: "base64:signature".to_string(),
-                    key_id:
-                        "sha256:0000000000000000000000000000000000000000000000000000000000000000"
-                            .to_string(),
+                    key_id: zero.to_string(),
                 },
                 consistency_proof: None,
             },
-            super_proof: None,
-            anchors: vec![],
-        }
+        )
+        .anchors(anchors)
+        .build(atl_core::SourceTextCheck::assume_duplicate_property_names_already_rejected())
     }
 
     fn create_test_single_result(valid: bool) -> SingleVerificationResult {
@@ -521,73 +523,100 @@ mod tests {
                 errors: vec![],
             },
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         }
     }
 
     use crate::net::bitcoin::{BitcoinBlockInfo, BlockLookup};
 
-    /// Everything the real Receipt-Full `bitcoin_ots` anchor states: target,
-    /// target hash, proof, and the two fields ATL v2.0 §5.5.2 step 5 checks.
-    struct FixtureAnchor {
-        target: String,
-        target_hash: String,
-        ots_proof: String,
-        super_root: Option<String>,
-        block_height: u64,
-        block_time: String,
-    }
-
-    fn fixture_anchor() -> FixtureAnchor {
-        let receipt: atl_core::Receipt =
-            serde_json::from_str(include_str!("../../real-data/receipt-full.atl"))
+    /// The real Receipt-Full fixture, with the `bitcoin_ots` anchor's own
+    /// two ATL v2.0 §5.5.2 step 5 claims optionally overridden.
+    ///
+    /// Overriding them means rebuilding the receipt: `Receipt` has no
+    /// setters, and going through `ReceiptBuilder` is the same path a
+    /// producer — or a relay — has to use.
+    fn fixture_receipt(
+        claimed_height: Option<u64>,
+        claimed_time: Option<&str>,
+    ) -> atl_core::Receipt {
+        let receipt =
+            atl_core::Receipt::from_json(include_str!("../../real-data/receipt-full.atl"))
                 .expect("fixture receipt");
-        let super_root = receipt.super_proof.as_ref().map(|sp| sp.super_root.clone());
-        receipt
-            .anchors
+        let anchors = receipt
+            .anchors()
             .iter()
-            .find_map(|a| match a {
+            .map(|a| match a {
                 atl_core::ReceiptAnchor::BitcoinOts {
                     target,
                     target_hash,
-                    ots_proof,
+                    timestamp,
                     bitcoin_block_height,
                     bitcoin_block_time,
-                    ..
-                } => Some(FixtureAnchor {
+                    ots_proof,
+                } => atl_core::ReceiptAnchor::BitcoinOts {
                     target: target.clone(),
                     target_hash: target_hash.clone(),
+                    timestamp: timestamp.clone(),
+                    bitcoin_block_height: claimed_height.unwrap_or(*bitcoin_block_height),
+                    bitcoin_block_time: claimed_time
+                        .map_or_else(|| bitcoin_block_time.clone(), str::to_string),
                     ots_proof: ots_proof.clone(),
-                    super_root: super_root.clone(),
-                    block_height: *bitcoin_block_height,
-                    block_time: bitcoin_block_time.clone(),
-                }),
-                atl_core::ReceiptAnchor::Rfc3161 { .. } => None,
+                },
+                // Named rather than wildcarded: a third anchor type would
+                // otherwise be carried through this fixture unchanged and
+                // silently untested.
+                rfc3161 @ atl_core::ReceiptAnchor::Rfc3161 { .. } => rfc3161.clone(),
             })
+            .collect();
+        atl_core::ReceiptBuilder::new(
+            receipt.spec_version().to_string(),
+            receipt.entry().clone(),
+            receipt.proof().clone(),
+        )
+        .super_proof_option(receipt.super_proof().cloned())
+        .anchors(anchors)
+        .upgrade_url_option(receipt.upgrade_url().map(str::to_string))
+        .build(atl_core::SourceTextCheck::assume_duplicate_property_names_already_rejected())
+    }
+
+    /// The index of the fixture's `bitcoin_ots` anchor.
+    fn bitcoin_index(receipt: &atl_core::Receipt) -> usize {
+        receipt
+            .anchors()
+            .iter()
+            .position(|a| matches!(a, atl_core::ReceiptAnchor::BitcoinOts { .. }))
             .expect("fixture carries a bitcoin_ots anchor")
     }
 
-    /// The real anchor prepared exactly as the offline pass prepares it, with
-    /// the receipt's own claims optionally overridden — which is how the
-    /// step-5 tests state a height or a time that the production receipt does
-    /// not.
-    // Same reason `prepare_bitcoin_ots` itself carries the allow: a rejected
-    // anchor must report the same shape as an accepted one, and boxing it
-    // would buy stack bytes on a path that runs once per test.
-    #[allow(clippy::result_large_err)]
+    /// The fixture's `bitcoin_ots` anchor as the offline pass reports it.
+    fn fixture_offline(
+        claimed_height: Option<u64>,
+        claimed_time: Option<&str>,
+    ) -> AnchorVerificationResult {
+        let receipt = fixture_receipt(claimed_height, claimed_time);
+        let facts = crate::verify::anchor::establish_anchor_facts(&receipt, None);
+        let index = bitcoin_index(&receipt);
+        crate::verify::anchor::offline_results(&receipt, &facts).remove(index)
+    }
+
+    /// What the network still has to settle for the fixture's Bitcoin
+    /// anchor, or `None` when the offline pass already settled it.
     fn prepare_fixture(
         claimed_height: Option<u64>,
         claimed_time: Option<&str>,
-    ) -> Result<PreparedOts, AnchorVerificationResult> {
-        let anchor = fixture_anchor();
-        crate::verify::anchor::prepare_bitcoin_ots(
-            &anchor.target,
-            &anchor.target_hash,
-            &anchor.ots_proof,
-            anchor.super_root.as_deref(),
-            claimed_height.unwrap_or(anchor.block_height),
-            claimed_time.unwrap_or(&anchor.block_time),
-        )
+    ) -> Option<PreparedOts> {
+        let receipt = fixture_receipt(claimed_height, claimed_time);
+        let facts = crate::verify::anchor::establish_anchor_facts(&receipt, None);
+        PreparedOts::from_facts(&facts[bitcoin_index(&receipt)])
+    }
+
+    /// The fixture's `target_hash`, which the online path publishes verbatim.
+    fn fixture_target_hash() -> String {
+        let receipt = fixture_receipt(None, None);
+        receipt.anchors()[bitcoin_index(&receipt)]
+            .target_hash()
+            .to_string()
     }
 
     fn ots_fixture() -> PreparedOts {
@@ -626,7 +655,7 @@ mod tests {
         let info = header(BLOCK_TS, REAL_ROOT);
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Corroborated {
                 reports: vec![
                     info.to_source_report("blockstream.info"),
@@ -651,7 +680,7 @@ mod tests {
         let info = header(BLOCK_TS, &"9".repeat(64));
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Corroborated {
                 reports: vec![
                     info.to_source_report("blockstream.info"),
@@ -676,7 +705,7 @@ mod tests {
         let b = header(BLOCK_TS, &"9".repeat(64));
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Disagreement {
                 reports: vec![
                     a.to_source_report("blockstream.info"),
@@ -720,7 +749,7 @@ mod tests {
         let b = header(BLOCK_TS + 1, REAL_ROOT);
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Disagreement {
                 reports: vec![
                     a.to_source_report("blockstream.info"),
@@ -759,7 +788,7 @@ mod tests {
             let info = header(BLOCK_TS, root);
             let result = anchor_from_lookup(
                 &prepared,
-                "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+                &fixture_target_hash(),
                 BlockLookup::Uncorroborated {
                     reports: vec![info.to_source_report("blockstream.info")],
                     failures: vec!["mempool.space: HTTP error".to_string()],
@@ -788,7 +817,7 @@ mod tests {
         let prepared = ots_fixture();
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Unavailable {
                 failures: vec!["blockstream.info: down".to_string()],
             },
@@ -817,31 +846,61 @@ mod tests {
         assert!(format!("{config:?}").contains("OnlineConfig"));
     }
 
+    fn needs_network(receipt: &Receipt) -> bool {
+        receipt_requires_network(&crate::verify::anchor::establish_anchor_facts(
+            receipt, None,
+        ))
+    }
+
     #[test]
     fn rfc3161_only_receipt_needs_no_network() {
-        let mut receipt = create_test_receipt();
-        receipt.anchors.push(ReceiptAnchor::Rfc3161 {
+        let receipt = receipt_with_anchors(vec![atl_core::ReceiptAnchor::Rfc3161 {
             target: "data_tree_root".to_string(),
             target_hash: TEST_ROOT_HASH.to_string(),
             tsa_url: "https://example.invalid/tsa".to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             token_der: "base64:token".to_string(),
-        });
-        assert!(!receipt_requires_network(&receipt));
+        }]);
+        assert!(!needs_network(&receipt));
     }
 
+    /// **An appended Bitcoin anchor must not be able to send this tool
+    /// online.**
+    ///
+    /// A receipt's `anchors` array is signed and hashed by nothing, so
+    /// anybody who relays a receipt can append to it. While the decision was
+    /// "is any anchor a `bitcoin_ots` anchor", appending one to a
+    /// Receipt-Lite made this tool build a runtime, probe connectivity and
+    /// report `mode: "online"` — outbound traffic a stranger with no key had
+    /// caused, for a receipt whose every check had finished locally.
+    ///
+    /// The question is now "is there an anchor a block header would still
+    /// settle", and an anchor that does not bind to this receipt is refuted
+    /// offline and settles nothing.
     #[test]
-    fn bitcoin_anchor_needs_network() {
-        let mut receipt = create_test_receipt();
-        receipt.anchors.push(ReceiptAnchor::BitcoinOts {
+    fn an_unbindable_bitcoin_anchor_never_asks_for_the_network() {
+        // The fixture receipt carries no `super_proof`, so a `super_root`
+        // anchor cannot bind to it at all -- refuted before any decoding.
+        let receipt = receipt_with_anchors(vec![atl_core::ReceiptAnchor::BitcoinOts {
             target: "super_root".to_string(),
             target_hash: TEST_ROOT_HASH.to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             bitcoin_block_height: 800_000,
             bitcoin_block_time: "2024-01-01T00:00:00Z".to_string(),
             ots_proof: "base64:proof".to_string(),
-        });
-        assert!(receipt_requires_network(&receipt));
+        }]);
+        assert!(!needs_network(&receipt));
+
+        // A receipt with no anchors at all is unchanged by that append: it
+        // asked for nothing before and asks for nothing after.
+        assert!(!needs_network(&receipt_with_anchors(vec![])));
+    }
+
+    /// The other half: a Bitcoin anchor the network really can settle does
+    /// ask for it, or the check above would be passing for the wrong reason.
+    #[test]
+    fn a_bindable_bitcoin_anchor_asks_for_the_network() {
+        assert!(needs_network(&fixture_receipt(None, None)));
     }
 
     #[tokio::test]
@@ -850,15 +909,16 @@ mod tests {
         // byte-for-byte identical -- and, crucially, without any network
         // call having been made.
         let mut result = create_test_single_result(true);
-        result.receipt.anchors.push(ReceiptAnchor::Rfc3161 {
+        result.receipt = receipt_with_anchors(vec![atl_core::ReceiptAnchor::Rfc3161 {
             target: "data_tree_root".to_string(),
             target_hash: OTHER_HASH.to_string(),
             tsa_url: "https://example.invalid/tsa".to_string(),
             timestamp: "2024-01-01T00:00:00Z".to_string(),
             token_der: "base64:token".to_string(),
-        });
+        }]);
+        result.anchor_facts = crate::verify::anchor::establish_anchor_facts(&result.receipt, None);
         result.anchor_results =
-            crate::verify::anchor::verify_anchors_offline(&result.receipt, None);
+            crate::verify::anchor::offline_results(&result.receipt, &result.anchor_facts);
         let before = result.anchor_results[0].verdict;
 
         verify_anchors_online(&mut result, &OnlineConfig::default())
@@ -881,7 +941,7 @@ mod tests {
             Some(ReasonCode::ReceiptUnanchored)
         );
         assert_eq!(result.verdict().exit_code().code(), 3);
-        assert!(result.is_lite());
+        assert!(result.presents_no_anchors());
         assert!(!result.is_valid());
     }
 
@@ -909,9 +969,14 @@ mod tests {
     /// before any lookup is even attempted.
     #[test]
     fn a_height_the_proof_contradicts_is_refuted_with_no_network() {
-        let rejection = prepare_fixture(Some(900_000), None)
-            .err()
-            .expect("a height the proof contradicts must be rejected");
+        let rejection = fixture_offline(Some(900_000), None);
+
+        // And no block lookup may be attempted for it: a refutation stands
+        // whatever a block explorer would report.
+        assert!(
+            prepare_fixture(Some(900_000), None).is_none(),
+            "a refuted anchor leaves the network nothing to settle"
+        );
 
         assert_eq!(
             rejection.verdict,
@@ -952,15 +1017,16 @@ mod tests {
     /// call despite exercising the online path.
     #[tokio::test]
     async fn the_online_path_refutes_a_contradicted_height_before_any_lookup() {
-        let anchor = fixture_anchor();
+        let receipt = fixture_receipt(Some(900_000), None);
+        let mut result = create_test_single_result(true);
+        result.receipt = receipt;
+        result.anchor_facts = crate::verify::anchor::establish_anchor_facts(&result.receipt, None);
+        result.anchor_results =
+            crate::verify::anchor::offline_results(&result.receipt, &result.anchor_facts);
+        let index = bitcoin_index(&result.receipt);
 
-        let result = verify_bitcoin_ots_online(
-            &anchor.target,
-            &anchor.target_hash,
-            &anchor.ots_proof,
-            anchor.super_root.as_deref(),
-            900_000,
-            &anchor.block_time,
+        verify_anchors_online(
+            &mut result,
             // A timeout short enough that a lookup, if one were attempted,
             // could not quietly succeed and make this test pass for the
             // wrong reason.
@@ -968,10 +1034,11 @@ mod tests {
                 request_timeout: Duration::from_millis(1),
             },
         )
-        .await;
+        .await
+        .expect("online pass must not fail");
 
         assert_eq!(
-            result.verdict,
+            result.anchor_results[index].verdict,
             AnchorVerdict::Invalid(ReasonCode::BitcoinClaimedHeightContradictsProof)
         );
     }
@@ -982,19 +1049,9 @@ mod tests {
     /// `untrusted` for the reason it already was, never `invalid`.
     #[test]
     fn an_unfetched_block_leaves_the_claimed_time_uncompared() {
-        let anchor = fixture_anchor();
-
-        let result = crate::verify::anchor::verify_bitcoin_ots_offline(
-            &anchor.target,
-            &anchor.target_hash,
-            &anchor.ots_proof,
-            anchor.super_root.as_deref(),
-            anchor.block_height,
-            // A time that is nowhere near the real block's. Offline it must
-            // make no difference whatsoever: an unperformed comparison
-            // cannot fail.
-            "1999-12-31T23:59:59Z",
-        );
+        // A time that is nowhere near the real block's. Offline it must make
+        // no difference whatsoever: an unperformed comparison cannot fail.
+        let result = fixture_offline(None, Some("1999-12-31T23:59:59Z"));
 
         assert_eq!(
             result.verdict,
@@ -1016,7 +1073,7 @@ mod tests {
 
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Corroborated {
                 reports: vec![
                     info.to_source_report("blockstream.info"),
@@ -1048,7 +1105,7 @@ mod tests {
 
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Corroborated {
                 reports: vec![
                     info.to_source_report("blockstream.info"),
@@ -1085,7 +1142,7 @@ mod tests {
             let info = header(BLOCK_TS, REAL_ROOT);
             let result = anchor_from_lookup(
                 &prepared,
-                "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+                &fixture_target_hash(),
                 BlockLookup::Corroborated {
                     reports: vec![
                         info.to_source_report("blockstream.info"),
@@ -1110,7 +1167,7 @@ mod tests {
 
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Corroborated {
                 reports: vec![
                     info.to_source_report("blockstream.info"),
@@ -1148,7 +1205,7 @@ mod tests {
             let info = header(BLOCK_TS, REAL_ROOT);
             let result = anchor_from_lookup(
                 &prepared,
-                "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+                &fixture_target_hash(),
                 BlockLookup::Corroborated {
                     reports: vec![
                         info.to_source_report("blockstream.info"),
@@ -1182,7 +1239,7 @@ mod tests {
             let info = header(BLOCK_TS, REAL_ROOT);
             let result = anchor_from_lookup(
                 &prepared,
-                "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+                &fixture_target_hash(),
                 BlockLookup::Corroborated {
                     reports: vec![
                         info.to_source_report("blockstream.info"),
@@ -1205,7 +1262,7 @@ mod tests {
         let info = header(BLOCK_TS, REAL_ROOT);
         let result = anchor_from_lookup(
             &prepared,
-            "sha256:d7b9361804864352cba323e3e5fa56aa2b64bf9299fa71b1df8b48cc97c5eebb",
+            &fixture_target_hash(),
             BlockLookup::Corroborated {
                 reports: vec![
                     info.to_source_report("blockstream.info"),

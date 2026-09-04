@@ -120,8 +120,11 @@ fn offline_batch_does_not_accept_an_unconfirmed_bitcoin_anchor() {
 
     assert_eq!(json["mode"], "offline");
     assert_eq!(json["status"], "untrusted");
-    // The TSA anchor of this receipt has an incomplete chain, so it reports
-    // first; what matters is that the batch is not accepted.
+    // No anchor of this receipt verifies offline without a trust store, so
+    // the item reports `receipt_unanchored` and the batch
+    // `batch_items_untrusted`. No anchor "reports first": the receipt's own
+    // reason is computed from the verified count and names none of them.
+    // What matters here is that the batch is not accepted.
     assert_eq!(json["summary"]["valid"], 0);
     assert_eq!(json["summary"]["untrusted"], 1);
     assert_ne!(json["items"][0]["status"], "valid");

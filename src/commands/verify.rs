@@ -145,7 +145,7 @@ fn execute_single(
 
 /// Settle the mode for one receipt and run the online pass if there is one.
 fn settle_single(verify_args: &VerifyArgs, result: &mut SingleVerificationResult) -> ModeOutcome {
-    let needs_network = receipt_requires_network(&result.receipt);
+    let needs_network = receipt_requires_network(&result.anchor_facts);
     let mode = match verify_args.determine_mode_for_receipt(needs_network) {
         Ok(mode) => mode,
         Err(error) => return ModeOutcome::not_attempted(error),
@@ -204,9 +204,12 @@ fn settle_batch(verify_args: &VerifyArgs, result: &mut BatchVerificationResult) 
     // items carry no anchors at all, so they never do.
     let needs_network = result.items.iter().any(|item| match item {
         BatchItemResult::Valid(r) | BatchItemResult::Untrusted(r) | BatchItemResult::Invalid(r) => {
-            receipt_requires_network(&r.receipt)
+            receipt_requires_network(&r.anchor_facts)
         }
-        // An unanchored item has no anchors, so it never needs the network.
+        // An item that presented no anchors has nothing for the network to
+        // settle. Note this is the bucket, not a fresh read of the array:
+        // an item whose appended anchor cannot bind to it is bucketed
+        // elsewhere and answers `false` on its own facts.
         _ => false,
     });
 
@@ -279,7 +282,7 @@ fn single_error(verify_args: &VerifyArgs, result: &SingleVerificationResult) -> 
             Some(ReasonCode::FileHashMismatch) => CliError::file_hash_mismatch(
                 &verify_args.source,
                 &result.file_hash,
-                &result.receipt.entry.payload_hash,
+                &result.receipt.entry().payload_hash,
             ),
             _ => CliError::VerificationFailed(invalid_detail(verdict, result)),
         }),
@@ -298,13 +301,6 @@ fn batch_error(result: &BatchVerificationResult) -> Option<CliError> {
             headline: untrusted_headline(verdict),
             reason_code: reason_str(verdict),
             detail: match verdict.reason_code {
-                Some(ReasonCode::BatchItemsUnanchored) => format!(
-                    "{} of {} receipts carry no anchors at all (Receipt-Lite). ATL v2.0 \u{a7}5.5: \
-                     a receipt without any verified anchors should be treated as untrustworthy. \
-                     Request an anchored receipt; no trust material supplied here can help",
-                    result.unanchored_count,
-                    result.total_count()
-                ),
                 Some(ReasonCode::BatchItemsUnmatched) => format!(
                     "{} of {} named files were never verified: a source file with no matching \
                      receipt, or a receipt with no matching source file. The convention is \
@@ -367,8 +363,18 @@ fn reason_str(verdict: ReceiptVerdict) -> &'static str {
 /// wrong verdict, wearing an explanation instead.
 ///
 /// So an anchor's prose is used only when that anchor's own reason code is
-/// the verdict's reason code. This is the rule the JSON renderer already
-/// applies in `build_errors`; the two now agree.
+/// the verdict's reason code.
+///
+/// # That condition is now unreachable, and the guard stays
+///
+/// [`Status::Invalid`] is reached only from
+/// [`SingleVerificationResult::receipt_refutation`], whose codes are all
+/// receipt-level, and an anchor never carries one of those — so the `find`
+/// below matches nothing and the detail is the bare reason code. Keeping the
+/// guard rather than deleting the lookup is deliberate: it is the rule, and
+/// a rule that holds vacuously today is what stops the prose being wired
+/// back to "the first refuted anchor" the next time somebody wants a more
+/// talkative message.
 fn invalid_detail(verdict: ReceiptVerdict, result: &SingleVerificationResult) -> String {
     let code = reason_str(verdict);
     let anchor_detail = result
@@ -393,11 +399,22 @@ fn trust_hint(result: &SingleVerificationResult) -> String {
     // could supply would change that. Saying "no anchor reached a configured
     // trust root" here would send them looking for trust material to fix a
     // receipt that never made a temporal claim at all.
-    if result.receipt.anchors.is_empty() {
-        return "the receipt carries no anchors at all (Receipt-Lite), so nothing external \
-                attests to when this existed. ATL v2.0 \u{a7}5.5: a receipt without any verified \
-                anchors should be treated as untrustworthy. Request an anchored receipt (TSA \
-                and/or Bitcoin); no trust material supplied here can substitute for one"
+    // §5.5's floor is met; the caller's own profile is not. Nothing is
+    // missing on this side, so no trust-material advice is honest here.
+    if result.verdict().reason_code == Some(ReasonCode::AnchorQuorumUnmet) {
+        return "at least one anchor IS verified, so ATL v2.0 \u{a7}5.5's floor is met; what is \
+                unmet is this tool's default profile, which asks that every anchor the receipt \
+                presents be verified. Re-run with --allow-single-anchor for \u{a7}5.5's own \
+                answer"
+            .to_string();
+    }
+
+    if result.presents_no_anchors() {
+        return "the receipt as it reached this tool carries no anchors at all (Receipt-Lite), \
+                so nothing external attests to when this existed. ATL v2.0 \u{a7}5.5: a receipt \
+                without any verified anchors should be treated as untrustworthy. Request an \
+                anchored receipt (TSA and/or Bitcoin); no trust material supplied here can \
+                substitute for one"
             .to_string();
     }
 
@@ -496,8 +513,8 @@ mod tests {
     /// only one had answered -- neither of which a certificate fixes.
     #[test]
     fn the_bitcoin_source_reasons_get_their_own_advice() {
-        let receipt: atl_core::Receipt =
-            serde_json::from_str(include_str!("../../real-data/receipt-full.atl"))
+        let receipt =
+            atl_core::Receipt::from_json(include_str!("../../real-data/receipt-full.atl"))
                 .expect("fixture receipt");
 
         for (reason, must_say) in [
@@ -513,6 +530,7 @@ mod tests {
                 core_result: atl_core::verify_receipt_anchor_only(&receipt)
                     .expect("fixture verifies"),
                 anchor_results: vec![bitcoin_anchor(reason)],
+                anchor_facts: Vec::new(),
                 policy: crate::verify::policy::AnchorPolicy::AllAnchors,
             };
 

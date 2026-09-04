@@ -48,7 +48,7 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
     // File hash comparison
     println!("File Hash:");
     println!("  Computed: {}", format_hash(&result.file_hash));
-    println!("  Expected: {}", result.receipt.entry.payload_hash);
+    println!("  Expected: {}", result.receipt.entry().payload_hash);
     print!("  Match: ");
     if result.file_hash_valid {
         print_status("YES", true, use_color);
@@ -67,7 +67,7 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
 
     // Receipt verification details
     println!("Receipt Verification:");
-    println!("  Entry ID: {}", result.receipt.entry.id);
+    println!("  Entry ID: {}", result.receipt.entry().id);
 
     // Inclusion proof - canonical verdict (base inclusion AND super-tree
     // proofs if the receipt has a super_proof), same source of truth the
@@ -80,34 +80,104 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
         print_status("INVALID", false, use_color);
     }
 
-    // Anchor status for lite receipts
-    if verdict.reason_code == Some(ReasonCode::ReceiptUnanchored) {
-        print!("  Anchor Status: ");
-        print_status_pending("UNANCHORED", use_color);
-        println!();
-        // The spec's own words for this tier (ATL v2.0 §5.5, §5.6): a
-        // Receipt-Lite "proves only internal consistency, not temporal
-        // existence", and "a receipt without any verified anchors SHOULD be
-        // treated as untrustworthy". This is why the outcome is `untrusted`
-        // and exit 3: nothing here is refuted, and nothing external attests
-        // to anything either.
-        println!(
-            "Note: Receipt-Lite. It proves internal consistency only, not temporal existence:"
+    // Two numbers, because they are two facts. `verified` counts anchors
+    // that reached a trust root the CALLER supplied, which nothing a
+    // stranger can do will raise; `presented` describes the document that
+    // arrived, and a receipt's `anchors` array is signed and hashed by
+    // nothing, so anybody who relayed it could have added to that one.
+    //
+    // This line used to read `Anchor Status: UNANCHORED`, printed when the
+    // reason code said so and computed from the array. Appending a single
+    // rubbish anchor to a Receipt-Lite made it disappear, so a receipt that
+    // had never been anchored stopped looking unanchored.
+    print!("  Anchors: ");
+    if assessment.verified_anchors > 0 {
+        print_status(
+            &format!(
+                "{} of {} verified",
+                assessment.verified_anchors, assessment.total_anchors
+            ),
+            true,
+            use_color,
         );
-        println!("      it carries no anchor, so nothing external attests to when this existed.");
-        println!("      ATL v2.0 §5.5 requires at least one VERIFIED anchor to establish trust,");
-        println!("      so this receipt is reported as untrusted (exit 3), not accepted.");
+    } else {
+        print_status_pending(
+            &format!("NONE VERIFIED ({} presented)", assessment.total_anchors),
+            use_color,
+        );
+        println!();
+    }
+
+    // The spec's own words for this tier (ATL v2.0 §5.5, §5.6): a
+    // Receipt-Lite "proves only internal consistency, not temporal
+    // existence", and "a receipt without any verified anchors SHOULD be
+    // treated as untrustworthy". This is why the outcome is `untrusted` and
+    // exit 3: nothing here is refuted, and nothing external attests to
+    // anything either.
+    //
+    // Gated on what was PRESENTED, and worded to say so. It is the one
+    // statement here a relay can suppress -- by appending an anchor -- and
+    // no rewording changes that; what matters is that nothing load-bearing
+    // hangs off it. The verdict, the reason code and the headline above are
+    // all computed from the verified count instead.
+    if result.presents_no_anchors() {
+        println!(
+            "Note: Receipt-Lite as it reached this tool. It proves internal consistency only,"
+        );
+        println!("      not temporal existence: it carries no anchor, so nothing external");
+        println!("      attests to when this existed. ATL v2.0 §5.5 requires at least one");
+        println!("      VERIFIED anchor to establish trust, so this receipt is reported as");
+        println!("      untrusted (exit 3), not accepted.");
         println!("      Request an upgraded receipt with TSA or Bitcoin anchoring for independent verification.");
     }
 
     print_anchor_section(&result.anchor_results, use_color);
     print_assessment(&assessment);
 
+    // Printed whatever the status, `valid` included. Under
+    // `--allow-single-anchor` one verified anchor meets the quorum, so a
+    // receipt can be accepted while carrying an anchor that was checked and
+    // FAILED -- and that anchor is a sign somebody interfered with the
+    // receipt on its way here. It does not change the verdict, and it must
+    // not be reported only when it happens to coincide with one: "does not
+    // decide the verdict" may not become "is not shown to anybody".
+    if assessment.refuted_anchors() > 0 {
+        print_refuted_anchor_notice(result);
+    }
+
     if verdict.status == Status::Untrusted {
         print_trust_hint(result);
     }
 
     Ok(())
+}
+
+/// Name every anchor that was checked and found false, and say what it means.
+///
+/// Nothing signs or hashes a receipt's `anchors` array, so an anchor that
+/// fails verification is one anybody who relayed the receipt could have
+/// attached. That is why it does not disprove the receipt — and exactly why
+/// the reader has to be told it is there.
+fn print_refuted_anchor_notice(result: &SingleVerificationResult) {
+    println!();
+    println!("An anchor attached to this receipt was checked and FAILED:");
+    for anchor in &result.anchor_results {
+        let AnchorVerdict::Invalid(code) = anchor.verdict else {
+            continue;
+        };
+        println!(
+            "  - The {} anchor: {}.\n    \
+             It is not counted towards ATL v2.0 §5.5, and it does not disprove the receipt:\n    \
+             a receipt's anchors are signed and hashed by nothing, so anyone who handled\n    \
+             this receipt could have attached it. Treat it as a sign of interference and\n    \
+             ask the log operator for the receipt as issued.",
+            format_anchor_type(&anchor.anchor_type),
+            code.as_str()
+        );
+        if let Some(detail) = &anchor.error {
+            println!("    Detail: {detail}");
+        }
+    }
 }
 
 /// Print the three axes: evidence, policy, coverage.
@@ -118,9 +188,6 @@ pub fn print_single_result(result: &SingleVerificationResult, use_color: bool) -
 /// Receipt-Full verified offline indistinguishable from one whose TSA root
 /// was never supplied.
 fn print_assessment(assessment: &TrustAssessment) {
-    if assessment.total_anchors == 0 {
-        return;
-    }
     println!();
     println!("Trust Assessment:");
     println!(
@@ -132,17 +199,18 @@ fn print_assessment(assessment: &TrustAssessment) {
         "  Evidence: {} ({} of {} anchors verified; ATL v2.0 §5.5 needs at least 1)",
         if assessment.evidence_established() {
             "ESTABLISHED"
-        } else if assessment.has_refutation() {
+        } else if assessment.receipt_refuted() {
             // Never "NOT ESTABLISHED (0 verified)" here: there may well be
             // verified anchors, and the count beside it says so. What
             // disqualifies the receipt is the refutation, and the line must
             // name that rather than leave a reader to reconcile a refusal
             // with a non-zero tally.
             //
-            // The wording covers both sources -- a refuted anchor and a
-            // refuted receipt (a mismatched source file, a broken proof) --
-            // because the reason code printed further up already says which,
-            // and this line's job is to say why the axis refuses.
+            // Only a refutation of the RECEIPT reaches this arm. A refuted
+            // anchor is something anybody who relayed the receipt could have
+            // appended, so it neither establishes nor withdraws trust: it is
+            // reported under Coverage below, where the accounting for every
+            // anchor presented belongs.
             "REFUTED — see the Reason above"
         } else {
             "NOT ESTABLISHED"
@@ -152,7 +220,11 @@ fn print_assessment(assessment: &TrustAssessment) {
     );
     println!(
         "  Coverage: {}",
-        if assessment.coverage_complete() {
+        if assessment.total_anchors == 0 {
+            // Vacuously complete, and saying "COMPLETE" unqualified beside
+            // a receipt nothing attests to would read as an achievement.
+            "COMPLETE (no anchors were presented, so there is nothing to account for)"
+        } else if assessment.coverage_complete() {
             "COMPLETE (every anchor presented was carried to a sound result)"
         } else {
             "INCOMPLETE"
@@ -184,7 +256,7 @@ fn print_assessment(assessment: &TrustAssessment) {
         "  Receipt-Full profile (§5.6, both anchor types verified): {}",
         if assessment.max_trust_profile() {
             "YES"
-        } else if assessment.has_refutation() {
+        } else if assessment.receipt_refuted() {
             "NO — this receipt was refuted"
         } else {
             "NO"
@@ -205,13 +277,17 @@ fn print_assessment(assessment: &TrustAssessment) {
 /// that never matched up.
 pub fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
     match verdict.reason_code {
-        // Nothing is missing on this side and nothing could be supplied:
-        // the receipt itself never carried an anchor. ATL v2.0 §5.5.
-        Some(ReasonCode::ReceiptUnanchored) => {
-            "NOT VERIFIED: the receipt carries no anchors (Receipt-Lite)"
-        }
-        Some(ReasonCode::BatchItemsUnanchored) => {
-            "NOT VERIFIED: some receipts carry no anchors (Receipt-Lite)"
+        // ATL v2.0 §5.5's floor is unmet. Deliberately worded as "no anchor
+        // was verified" rather than "the receipt carries no anchors": this
+        // code covers a Receipt-Lite and a receipt whose anchors all failed
+        // alike, because the `anchors` array is authenticated by nothing and
+        // the second is what the first looks like after a relay appends to
+        // it. Whether any were presented is said below, from
+        // `presents_no_anchors`, and labelled as what arrived.
+        Some(ReasonCode::ReceiptUnanchored) => "NOT VERIFIED: no anchor was verified",
+        // §5.5's floor IS met; the caller's stricter profile is not.
+        Some(ReasonCode::AnchorQuorumUnmet) => {
+            "NOT VERIFIED: not every anchor the receipt presents was verified"
         }
         // A pairing problem, not a trust problem: pointing the reader at
         // --tsa-trust-store here would waste their time entirely.
@@ -249,6 +325,44 @@ pub fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
             "NOT VERIFIED: the receipt's own Bitcoin block time could not be read, so it was \
              not compared"
         }
+        // An anchor was checked and found false.
+        //
+        // **Unreachable today, and kept deliberately.** The receipt's own
+        // reason is now computed from the verified-anchor count and names no
+        // anchor (`receipt_unanchored` / `anchor_quorum_unmet`), so no
+        // anchor code reaches a receipt verdict. These arms stay because the
+        // alternative is the `_` fallback -- "trust root unavailable" --
+        // which would be the wrong advice and would hide the one thing worth
+        // seeing, and because a headline that fails closed is what stops a
+        // future change to `unsatisfied_reason` from silently producing it.
+        Some(
+            ReasonCode::AnchorTargetInvalid
+            | ReasonCode::AnchorHashMalformed
+            | ReasonCode::AnchorTargetHashMismatch
+            | ReasonCode::SuperProofMissing
+            | ReasonCode::TsaTokenUnparsable
+            | ReasonCode::TsaImprintMismatch
+            | ReasonCode::TsaImprintMalformed
+            | ReasonCode::CmsSignatureInvalid
+            | ReasonCode::TsaTimestampingEkuInvalid
+            | ReasonCode::TsaChainInvalidAtGenTime
+            | ReasonCode::BitcoinOtsProofInvalid
+            | ReasonCode::BitcoinMerkleRootMismatch
+            | ReasonCode::BitcoinClaimedHeightContradictsProof
+            | ReasonCode::BitcoinClaimedTimeContradictsBlock,
+        ) => {
+            "NOT VERIFIED: an anchor was checked and failed (the receipt itself is not \
+             disproved)"
+        }
+        // Nothing about the receipt was disproved and a check about the
+        // receipt itself did not finish, so nothing can be supplied here
+        // either.
+        Some(ReasonCode::ReceiptCheckIncomplete) => {
+            "NOT VERIFIED: a check on the receipt could not be completed (nothing was refuted)"
+        }
+        Some(ReasonCode::AnchorTypeUnsupported) => {
+            "NOT VERIFIED: this build cannot verify an anchor of that type"
+        }
         _ => "NOT VERIFIED: trust root unavailable",
     }
 }
@@ -256,9 +370,12 @@ pub fn untrusted_headline(verdict: ReceiptVerdict) -> &'static str {
 /// Print the overall status line for one receipt.
 ///
 /// `Untrusted` is deliberately worded so it cannot be read as damage to the
-/// evidence: nothing was refuted, this verifier is simply not configured to
-/// finish the check. It is printed in the warning colour,
-/// never the failure colour.
+/// receipt: nothing about the receipt was refuted. It covers a verifier that
+/// is simply not configured to finish the check *and* a receipt one of whose
+/// anchors was checked and found false — the headline
+/// ([`untrusted_headline`]) distinguishes them, and the anchor is printed in
+/// full either way. It is printed in the warning colour, never the failure
+/// colour: the failure colour is for a receipt this run disproved.
 fn print_receipt_status(
     verdict: ReceiptVerdict,
     assessment: Option<&TrustAssessment>,
@@ -268,17 +385,28 @@ fn print_receipt_status(
         // A success reached only because the quorum was lowered must never
         // be printed as a bare "VALID". The caller relaxed the policy; the
         // headline says so, and the Trust Assessment block beneath lists
-        // every anchor that went unresolved. Presenting this as
+        // every anchor that did not come through. Presenting this as
         // unconditional acceptance would be exactly the overclaim the flag
         // was added to make explicit.
+        //
+        // Both kinds of gap are counted. Under `--allow-single-anchor` one
+        // verified anchor meets the quorum, so a receipt can be accepted
+        // while carrying an anchor that was checked and FAILED -- an anchor
+        // anybody who relayed it could have appended, which is why it does
+        // not disprove the receipt, and exactly why the success line may not
+        // pass over it in silence. Counting only `unresolved` printed
+        // "0 unresolved" beside "1 of 2 anchors verified" and left the
+        // reader to work out where the second one went.
         Status::Valid => match assessment.filter(|a| a.accepted_with_gaps()) {
             Some(a) => print_status(
                 &format!(
-                    "VALID under policy '{}' ({} of {} anchors verified; {} unresolved)",
+                    "VALID under policy '{}' ({} of {} anchors verified; {} unresolved, {} \
+                     REFUTED)",
                     a.policy.as_str(),
                     a.verified_anchors,
                     a.total_anchors,
-                    a.unresolved.len()
+                    a.unresolved.len(),
+                    a.refuted_anchors()
                 ),
                 true,
                 use_color,
@@ -312,17 +440,42 @@ fn print_receipt_status(
 /// certificate that would not help.
 fn print_trust_hint(result: &SingleVerificationResult) {
     println!();
-    println!("The evidence was NOT disproved. This verifier could not finish checking it:");
+    // Deliberately "the receipt", not "the evidence": one of the receipt's
+    // anchors may well have been refuted, and [`print_refuted_anchor_notice`]
+    // has just said so above. What was not disproved is the document.
+    println!("The RECEIPT was NOT disproved. This verifier could not establish trust in it:");
+
+    // §5.5's floor IS met and the caller's own stricter profile is not.
+    // Nothing about any anchor needs supplying, so the loop below has
+    // nothing to print -- it used to fall through it and leave the headline
+    // above standing alone over an empty block.
+    if result.verdict().reason_code == Some(ReasonCode::AnchorQuorumUnmet) {
+        println!(
+            "  - At least one anchor IS verified, so ATL v2.0 §5.5's floor is met. What is\n    \
+             unmet is the '--allow-single-anchor'-off default, which asks that EVERY anchor\n    \
+             the receipt presents be verified. Re-run with --allow-single-anchor to be told\n    \
+             §5.5's answer instead, and see the Coverage list above for the anchors that\n    \
+             did not come through."
+        );
+        println!(
+            "    Note that this profile is defined over the anchors PRESENTED, and a receipt's\n    \
+             anchors are signed and hashed by nothing -- so anybody who relayed this receipt\n    \
+             could have appended one and produced this outcome. It is not a finding about\n    \
+             the receipt: --allow-single-anchor cannot be moved that way."
+        );
+        return;
+    }
 
     // A Receipt-Lite has no anchor to enumerate, and no file the caller
     // could supply would change that. Falling through to the loop below
     // printed nothing at all under that headline.
-    if result.receipt.anchors.is_empty() {
+    if result.presents_no_anchors() {
         println!(
-            "  - The receipt carries no anchors at all (Receipt-Lite), so nothing external\n    \
-             attests to when this existed. ATL v2.0 §5.5 requires at least one verified\n    \
-             anchor. No certificate and no network access can supply one: ask the log\n    \
-             operator for an anchored receipt (Receipt-TSA or Receipt-Full)."
+            "  - The receipt as it reached this tool carries no anchors at all\n    \
+             (Receipt-Lite), so nothing external attests to when this existed. ATL v2.0\n    \
+             §5.5 requires at least one verified anchor. No certificate and no network\n    \
+             access can supply one: ask the log operator for an anchored receipt\n    \
+             (Receipt-TSA or Receipt-Full)."
         );
         return;
     }
@@ -602,7 +755,7 @@ fn print_anchor_section(anchors: &[AnchorVerificationResult], use_color: bool) {
 /// The per-anchor status line, derived from the same classification as the
 /// JSON `trust_state` field and the anchor's `verified` flag.
 fn print_anchor_status(anchor: &AnchorVerificationResult, use_color: bool) {
-    match anchor.details.rfc3161_trust_state() {
+    match anchor.rfc3161_trust_state() {
         Some("trusted") => print_status("TRUSTED", true, use_color),
         Some("assumed") => print_status_pending("NOT TRUSTED (root not supplied)", use_color),
         Some("incomplete") => {
@@ -846,7 +999,7 @@ pub fn print_batch_result(result: &BatchVerificationResult, use_color: bool) -> 
                                 .file_name()
                                 .is_some_and(|f| f == name.as_str()) =>
                         {
-                            r.receipt.super_proof.as_ref()
+                            r.receipt.super_proof()
                         }
                         _ => None,
                     });
@@ -1342,7 +1495,12 @@ mod tests {
     use std::path::PathBuf;
 
     fn create_test_receipt() -> atl_core::Receipt {
-        serde_json::from_str(include_str!(
+        // `from_json`, not `serde_json::from_str`: the latter produces a
+        // receipt whose bytes were never checked for duplicate property
+        // names, which `atl-core` will not confirm. Production parses
+        // through the same call (`crate::verify::single::load_receipt`), and
+        // a fixture that did not would be testing a receipt no run produces.
+        atl_core::Receipt::from_json(include_str!(
             "../../test_data/receipts/valid/document.pdf.atl"
         ))
         .expect("Failed to parse test receipt")
@@ -1374,8 +1532,32 @@ mod tests {
             receipt: create_test_receipt(),
             core_result: create_test_verification_result(core_valid),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         }
+    }
+
+    /// Attach one anchor to a receipt.
+    ///
+    /// `Receipt` exposes no setters and no `&mut` accessors, so "add an
+    /// anchor" is spelled as "assemble a new receipt from the parts". That
+    /// is exactly what a relay appending one has to do, which is the point
+    /// the invariant tests turn on.
+    fn receipt_plus_anchor(
+        receipt: &atl_core::Receipt,
+        anchor: ReceiptAnchor,
+    ) -> atl_core::Receipt {
+        let mut anchors = receipt.anchors().to_vec();
+        anchors.push(anchor);
+        atl_core::ReceiptBuilder::new(
+            receipt.spec_version().to_string(),
+            receipt.entry().clone(),
+            receipt.proof().clone(),
+        )
+        .super_proof_option(receipt.super_proof().cloned())
+        .anchors(anchors)
+        .upgrade_url_option(receipt.upgrade_url().map(str::to_string))
+        .build(atl_core::SourceTextCheck::assume_duplicate_property_names_already_rejected())
     }
 
     /// Attach one RFC 3161 anchor (and its verdict) to a receipt.
@@ -1385,13 +1567,16 @@ mod tests {
         path_status: PathStatus,
         terminal: Option<TerminalAnchor>,
     ) -> SingleVerificationResult {
-        result.receipt.anchors.push(ReceiptAnchor::Rfc3161 {
-            target: "data_tree_root".to_string(),
-            target_hash: result.receipt.proof.root_hash.clone(),
-            tsa_url: "https://example.invalid/tsa".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            token_der: "base64:token".to_string(),
-        });
+        result.receipt = receipt_plus_anchor(
+            &result.receipt,
+            ReceiptAnchor::Rfc3161 {
+                target: "data_tree_root".to_string(),
+                target_hash: result.receipt.proof().root_hash.clone(),
+                tsa_url: "https://example.invalid/tsa".to_string(),
+                timestamp: "2024-01-01T00:00:00Z".to_string(),
+                token_der: "base64:token".to_string(),
+            },
+        );
         result.anchor_results.push(AnchorVerificationResult {
             anchor_type: "rfc3161".to_string(),
             verdict,
@@ -1474,28 +1659,51 @@ mod tests {
         }
     }
 
+    /// Regression guard for the conflation this crate exists to remove: the
+    /// `Untrusted` wording must not read as damage to the evidence, and must
+    /// differ from both VALID and INVALID.
+    ///
+    /// The headline is asserted, not merely rendered. It used to bind an
+    /// `expected` string and then discard it with `let _ = expected;`, so
+    /// the table documented wordings nothing checked — and one of its rows
+    /// paired an anchor-level reason code with a receipt verdict, a shape
+    /// the tool no longer produces at all.
     #[test]
     fn every_receipt_status_has_its_own_wording() {
-        // Regression guard for the conflation this change removes: the
-        // `Untrusted` wording must not read as damage to the evidence, and
-        // must differ from both VALID and INVALID.
+        // Every reason code a RECEIPT's `untrusted` verdict can actually
+        // carry. The anchor-level codes are deliberately absent: the
+        // top-level reason is computed from the verified-anchor count and
+        // names no anchor.
         for (verdict, expected) in [
-            (ReceiptVerdict::VALID, "VALID"),
             (
                 ReceiptVerdict::unanchored(),
-                "NOT VERIFIED: the receipt carries no anchors (Receipt-Lite)",
+                "NOT VERIFIED: no anchor was verified",
             ),
             (
-                ReceiptVerdict::untrusted(ReasonCode::TsaRootNotTrusted),
-                "NOT VERIFIED: trust root unavailable",
+                ReceiptVerdict::untrusted(ReasonCode::AnchorQuorumUnmet),
+                "NOT VERIFIED: not every anchor the receipt presents was verified",
             ),
             (
-                ReceiptVerdict::invalid(ReasonCode::FileHashMismatch),
-                "INVALID",
+                ReceiptVerdict::untrusted(ReasonCode::ReceiptCheckIncomplete),
+                "NOT VERIFIED: a check on the receipt could not be completed (nothing was \
+                 refuted)",
             ),
         ] {
-            let _ = expected;
-            // Rendering must not panic in either color mode.
+            assert_eq!(untrusted_headline(verdict), expected);
+            // None of them may read as damage to the evidence.
+            assert!(
+                !untrusted_headline(verdict).contains("INVALID"),
+                "{expected}"
+            );
+        }
+
+        // Rendering must not panic in either colour mode, for every status.
+        for verdict in [
+            ReceiptVerdict::VALID,
+            ReceiptVerdict::unanchored(),
+            ReceiptVerdict::untrusted(ReasonCode::AnchorQuorumUnmet),
+            ReceiptVerdict::invalid(ReasonCode::FileHashMismatch),
+        ] {
             print_receipt_status(verdict, None, false);
             print_receipt_status(verdict, None, true);
         }
@@ -1542,8 +1750,18 @@ mod tests {
         assert!(print_single_result(&result, false).is_ok());
     }
 
+    /// **A refuted anchor is rendered, and does not make the receipt
+    /// `invalid`.**
+    ///
+    /// A receipt authenticates neither the presence nor the contents of its
+    /// `anchors` array, so this anchor is one anybody who relayed the
+    /// receipt could have appended. It is `untrusted` — the quorum is unmet
+    /// — never `invalid`, which would say the receipt itself was disproved.
+    /// The renderer must still print it: an appended anchor is evidence that
+    /// somebody interfered, and hiding it because it does not gate the
+    /// verdict would be the mirror-image defect.
     #[test]
-    fn refuted_anchor_receipt_renders_as_invalid() {
+    fn refuted_anchor_receipt_renders_as_untrusted_and_is_shown() {
         let result = with_rfc3161_anchor(
             single_result(true, true),
             AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid),
@@ -1552,8 +1770,66 @@ mod tests {
                 sha256_fingerprint: [0u8; 32],
             }),
         );
-        assert_eq!(result.verdict().status, Status::Invalid);
+        assert_eq!(result.verdict().status, Status::Untrusted);
+        assert_eq!(
+            result.verdict().reason_code,
+            Some(ReasonCode::ReceiptUnanchored),
+            "the receipt's own reason is that no anchor verified; naming the \
+             anchor here would let whoever appended it choose the headline"
+        );
+        assert_eq!(result.assessment().refuted_anchors(), 1);
+        assert!(!result.assessment().coverage_complete());
         assert!(print_single_result(&result, false).is_ok());
+    }
+
+    /// The other half: an anchor that **passes** does move the outcome.
+    ///
+    /// Without this beside it, the test above cannot tell "the invariant
+    /// holds" from "anchors do not matter".
+    #[test]
+    fn a_verified_anchor_still_carries_the_receipt() {
+        let refuted = with_rfc3161_anchor(
+            single_result(true, true),
+            AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid),
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [0u8; 32],
+            }),
+        );
+        assert_eq!(refuted.verdict().status, Status::Untrusted);
+
+        let mut accepted = with_rfc3161_anchor(
+            single_result(true, true),
+            AnchorVerdict::Valid,
+            PathStatus::Complete,
+            Some(TerminalAnchor::Trusted {
+                sha256_fingerprint: [0u8; 32],
+            }),
+        );
+        assert_eq!(accepted.verdict().status, Status::Valid);
+
+        // And appending a refuted anchor beside the verified one does not
+        // take that back, under the quorum that asks for one verified
+        // anchor. Under the default profile it does, because that profile
+        // asks for every anchor presented -- a property of the profile, not
+        // a finding about the receipt.
+        let with_appended = with_rfc3161_anchor(
+            accepted.clone(),
+            AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid),
+            PathStatus::Complete,
+            None,
+        );
+        let mut relaxed = with_appended.clone();
+        relaxed.policy = AnchorPolicy::SingleAnchor;
+        assert_eq!(
+            relaxed.verdict().status,
+            Status::Valid,
+            "an anchor anybody could have appended may not withdraw a verified one"
+        );
+        assert_eq!(with_appended.verdict().status, Status::Untrusted);
+
+        accepted.policy = AnchorPolicy::SingleAnchor;
+        assert_eq!(accepted.verdict().status, Status::Valid);
     }
 
     #[test]

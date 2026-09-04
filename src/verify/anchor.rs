@@ -1,28 +1,52 @@
-//! Anchor verification and the per-anchor verdict every renderer reads.
+//! The per-anchor verdict every renderer reads, projected from the facts
+//! `atl-core` establishes.
+//!
+//! # What this module is not
+//!
+//! It is **not** an implementation of ATL v2.0 §5.5. That is
+//! [`verify_receipt_anchors`], and this crate calls it: binding each anchor
+//! to the receipt's own root, decoding the payload, running the steps the
+//! specification names and deciding which facts refute and which merely fail
+//! to confirm is *protocol orchestration*, and a second implementation of a
+//! mandatory rule drifts from the first. This crate carried one, and every
+//! defect fixed on one side stayed open on the other until it did not.
+//!
+//! What lives here is everything downstream of the facts:
+//!
+//! * [`AnchorVerdict`] and [`AnchorState`] — this CLI's three-valued
+//!   classification, and the granularity a user can act on;
+//! * [`reason_for_finding`] — the stable `snake_case` reason codes, which are
+//!   this CLI's contract and deliberately not `atl-core`'s vocabulary;
+//! * [`AnchorDetails`] — the fact set as the renderers publish it;
+//! * [`BlockSourceReport`] and [`PreparedOts`] — the Bitcoin half, which
+//!   `atl-core` cannot finish because it performs no I/O.
 //!
 //! RFC 3161 verification is **pure computation**: decoding the token,
 //! checking the CMS signature, and walking the certificate chain need no
-//! network access whatsoever. It therefore runs on every verification,
-//! offline and online alike, and lives here rather than in
-//! [`crate::verify::online`]. Only `bitcoin_ots` anchors need the network,
-//! and only to ask block-explorer APIs for the header whose Merkle root the
-//! OTS proof is compared against. Nothing here observes the Bitcoin network.
+//! network access whatsoever. It therefore reaches a final answer on every
+//! verification, offline and online alike. Only `bitcoin_ots` anchors need
+//! the network, and only to ask block-explorer APIs for the header whose
+//! Merkle root the OTS proof is compared against
+//! ([`crate::verify::online`]). Nothing here observes the Bitcoin network.
 //!
 //! Per the ATL trust model (`docs-md/atl-trust-model-decisions.md`, decision
 //! Р1) nothing in this module knows any identity: no root, no fingerprint,
 //! no TSA name. All trust material arrives as a caller-supplied
 //! [`TrustStore`], built from `--tsa-trust-store` / `--tsa-intermediates`.
+//!
+//! # A refuted anchor is not a refuted receipt
+//!
+//! Nothing signs or hashes a receipt's `anchors` array, so every refutation
+//! this module can report is one anybody who relayed the receipt could have
+//! manufactured. It is always shown — an appended anchor is a sign of
+//! interference — and it never decides the receipt's status. See
+//! [`crate::verify::single::SingleVerificationResult::verdict`].
 
-use atl_core::core::ots::{
-    attestation_for_claimed_height, attested_block_heights, BitcoinAttestation,
-};
-use atl_core::core::verify::anchors::bitcoin_ots::verify_ots_anchor_impl;
-use atl_core::core::verify::anchors::rfc3161::verify_rfc3161_token;
-use atl_core::core::verify::iso8601::parse_iso8601_to_nanos;
+use atl_core::ots::BitcoinAttestation;
 use atl_core::{
-    CmsSignature, MessageImprint, PathStatus, ReceiptAnchor, Revocation, Rfc3161AnchorFacts,
-    SelfSignature, TerminalAnchor, TimestampingEku, TrustStore, ANCHOR_TARGET_DATA_TREE_ROOT,
-    ANCHOR_TARGET_SUPER_ROOT,
+    verify_receipt_anchors, AnchorEvidence, AnchorFacts, CmsSignature, MessageImprint, PathStatus,
+    ReceiptAnchor, Revocation, Rfc3161AnchorFacts, SelfSignature, TerminalAnchor, TimestampingEku,
+    TrustStore, VerificationError, VerifyOptions,
 };
 use subtle::ConstantTimeEq;
 
@@ -118,6 +142,14 @@ pub enum AnchorVerdict {
     /// be evaluated at all. See the [`ReasonCode`] for which.
     Untrusted(ReasonCode),
     /// At least one fact about the anchor was checked and is false.
+    ///
+    /// **About the anchor, and about nothing else.** A receipt's `anchors`
+    /// array is covered by neither the leaf hash nor the checkpoint blob, so
+    /// anybody who relays a receipt can append an entry to it with no key —
+    /// which means every refutation this crate can report about an anchor is
+    /// one a stranger could have produced. It is always shown, and it never
+    /// makes the receipt [`crate::verify::verdict::Status::Invalid`]. See
+    /// [`crate::verify::single::SingleVerificationResult::verdict`].
     Invalid(ReasonCode),
 }
 
@@ -268,7 +300,10 @@ impl AnchorState {
             // `bitcoin_block_time` is a string this build's parser cannot
             // read, so the comparison §5.5.2 step 5 asks for never ran. No
             // certificate and no network access changes it.
-            | ReasonCode::BitcoinClaimedTimeUnreadable => Self::Unevaluable,
+            | ReasonCode::BitcoinClaimedTimeUnreadable
+            // A sixth: the Cargo feature that implements this anchor type is
+            // compiled out, so nothing about the anchor was examined at all.
+            | ReasonCode::AnchorTypeUnsupported => Self::Unevaluable,
 
             // Everything below is either a refutation or a receipt-/batch-
             // level aggregate, and none of them reaches this function: a
@@ -306,11 +341,12 @@ impl AnchorState {
             | ReasonCode::BitcoinMerkleRootMismatch
             | ReasonCode::BitcoinClaimedHeightContradictsProof
             | ReasonCode::BitcoinClaimedTimeContradictsBlock
+            | ReasonCode::ReceiptCheckIncomplete
             | ReasonCode::ReceiptUnanchored
+            | ReasonCode::AnchorQuorumUnmet
             | ReasonCode::BatchItemsInvalid
             | ReasonCode::BatchItemsErrored
             | ReasonCode::BatchItemsUntrusted
-            | ReasonCode::BatchItemsUnanchored
             | ReasonCode::BatchItemsUnmatched
             | ReasonCode::BatchNothingVerified
             | ReasonCode::LogConsistencyFailed => Self::Unresolved,
@@ -386,6 +422,35 @@ impl AnchorVerificationResult {
     pub const fn state(&self) -> AnchorState {
         self.verdict.state()
     }
+
+    /// Stable JSON/prose label for an RFC 3161 anchor's trust state, or
+    /// `None` for any other anchor type.
+    ///
+    /// Derived from [`Self::verdict`] — the one classification every
+    /// consumer reads — so the label can never disagree with the verdict,
+    /// the receipt status, or the exit code. It lived on
+    /// [`AnchorDetails`] while the CLI formed the verdict from those same
+    /// fields; now that `atl-core` establishes the facts and the verdict
+    /// follows from its findings, the fact set is no longer a place a
+    /// verdict can be recomputed from.
+    #[must_use]
+    pub const fn rfc3161_trust_state(&self) -> Option<&'static str> {
+        if !matches!(self.details, AnchorDetails::Rfc3161 { .. }) {
+            return None;
+        }
+        Some(match self.verdict {
+            AnchorVerdict::Valid => "trusted",
+            AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted) => "assumed",
+            AnchorVerdict::Untrusted(
+                ReasonCode::TsaChainIndeterminate
+                | ReasonCode::CmsSignatureIndeterminate
+                | ReasonCode::TsaImprintIndeterminate
+                | ReasonCode::TsaTimestampingEkuNotChecked,
+            ) => "indeterminate",
+            AnchorVerdict::Untrusted(_) => "incomplete",
+            AnchorVerdict::Invalid(_) => "failed",
+        })
+    }
 }
 
 /// What became of the *time* half of ATL v2.0 §5.5.2 step 5: the receipt's
@@ -450,13 +515,14 @@ pub enum AnchorDetails {
         /// Whether the CMS `SignerInfo` signature verified, was refuted, or
         /// could not be evaluated at all. Three-valued because an algorithm
         /// `atl-core` does not implement must not be published as a broken
-        /// signature — see [`AnchorDetails::rfc3161_verdict`].
+        /// signature — see [`reason_for_finding`].
         cms_signature: CmsSignature,
         /// Every link on the constructed path was valid at `genTime`.
         ///
         /// `atl-core` reports this as `false` whenever no complete path was
         /// built, so it is only a *refutation* when `path_status` is
-        /// [`PathStatus::Invalid`] — see [`AnchorDetails::rfc3161_verdict`].
+        /// [`PathStatus::Invalid`] — a rule `atl-core` applies inside the
+        /// finding it reports, never re-derived here.
         chain_valid_at_gen_time: bool,
         /// What stopped the chain from completing, in prose, when
         /// `atl-core` had something to say. Never load-bearing.
@@ -573,156 +639,6 @@ pub enum AnchorDetails {
 }
 
 impl AnchorDetails {
-    /// Classify an RFC 3161 anchor's facts. Returns `None` for any other
-    /// anchor type.
-    ///
-    /// This is the ONLY place the RFC 3161 trust decision is made; the
-    /// per-anchor verdict, the receipt status, both renderers and the exit
-    /// code are all derived from it.
-    ///
-    /// # Aggregation, not early returns
-    ///
-    /// Every fact is collected before any verdict is formed. An earlier
-    /// version returned as soon as it met a non-`Verified` fact, which meant
-    /// an *inability* encountered first silently suppressed a *refutation*
-    /// found later: `message_imprint: Indeterminate` together with
-    /// `cms_signature: Refuted` came out `untrusted`, even though
-    /// `untrusted` is defined as "nothing was refuted". Having spent this
-    /// whole rework stopping the CLI from accusing without grounds, that
-    /// produced the mirror-image defect — concealing what had actually been
-    /// proved.
-    ///
-    /// So: gather every refutation first; if any exists, the anchor is
-    /// `Invalid`. Only when there is none may an inability be reported, and
-    /// only then can the outcome be `Untrusted`. Any refuted fact outranks
-    /// every indeterminate fact, whichever order they appear in.
-    #[must_use]
-    pub fn rfc3161_verdict(&self) -> Option<AnchorVerdict> {
-        let Self::Rfc3161 {
-            message_imprint,
-            cms_signature,
-            chain_valid_at_gen_time,
-            timestamping_eku,
-            path_status,
-            terminal_anchor,
-            ..
-        } = self
-        else {
-            return None;
-        };
-
-        // ---- Phase 1: every refutation, gathered before judging ----
-        //
-        // Ordered by how directly each bears on "does this token attest to
-        // THIS receipt", so the reported code is the most informative one
-        // when several hold at once. Which is reported never changes the
-        // verdict: any entry at all means `Invalid`.
-        let mut refutations: Vec<ReasonCode> = Vec::new();
-
-        match message_imprint {
-            MessageImprint::Mismatch => refutations.push(ReasonCode::TsaImprintMismatch),
-            // A structurally broken imprint is refuted too, but calling it a
-            // mismatch would explain a proven defect with the wrong cause.
-            MessageImprint::Malformed => refutations.push(ReasonCode::TsaImprintMalformed),
-            MessageImprint::Verified | MessageImprint::Indeterminate => {}
-        }
-        if matches!(cms_signature, CmsSignature::Refuted) {
-            refutations.push(ReasonCode::CmsSignatureInvalid);
-        }
-        match timestamping_eku {
-            // Checked, and the certificate does not satisfy RFC 3161 2.3.
-            TimestampingEku::Absent
-            | TimestampingEku::Malformed
-            | TimestampingEku::NotCritical
-            | TimestampingEku::NotExclusive => {
-                refutations.push(ReasonCode::TsaTimestampingEkuInvalid);
-            }
-            // Never examined (no signer was established) — an inability, and
-            // reporting it as an EKU failure would refute on an unchecked
-            // fact. Handled in phase 2.
-            TimestampingEku::Ok | TimestampingEku::NotChecked => {}
-        }
-        match path_status {
-            // A candidate link was found and failed validation.
-            PathStatus::Invalid => refutations.push(ReasonCode::TsaChainInvalidAtGenTime),
-            // A path that completed must also have been valid at genTime;
-            // `atl-core` cannot produce the contrary, but if it ever did,
-            // that is a refutation and not a success.
-            PathStatus::Complete if !*chain_valid_at_gen_time => {
-                refutations.push(ReasonCode::TsaChainInvalidAtGenTime);
-            }
-            PathStatus::Complete | PathStatus::Incomplete | PathStatus::Indeterminate => {}
-        }
-
-        if let Some(reason) = refutations.first() {
-            return Some(AnchorVerdict::Invalid(*reason));
-        }
-
-        // ---- Phase 2: nothing was refuted; report the first inability ----
-        if matches!(message_imprint, MessageImprint::Indeterminate) {
-            return Some(AnchorVerdict::Untrusted(
-                ReasonCode::TsaImprintIndeterminate,
-            ));
-        }
-        if matches!(cms_signature, CmsSignature::Indeterminate) {
-            return Some(AnchorVerdict::Untrusted(
-                ReasonCode::CmsSignatureIndeterminate,
-            ));
-        }
-        if matches!(timestamping_eku, TimestampingEku::NotChecked) {
-            return Some(AnchorVerdict::Untrusted(
-                ReasonCode::TsaTimestampingEkuNotChecked,
-            ));
-        }
-
-        Some(match path_status {
-            // Ran out of certificates before any terminal: a missing issuer,
-            // not a broken one.
-            PathStatus::Incomplete => AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete),
-            // The path could not be *evaluated* — unsupported cryptography
-            // or the depth limit. Fail closed, but never a refutation. This
-            // is inspected before `terminal_anchor`, because an
-            // `Indeterminate` path can still carry an `Assumed` terminal
-            // whose self-signature is precisely what could not be checked,
-            // and reporting that as `tsa_root_not_trusted` would name the
-            // wrong problem.
-            PathStatus::Indeterminate => {
-                AnchorVerdict::Untrusted(ReasonCode::TsaChainIndeterminate)
-            }
-            PathStatus::Complete => match terminal_anchor {
-                Some(TerminalAnchor::Trusted { .. }) => AnchorVerdict::Valid,
-                Some(TerminalAnchor::Assumed { .. }) => {
-                    AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted)
-                }
-                // `Complete` always carries a terminal in atl-core; treat
-                // the impossible case as missing material rather than as a
-                // refutation.
-                None => AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete),
-            },
-            // Handled in phase 1; unreachable here.
-            PathStatus::Invalid => AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime),
-        })
-    }
-
-    /// Stable JSON/prose label for an RFC 3161 anchor's trust state,
-    /// derived from [`Self::rfc3161_verdict`] so it can never disagree with
-    /// the verdict, the status, or the exit code.
-    #[must_use]
-    pub fn rfc3161_trust_state(&self) -> Option<&'static str> {
-        Some(match self.rfc3161_verdict()? {
-            AnchorVerdict::Valid => "trusted",
-            AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted) => "assumed",
-            AnchorVerdict::Untrusted(
-                ReasonCode::TsaChainIndeterminate
-                | ReasonCode::CmsSignatureIndeterminate
-                | ReasonCode::TsaImprintIndeterminate
-                | ReasonCode::TsaTimestampingEkuNotChecked,
-            ) => "indeterminate",
-            AnchorVerdict::Untrusted(_) => "incomplete",
-            AnchorVerdict::Invalid(_) => "failed",
-        })
-    }
-
     /// The SHA-256 fingerprint (hex, no prefix) of the certificate a caller
     /// would have to add to `--tsa-trust-store` to turn an
     /// `Untrusted`/`Assumed` outcome into `Valid`. `None` when the chain
@@ -742,48 +658,12 @@ impl AnchorDetails {
     }
 }
 
-/// Decode a `"sha256:<64 hex chars>"` string into a 32-byte hash.
-///
-/// Delegates to [`atl_core::core::checkpoint::parse_hash`] so this crate's
-/// notion of "a valid hash string" can never drift from `atl-core`'s. The
-/// prefix must be exactly `"sha256:"` (lowercase); the hex digits
-/// themselves are case-insensitive.
-fn decode_hash_hex(s: &str) -> Result<[u8; 32], String> {
-    atl_core::core::checkpoint::parse_hash(s).map_err(|e| e.to_string())
-}
-
-/// Constant-time 32-byte comparison.
-///
-/// The hashes compared here are not secret (they are published inside the
-/// receipt), but comparing them in constant time matches `atl-core`'s own
-/// internal pinning and this project's policy of never using `==` on
-/// hash/digest values.
-fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    a.ct_eq(b).into()
-}
-
-/// Build a rejection result carrying no fact set.
-fn rejected(
-    anchor_type: &str,
-    verdict: AnchorVerdict,
-    timestamp_nanos: Option<u64>,
-    error: String,
-) -> AnchorVerificationResult {
-    AnchorVerificationResult {
-        anchor_type: anchor_type.to_string(),
-        verdict,
-        timestamp_nanos,
-        error: Some(error),
-        details: AnchorDetails::Unknown,
-    }
-}
-
 /// Render a compact explanation of why an RFC 3161 anchor did not reach
 /// `Valid`.
 ///
-/// Prose only: every fact it reads was already computed by `atl-core`'s
-/// `verify_rfc3161_token`, and the verdict was already decided by
-/// [`AnchorDetails::rfc3161_verdict`]. This function re-derives nothing.
+/// Prose only: every fact it reads was already established by `atl-core`,
+/// and the verdict was already decided by [`verdict_from_facts`] from the
+/// findings `atl-core` reported. This function re-derives nothing.
 fn summarize_rfc3161(facts: &Rfc3161AnchorFacts) -> String {
     let mut reasons = Vec::new();
     match facts.message_imprint {
@@ -895,134 +775,364 @@ fn summarize_rfc3161(facts: &Rfc3161AnchorFacts) -> String {
     }
 }
 
-/// Verify one RFC 3161 anchor. Entirely local: no network access.
+/// The stable CLI reason code for one finding `atl-core` reported about an
+/// anchor.
 ///
-/// # Anchor pinning (ATL Protocol v2.0, "RFC 3161 Anchor", steps 1-2)
+/// This is a **translation**, not a classification: whether a finding is a
+/// refutation or an inability is decided by
+/// [`VerificationError::is_refutation`] in `atl-core`, and this function is
+/// never asked. It only names, in this CLI's own stable vocabulary, what the
+/// core already established — so a reason code cannot claim a strength the
+/// finding behind it does not have.
 ///
-/// Steps 1 and 2 require checking that `anchor.target` is `"data_tree_root"`
-/// and that `anchor.target_hash` equals `proof.root_hash` *before* any
-/// cryptographic verification. Without step 2 a genuine token minted for an
-/// unrelated hash would be reported as proof for THIS receipt: the token
-/// only proves the TSA once timestamped `anchor.target_hash`.
+/// # Exhaustive on purpose
 ///
-/// `atl-core` performs the same pinning internally in
-/// `core::verify::helpers::verify_rfc3161_anchor`, but that module is
-/// `pub(in crate::core)` and the reachable whole-receipt entry points
-/// collapse each anchor to a bare `is_valid: bool`. This path needs the full
-/// [`Rfc3161AnchorFacts`], so it duplicates the pinning check — kept to the
-/// few lines below, using the same `subtle` constant-time comparison.
-///
-/// # Trust
-///
-/// Steps 3-5 (decode, verify the CMS signature, match the `messageImprint`)
-/// plus chain construction, validity at `genTime` and EKU checking are all
-/// performed by [`verify_rfc3161_token`]. `trust_store` comes only from the
-/// caller's flags, never from the receipt or the token.
-pub fn verify_rfc3161_anchor(
-    target: &str,
-    target_hash: &str,
-    timestamp: &str,
-    token_der: &str,
-    data_tree_root: &str,
-    trust_store: Option<&TrustStore>,
-) -> AnchorVerificationResult {
-    // STEP 1: the anchor must target the Data Tree root.
-    if target != ANCHOR_TARGET_DATA_TREE_ROOT {
-        return rejected(
-            "rfc3161",
-            AnchorVerdict::Invalid(ReasonCode::AnchorTargetInvalid),
-            None,
-            format!("Invalid target '{target}', expected '{ANCHOR_TARGET_DATA_TREE_ROOT}'"),
-        );
-    }
+/// No wildcard arm. A finding `atl-core` adds later must be given a reason
+/// code deliberately; a catch-all would silently publish it under whatever
+/// code happened to be nearest, and this crate's whole contract is that the
+/// code names what was actually found.
+fn reason_for_finding(finding: &VerificationError) -> ReasonCode {
+    match finding {
+        // ---- ATL v2.0 §5.5.1 / §5.5.2 steps 1-2: binding the anchor ----
+        VerificationError::AnchorTargetInvalid { .. } => ReasonCode::AnchorTargetInvalid,
+        VerificationError::AnchorTargetHashMismatch { .. } => ReasonCode::AnchorTargetHashMismatch,
+        // Every hash `atl-core` reports unreadable while binding an anchor:
+        // the anchor's own `target_hash`, and the receipt root it must pin
+        // to (`proof.root_hash` / `super_proof.super_root`).
+        VerificationError::InvalidHash { .. } => ReasonCode::AnchorHashMalformed,
+        VerificationError::MissingSuperProof => ReasonCode::SuperProofMissing,
 
-    // Attacker-controlled input from the receipt: not yet trusted to say
-    // anything about THIS receipt's Data Tree.
-    let claimed_hash = match decode_hash_hex(target_hash) {
-        Ok(h) => h,
-        Err(e) => {
-            return rejected(
-                "rfc3161",
-                AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed),
-                None,
-                e,
-            )
-        }
-    };
-
-    let expected_root = match decode_hash_hex(data_tree_root) {
-        Ok(h) => h,
-        Err(e) => {
-            return rejected(
-                "rfc3161",
-                AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed),
-                None,
-                format!("invalid proof.root_hash: {e}"),
-            )
-        }
-    };
-
-    // STEP 2: pin the anchor to THIS receipt's Data Tree root.
-    if !constant_time_eq(&claimed_hash, &expected_root) {
-        return rejected(
-            "rfc3161",
-            AnchorVerdict::Invalid(ReasonCode::AnchorTargetHashMismatch),
-            None,
-            "target_hash does not match proof.root_hash".to_string(),
-        );
-    }
-
-    let token_with_prefix = if token_der.starts_with("base64:") {
-        token_der.to_string()
-    } else {
-        format!("base64:{token_der}")
-    };
-
-    // STEPS 3-5 plus trust. The receipt's own root hash (now proven equal to
-    // the anchor's claim) is passed as the expected hash, not the anchor's
-    // claim, so a future refactor cannot drop the pinning check above and
-    // still appear to work.
-    match verify_rfc3161_token(&token_with_prefix, &expected_root, trust_store) {
-        Ok(facts) => {
-            let details = AnchorDetails::Rfc3161 {
-                message_imprint: facts.message_imprint,
-                cms_signature: facts.cms_signature,
-                chain_valid_at_gen_time: facts.chain_valid_at_gen_time,
-                chain_diagnostic: facts.chain_diagnostic.clone(),
-                timestamping_eku_ok: facts.timestamping_eku_ok,
-                timestamping_eku: facts.timestamping_eku,
-                path_status: facts.path_status,
-                terminal_anchor: facts.terminal_anchor,
-                revocation: facts.revocation,
-            };
-            let verdict = details.rfc3161_verdict().unwrap_or(AnchorVerdict::Invalid(
-                ReasonCode::ReceiptVerificationFailed,
-            ));
-            let error = if verdict.is_valid() {
-                None
+        // ---- Step 3: the payload ----
+        VerificationError::AnchorPayloadUndecodable { anchor_type, .. } => {
+            if anchor_type == "bitcoin_ots" {
+                ReasonCode::BitcoinOtsProofInvalid
             } else {
-                Some(summarize_rfc3161(&facts))
-            };
-            AnchorVerificationResult {
-                anchor_type: "rfc3161".to_string(),
-                verdict,
-                timestamp_nanos: facts.gen_time.or_else(|| parse_iso8601_to_nanos(timestamp)),
-                error,
-                details,
+                ReasonCode::TsaTokenUnparsable
             }
         }
-        Err(e) => rejected(
-            "rfc3161",
-            AnchorVerdict::Invalid(ReasonCode::TsaTokenUnparsable),
-            parse_iso8601_to_nanos(timestamp),
-            e.to_string(),
-        ),
+        VerificationError::AnchorTypeUnsupported { .. } => ReasonCode::AnchorTypeUnsupported,
+
+        // ---- §5.5.2 steps 4-5: Bitcoin ----
+        VerificationError::BitcoinHeightContradictsProof { .. } => {
+            ReasonCode::BitcoinClaimedHeightContradictsProof
+        }
+        // `atl-core` performs no I/O, so it never obtains a block header.
+        // Offline that is the honest end of the road; online it is replaced
+        // wholesale by [`crate::verify::online`], which does fetch one.
+        VerificationError::BitcoinBlockNotObtained => ReasonCode::BitcoinBlockNotChecked,
+
+        // ---- §5.5.1 steps 4-5 plus chain construction: RFC 3161 ----
+        //
+        // Each of these carries the fact itself, so the refuted/indeterminate
+        // split is read off the payload and never guessed from the variant.
+        VerificationError::Rfc3161MessageImprint(imprint) => match imprint {
+            MessageImprint::Mismatch => ReasonCode::TsaImprintMismatch,
+            // Refuted too, but calling it a mismatch would explain a proven
+            // defect with the wrong cause: no comparison was attempted.
+            MessageImprint::Malformed => ReasonCode::TsaImprintMalformed,
+            MessageImprint::Verified | MessageImprint::Indeterminate => {
+                ReasonCode::TsaImprintIndeterminate
+            }
+        },
+        VerificationError::Rfc3161CmsSignature(signature) => match signature {
+            CmsSignature::Refuted => ReasonCode::CmsSignatureInvalid,
+            CmsSignature::Verified | CmsSignature::Indeterminate => {
+                ReasonCode::CmsSignatureIndeterminate
+            }
+        },
+        VerificationError::Rfc3161TimestampingEku(eku) => match eku {
+            // All four were *checked* and fail RFC 3161 2.3.
+            TimestampingEku::Absent
+            | TimestampingEku::Malformed
+            | TimestampingEku::NotCritical
+            | TimestampingEku::NotExclusive => ReasonCode::TsaTimestampingEkuInvalid,
+            // Never examined: no signer certificate was settled on.
+            TimestampingEku::Ok | TimestampingEku::NotChecked => {
+                ReasonCode::TsaTimestampingEkuNotChecked
+            }
+        },
+        VerificationError::Rfc3161CertificatePath {
+            status,
+            valid_at_gen_time,
+        } => match status {
+            // A candidate link was found and rejected; and a path that
+            // completed yet is invalid at genTime is a contradiction.
+            PathStatus::Invalid => ReasonCode::TsaChainInvalidAtGenTime,
+            PathStatus::Complete if !valid_at_gen_time => ReasonCode::TsaChainInvalidAtGenTime,
+            // Ran out of certificates: a missing issuer, not a broken one.
+            PathStatus::Incomplete => ReasonCode::TsaChainIncomplete,
+            // The path could not be *evaluated*. Deliberately not
+            // `tsa_chain_incomplete`, which would send the reader hunting
+            // for a certificate that would not help.
+            PathStatus::Indeterminate | PathStatus::Complete => ReasonCode::TsaChainIndeterminate,
+        },
+        // Nothing is refuted by the absence of a reason to believe a
+        // certificate. `None` means the chain named no terminal at all,
+        // which is missing material rather than an untrusted one.
+        VerificationError::Rfc3161TerminalNotTrusted { terminal } => match terminal {
+            Some(TerminalAnchor::Assumed { .. }) => ReasonCode::TsaRootNotTrusted,
+            Some(TerminalAnchor::Trusted { .. }) | None => ReasonCode::TsaChainIncomplete,
+        },
+
+        // ---- Not findings about an anchor ----
+        //
+        // `verify_receipt_anchors` produces none of these. They are the
+        // receipt-level errors, which travel through
+        // [`crate::verify::single`] instead. Reaching this arm would mean a
+        // receipt-level fact had been attributed to an anchor, so the
+        // weakest honest code is the right answer.
+        VerificationError::InvalidReceipt(_)
+        | VerificationError::SignatureFailed
+        | VerificationError::InclusionProofFailed { .. }
+        | VerificationError::ConsistencyProofFailed { .. }
+        | VerificationError::RootHashMismatch
+        | VerificationError::TreeSizeMismatch
+        | VerificationError::SuperInclusionFailed { .. }
+        | VerificationError::SuperConsistencyFailed { .. }
+        | VerificationError::SuperDataMismatch { .. }
+        | VerificationError::UnsupportedVersion(_)
+        | VerificationError::MetadataHashMismatch { .. }
+        | VerificationError::MetadataNotCanonicalizable { .. }
+        | VerificationError::SourceTextNotChecked
+        | VerificationError::NoTrustAnchor { .. }
+        | VerificationError::AnchorFinding { .. } => ReasonCode::ReceiptVerificationFailed,
     }
 }
 
-/// Everything a Bitcoin OTS anchor's local (network-free) pass establishes.
+/// Reduce one anchor's fact set to this CLI's three-valued verdict.
+///
+/// The three outcomes are `atl-core`'s own — [`AnchorFacts::is_verified`],
+/// [`AnchorFacts::is_refuted`], [`AnchorFacts::is_indeterminate`] — and they
+/// partition, so nothing here collapses them into two. **Any refutation
+/// outranks every inability**, which is why the refutations are consulted
+/// first: `atl-core` gathers every finding before any is weighed, and this
+/// reads them in that order.
+fn verdict_from_facts(facts: &AnchorFacts) -> AnchorVerdict {
+    if let Some(refutation) = facts.refutations().next() {
+        return AnchorVerdict::Invalid(reason_for_finding(refutation));
+    }
+    if let Some(inability) = facts.inabilities().next() {
+        return AnchorVerdict::Untrusted(reason_for_finding(inability));
+    }
+    AnchorVerdict::Valid
+}
+
+/// Prose for one finding, for a reader rather than for a branch.
+///
+/// Never load-bearing: every consumer branches on
+/// [`AnchorVerificationResult::verdict`]. The evidence each message quotes
+/// comes out of the finding itself, so a message cannot describe a check
+/// that was not the one performed.
+fn describe_finding(finding: &VerificationError) -> String {
+    match finding {
+        VerificationError::AnchorTargetInvalid {
+            expected, actual, ..
+        } => {
+            format!("Invalid target '{actual}', expected '{expected}'")
+        }
+        VerificationError::AnchorTargetHashMismatch { anchor_type, .. } => {
+            if anchor_type == "bitcoin_ots" {
+                "target_hash does not match super_root".to_string()
+            } else {
+                "target_hash does not match proof.root_hash".to_string()
+            }
+        }
+        // The anchor's own `target_hash` is named by the message alone; a
+        // receipt root that would not parse is named by its field, because
+        // the reader must be told which of the two hashes is unreadable.
+        VerificationError::InvalidHash { field, message } => {
+            if field == "anchor.target_hash" {
+                message.clone()
+            } else {
+                format!("invalid {field}: {message}")
+            }
+        }
+        VerificationError::MissingSuperProof => "Receipt has no super_proof".to_string(),
+        VerificationError::AnchorPayloadUndecodable {
+            anchor_type,
+            reason,
+        } => {
+            if anchor_type == "bitcoin_ots" {
+                format!("OTS verification failed: {reason}")
+            } else {
+                reason.clone()
+            }
+        }
+        VerificationError::AnchorTypeUnsupported {
+            anchor_type,
+            required_feature,
+        } => format!(
+            "this build cannot verify {anchor_type} anchors: it was compiled without the \
+             {required_feature} feature -- nothing about the anchor was examined"
+        ),
+        VerificationError::BitcoinHeightContradictsProof { claimed, attested } => {
+            let heights = attested
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "the receipt states bitcoin_block_height {claimed}, but its own OTS proof \
+                 attests to no such block (attested: [{heights}])"
+            )
+        }
+        VerificationError::BitcoinBlockNotObtained => "Bitcoin block not fetched: the OTS \
+             proof's merkle root was not compared against any block header, and neither was \
+             the block time the receipt states (re-run with network access)"
+            .to_string(),
+        // The RFC 3161 findings are summarised together by
+        // [`summarize_rfc3161`], which reads the whole fact set and can say
+        // that several things went wrong at once.
+        _ => finding_fallback(finding),
+    }
+}
+
+/// The last resort for a finding [`describe_finding`] has no wording for.
+///
+/// Kept separate so the common path stays readable, and deliberately says
+/// only what is known rather than inventing a cause.
+fn finding_fallback(finding: &VerificationError) -> String {
+    format!("{finding:?}")
+}
+
+/// The message an anchor carries beside its verdict.
+///
+/// `None` exactly when the anchor is [`AnchorVerdict::Valid`]: there is
+/// nothing to explain.
+fn error_for_facts(facts: &AnchorFacts) -> Option<String> {
+    if facts.is_verified() {
+        return None;
+    }
+    // An RFC 3161 token that decoded has a whole fact set to report on, and
+    // several of its facts can fail at once. Summarising them together is
+    // more use than quoting whichever one happens to decide the verdict.
+    if let AnchorEvidence::Rfc3161(rfc3161) = facts.evidence() {
+        return Some(summarize_rfc3161(rfc3161));
+    }
+    // Otherwise the finding that decided the verdict is the message: a
+    // refutation if there is one, and only then an inability.
+    facts
+        .refutations()
+        .next()
+        .or_else(|| facts.inabilities().next())
+        .map(describe_finding)
+}
+
+/// The Bitcoin fact set as this CLI publishes it, built from whatever
+/// `atl-core` was able to establish.
+///
+/// Produced for **every** `bitcoin_ots` anchor, including one rejected
+/// before its proof was ever decoded: the receipt's own two claims
+/// (`bitcoin_block_height`, `bitcoin_block_time`) and the `target_hash` come
+/// from the anchor itself, and they are what a reader most wants to see
+/// beside a damaged anchor.
+#[allow(clippy::option_if_let_else)] // the `if let` here reads better than `map_or_else`
+fn bitcoin_details(
+    target_hash: &str,
+    receipt_block_height: u64,
+    receipt_block_time: &str,
+    evidence: &AnchorEvidence,
+) -> AnchorDetails {
+    let (proof_block_height, proof_block_heights, operation_count, computed_root) =
+        if let AnchorEvidence::BitcoinOts(bitcoin) = evidence {
+            (
+                bitcoin.attestation.as_ref().map(|a| a.block_height),
+                bitcoin.attested_block_heights.clone(),
+                bitcoin.attestation.as_ref().map(|a| a.merkle_path.len()),
+                bitcoin.computed_block_merkle_root.clone(),
+            )
+        } else {
+            (None, Vec::new(), None, None)
+        };
+
+    AnchorDetails::Bitcoin {
+        proof_block_height,
+        proof_block_heights,
+        receipt_block_height,
+        receipt_block_time: receipt_block_time.to_string(),
+        // `atl-core` obtains no block header, so §5.5.2 step 5's time half
+        // was not carried out. Reporting that as anything but "not compared"
+        // would be the overclaim this whole taxonomy exists to prevent. The
+        // online pass replaces the whole result when it does obtain one.
+        claimed_time_check: ClaimedTimeCheck::NotCompared,
+        block_timestamp_secs: None,
+        target_hash: target_hash.to_string(),
+        operation_count,
+        computed_root,
+        block_merkle_root: None,
+        merkle_match: None,
+        block_sources: Vec::new(),
+    }
+}
+
+/// Turn one anchor's `atl-core` fact set into the result every renderer,
+/// the policy and the exit code read.
+///
+/// `anchor` is the entry the facts were established for — index-aligned with
+/// the `Vec` [`establish_anchor_facts`] returns — and supplies the fields
+/// that are the receipt's own assertions rather than findings about them.
+fn result_from_facts(anchor: &ReceiptAnchor, facts: &AnchorFacts) -> AnchorVerificationResult {
+    let (details, timestamp_nanos) = match anchor {
+        ReceiptAnchor::Rfc3161 { .. } => {
+            let details = match facts.evidence() {
+                AnchorEvidence::Rfc3161(rfc3161) => AnchorDetails::Rfc3161 {
+                    message_imprint: rfc3161.message_imprint,
+                    cms_signature: rfc3161.cms_signature,
+                    chain_valid_at_gen_time: rfc3161.chain_valid_at_gen_time,
+                    chain_diagnostic: rfc3161.chain_diagnostic.clone(),
+                    timestamping_eku_ok: rfc3161.timestamping_eku_ok,
+                    timestamping_eku: rfc3161.timestamping_eku,
+                    path_status: rfc3161.path_status,
+                    terminal_anchor: rfc3161.terminal_anchor,
+                    revocation: rfc3161.revocation,
+                },
+                // Rejected before the token was read, so there is no fact
+                // set: a wrong `target`, an unreadable hash, a `target_hash`
+                // that pins to some other root, or a token that would not
+                // decode.
+                _ => AnchorDetails::Unknown,
+            };
+            // The token's own `genTime`, or the anchor's `timestamp` field
+            // when the token would not decode. A claim, never an
+            // established time -- the renderers publish it under a
+            // `claimed_*` name until the verdict is `Valid`.
+            (details, facts.claimed_timestamp())
+        }
+        ReceiptAnchor::BitcoinOts {
+            target_hash,
+            bitcoin_block_height,
+            bitcoin_block_time,
+            ..
+        } => (
+            bitcoin_details(
+                target_hash,
+                *bitcoin_block_height,
+                bitcoin_block_time,
+                facts.evidence(),
+            ),
+            // Left empty offline on purpose. For a `bitcoin_ots` anchor this
+            // field carries the time of the block header the sources agreed
+            // on -- an established fact -- and no header exists here. The
+            // anchor's own `timestamp` claim is not put in its place: the
+            // renderers would publish it as `claimed_timestamp`, a field
+            // this anchor type has never had.
+            None,
+        ),
+    };
+
+    AnchorVerificationResult {
+        anchor_type: anchor.anchor_type().to_string(),
+        verdict: verdict_from_facts(facts),
+        timestamp_nanos,
+        error: error_for_facts(facts),
+        details,
+    }
+}
+
+/// Everything a Bitcoin OTS anchor's network-free pass established, in the
+/// shape the online pass needs.
 pub struct PreparedOts {
-    /// Earliest Bitcoin attestation in the proof.
+    /// The attestation the receipt's own claimed height selected.
     pub attestation: BitcoinAttestation,
     /// Merkle root computed from the OTS proof, `sha256:` prefixed.
     pub computed_root: String,
@@ -1035,1119 +1145,618 @@ pub struct PreparedOts {
     /// publish it beside the proof's own. Equal to
     /// `attestation.block_height` by the time this struct exists — the
     /// attestation was *selected by* this claim, and a claim matching no
-    /// attestation is a refutation that never reaches here.
+    /// attestation is a refutation from which no `PreparedOts` is built.
     pub receipt_block_height: u64,
     /// The block time the receipt states, verbatim. Nothing offline can
     /// check it; the online pass compares it with the header it obtained.
     pub receipt_block_time: String,
 }
 
-/// Run every network-free check a `bitcoin_ots` anchor admits: target
-/// pinning, OTS proof decoding, extraction of the earliest attestation, and
-/// the height half of ATL v2.0 §5.5.2 step 5.
-///
-/// # Step 5 splits by what the network is needed for
-///
-/// Step 5 asks that "`bitcoin_block_height` and `bitcoin_block_time` match
-/// the proof". The height is *in* the proof — an `OpenTimestamps` Bitcoin
-/// attestation encodes it — so comparing it with the receipt's own field is
-/// pure computation and belongs here, where both the offline and the online
-/// path run it. A receipt whose stated height its own proof contradicts is
-/// **refuted**, offline included.
-///
-/// The block time is in no proof; it exists only in the block header. It can
-/// therefore be compared only after a header has been obtained, which is the
-/// online pass's job ([`crate::verify::online`]). Offline the comparison
-/// does not happen, and the honest report of that is
-/// [`ClaimedTimeCheck::NotCompared`] — never a mismatch, because "we could
-/// not check" must never be published as "we checked and it failed".
-///
-/// Returns `Err(result)` with a finished rejection when a check fails, so
-/// both the offline and the online path share exactly these rules.
-///
-/// The `Err` variant is a full [`AnchorVerificationResult`] on purpose: a
-/// rejected anchor must carry the same reported shape as an accepted one,
-/// and boxing it here would buy a few stack bytes on a path that runs at
-/// most a handful of times per receipt.
-#[allow(clippy::result_large_err)]
-pub fn prepare_bitcoin_ots(
-    target: &str,
-    target_hash: &str,
-    ots_proof: &str,
-    super_root: Option<&str>,
-    receipt_block_height: u64,
-    receipt_block_time: &str,
-) -> Result<PreparedOts, AnchorVerificationResult> {
-    // Every rejection below carries a Bitcoin fact set rather than
-    // `AnchorDetails::Unknown`, so the receipt's own two claims are
-    // published for a damaged anchor as well as a sound one. They used to be
-    // dropped exactly here -- at the anchors where a reader most wants to
-    // see what the receipt asserted.
-    let reject = |verdict: AnchorVerdict, error: String, proof: Option<&BitcoinAttestation>| {
-        AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verdict,
-            timestamp_nanos: None,
-            error: Some(error),
-            details: AnchorDetails::Bitcoin {
-                proof_block_height: proof.map(|a| a.block_height),
-                proof_block_heights: proof.map(|a| vec![a.block_height]).unwrap_or_default(),
-                receipt_block_height,
-                receipt_block_time: receipt_block_time.to_string(),
-                claimed_time_check: ClaimedTimeCheck::NotCompared,
-                block_timestamp_secs: None,
-                target_hash: target_hash.to_string(),
-                operation_count: proof.map(|a| a.merkle_path.len()),
-                computed_root: None,
-                block_merkle_root: None,
-                merkle_match: None,
-                block_sources: Vec::new(),
-            },
+impl PreparedOts {
+    /// What the network still has to settle for this anchor, or `None` when
+    /// there is nothing left for it to settle.
+    ///
+    /// `None` covers three cases, and none of them may be turned into a
+    /// block lookup:
+    ///
+    /// * the anchor is not a `bitcoin_ots` anchor at all;
+    /// * it was **refuted** — a wrong `target`, a `target_hash` naming
+    ///   another root, an undecodable proof, a stated height its own proof
+    ///   contradicts. A refutation stands whatever a block explorer says,
+    ///   and fetching a block for it would invite the header to overwrite
+    ///   the finding;
+    /// * no attestation or no computed Merkle root was established, so there
+    ///   is nothing to compare a header against and no height to ask for.
+    #[must_use]
+    pub fn from_facts(facts: &AnchorFacts) -> Option<Self> {
+        if facts.is_refuted() {
+            return None;
         }
-    };
-
-    if target != ANCHOR_TARGET_SUPER_ROOT {
-        return Err(reject(
-            AnchorVerdict::Invalid(ReasonCode::AnchorTargetInvalid),
-            format!("Invalid target '{target}', expected '{ANCHOR_TARGET_SUPER_ROOT}'"),
-            None,
-        ));
-    }
-
-    let Some(expected_super_root) = super_root else {
-        return Err(reject(
-            AnchorVerdict::Invalid(ReasonCode::SuperProofMissing),
-            "Receipt has no super_proof".to_string(),
-            None,
-        ));
-    };
-
-    let claimed_hash = match decode_hash_hex(target_hash) {
-        Ok(h) => h,
-        Err(e) => {
-            return Err(reject(
-                AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed),
-                e,
-                None,
-            ))
-        }
-    };
-
-    let expected_hash = match decode_hash_hex(expected_super_root) {
-        Ok(h) => h,
-        Err(e) => {
-            return Err(reject(
-                AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed),
-                format!("invalid super_proof.super_root: {e}"),
-                None,
-            ))
-        }
-    };
-
-    if !constant_time_eq(&claimed_hash, &expected_hash) {
-        return Err(reject(
-            AnchorVerdict::Invalid(ReasonCode::AnchorTargetHashMismatch),
-            "target_hash does not match super_root".to_string(),
-            None,
-        ));
-    }
-
-    let ots_result = match verify_ots_anchor_impl(ots_proof, &expected_hash) {
-        Ok(r) => r,
-        Err(e) => {
-            return Err(reject(
-                AnchorVerdict::Invalid(ReasonCode::BitcoinOtsProofInvalid),
-                format!("OTS verification failed: {e}"),
-                None,
-            ))
-        }
-    };
-
-    if ots_result.attestations.is_empty() {
-        return Err(reject(
-            AnchorVerdict::Invalid(ReasonCode::BitcoinOtsProofInvalid),
-            "No Bitcoin attestations in OTS proof".to_string(),
-            None,
-        ));
-    }
-    let attested = attested_block_heights(&ots_result.attestations);
-
-    // ATL v2.0 §5.5.2 step 5, height half. Two independent assertions -- the
-    // receipt's `bitcoin_block_height` and what its own OTS proof attests to
-    // -- and no network is needed to compare them.
-    //
-    // The rule is `atl-core`'s `attestation_for_claimed_height`, not a
-    // second copy kept here: the claim holds if it matches ANY attestation.
-    // This code once compared against the lowest, a criterion §5.5.2 nowhere
-    // states, under which a receipt naming a block genuinely present in its
-    // own proof was refuted by an invented rule.
-    let Some(attestation) =
-        attestation_for_claimed_height(&ots_result.attestations, receipt_block_height)
-    else {
-        let heights = attested
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return Err(AnchorVerificationResult {
-            anchor_type: "bitcoin_ots".to_string(),
-            verdict: AnchorVerdict::Invalid(ReasonCode::BitcoinClaimedHeightContradictsProof),
-            timestamp_nanos: None,
-            error: Some(format!(
-                "the receipt states bitcoin_block_height {receipt_block_height}, but its own \
-                 OTS proof attests to no such block (attested: [{heights}])"
-            )),
-            // The full fact set: the claim and every attested height are the
-            // evidence for this refutation, and a reader cannot check the
-            // finding without seeing which claim came from where.
-            details: AnchorDetails::Bitcoin {
-                // No attestation was selected, so there is no single
-                // "the proof's height" to name. The set is what there is.
-                proof_block_height: None,
-                proof_block_heights: attested,
-                receipt_block_height,
-                receipt_block_time: receipt_block_time.to_string(),
-                claimed_time_check: ClaimedTimeCheck::NotCompared,
-                block_timestamp_secs: None,
-                target_hash: target_hash.to_string(),
-                operation_count: None,
-                computed_root: None,
-                block_merkle_root: None,
-                merkle_match: None,
-                block_sources: Vec::new(),
-            },
-        });
-    };
-
-    let Some(last_hash) = attestation.merkle_path.last() else {
-        return Err(reject(
-            AnchorVerdict::Invalid(ReasonCode::BitcoinOtsProofInvalid),
-            "Empty merkle path in attestation".to_string(),
-            Some(attestation),
-        ));
-    };
-
-    // Bitcoin displays hashes byte-reversed relative to their internal form.
-    let mut reversed = *last_hash;
-    reversed.reverse();
-
-    Ok(PreparedOts {
-        computed_root: format!("sha256:{}", hex::encode(reversed)),
-        operation_count: attestation.merkle_path.len(),
-        attestation: attestation.clone(),
-        attested_block_heights: attested,
-        receipt_block_height,
-        receipt_block_time: receipt_block_time.to_string(),
-    })
-}
-
-/// Verify a `bitcoin_ots` anchor as far as is possible without the network.
-///
-/// A structurally sound OTS proof whose block was never fetched is
-/// [`AnchorVerdict::Untrusted`], not `Valid`: the proof's computed Merkle
-/// root has not been compared against any block header, so nothing external
-/// corroborates it yet. Reporting it as accepted would be the same silent
-/// overclaim as printing `mode: online` without going online.
-pub fn verify_bitcoin_ots_offline(
-    target: &str,
-    target_hash: &str,
-    ots_proof: &str,
-    super_root: Option<&str>,
-    receipt_block_height: u64,
-    receipt_block_time: &str,
-) -> AnchorVerificationResult {
-    let prepared = match prepare_bitcoin_ots(
-        target,
-        target_hash,
-        ots_proof,
-        super_root,
-        receipt_block_height,
-        receipt_block_time,
-    ) {
-        Ok(p) => p,
-        Err(result) => return result,
-    };
-
-    AnchorVerificationResult {
-        anchor_type: "bitcoin_ots".to_string(),
-        verdict: AnchorVerdict::Untrusted(ReasonCode::BitcoinBlockNotChecked),
-        timestamp_nanos: None,
-        error: Some(
-            "Bitcoin block not fetched: the OTS proof's merkle root was not compared against \
-             any block header, and neither was the block time the receipt states (re-run with \
-             network access)"
-                .to_string(),
-        ),
-        details: AnchorDetails::Bitcoin {
-            proof_block_height: Some(prepared.attestation.block_height),
-            proof_block_heights: prepared.attested_block_heights,
-            receipt_block_height: prepared.receipt_block_height,
-            receipt_block_time: prepared.receipt_block_time,
-            // Offline there is no header, so §5.5.2 step 5's time half was
-            // not carried out. Reporting that as anything but "not
-            // compared" would be the overclaim this whole taxonomy exists
-            // to prevent.
-            claimed_time_check: ClaimedTimeCheck::NotCompared,
-            block_timestamp_secs: None,
-            target_hash: target_hash.to_string(),
-            operation_count: Some(prepared.operation_count),
-            computed_root: Some(prepared.computed_root),
-            block_merkle_root: None,
-            merkle_match: None,
-            block_sources: Vec::new(),
-        },
+        let AnchorEvidence::BitcoinOts(bitcoin) = facts.evidence() else {
+            return None;
+        };
+        let attestation = bitcoin.attestation.clone()?;
+        let computed_root = bitcoin.computed_block_merkle_root.clone()?;
+        Some(Self {
+            operation_count: attestation.merkle_path.len(),
+            attestation,
+            computed_root,
+            attested_block_heights: bitcoin.attested_block_heights.clone(),
+            receipt_block_height: bitcoin.receipt_block_height,
+            receipt_block_time: bitcoin.receipt_block_time.clone(),
+        })
     }
 }
 
-/// `true` if verifying this anchor to completion requires network access.
+/// Establish ATL v2.0 §5.5 for every anchor the receipt presents, by asking
+/// `atl-core`.
 ///
-/// Only `bitcoin_ots` does: RFC 3161 verification is pure computation. This
-/// is what keeps `atl-cli` from probing connectivity for a receipt it can
-/// fully verify offline.
+/// # Why this is one call and not an implementation
+///
+/// Binding each anchor to the receipt's own root, decoding its payload,
+/// running the steps the specification names and reporting which facts hold
+/// is *protocol orchestration*, and `atl-core` publishes it as
+/// [`verify_receipt_anchors`]. This crate used to carry a second copy: two
+/// implementations of a mandatory rule drift, and a defect fixed on one side
+/// stays open on the other — which is exactly what happened, repeatedly.
+///
+/// What stays here is everything the core cannot do: the network
+/// ([`crate::verify::online`]), the acceptance policy
+/// ([`crate::verify::policy`]), and the status, reason codes and exit codes
+/// that are this CLI's own contract ([`crate::verify::verdict`]).
+///
+/// `trust_store` is threaded straight from `--tsa-trust-store` /
+/// `--tsa-intermediates` and from nowhere else: a certificate found inside
+/// the token being verified is never promoted to a trust anchor.
 #[must_use]
-pub const fn requires_network(anchor: &ReceiptAnchor) -> bool {
-    matches!(anchor, ReceiptAnchor::BitcoinOts { .. })
-}
-
-/// Verify every anchor in `receipt` with no network access.
-///
-/// RFC 3161 anchors are fully judged here; `bitcoin_ots` anchors get their
-/// network-free verdict (see [`verify_bitcoin_ots_offline`]) which the
-/// online pass later upgrades.
-pub fn verify_anchors_offline(
+pub fn establish_anchor_facts(
     receipt: &atl_core::Receipt,
     trust_store: Option<&TrustStore>,
-) -> Vec<AnchorVerificationResult> {
-    let super_root = receipt
-        .super_proof
-        .as_ref()
-        .map(|sp| sp.super_root.as_str());
-    let data_tree_root = receipt.proof.root_hash.as_str();
-
-    receipt
-        .anchors
-        .iter()
-        .map(|anchor| match anchor {
-            ReceiptAnchor::Rfc3161 {
-                target,
-                target_hash,
-                timestamp,
-                token_der,
-                ..
-            } => verify_rfc3161_anchor(
-                target,
-                target_hash,
-                timestamp,
-                token_der,
-                data_tree_root,
-                trust_store,
-            ),
-            ReceiptAnchor::BitcoinOts {
-                target,
-                target_hash,
-                ots_proof,
-                bitcoin_block_height,
-                bitcoin_block_time,
-                ..
-            } => verify_bitcoin_ots_offline(
-                target,
-                target_hash,
-                ots_proof,
-                super_root,
-                *bitcoin_block_height,
-                bitcoin_block_time,
-            ),
-        })
-        .collect()
+) -> Vec<AnchorFacts> {
+    let options = VerifyOptions {
+        rfc3161_trust_store: trust_store.cloned(),
+        ..VerifyOptions::default()
+    };
+    verify_receipt_anchors(receipt, &options)
 }
 
+/// Project each anchor's fact set onto the result this CLI reports.
+///
+/// `facts` must be what [`establish_anchor_facts`] returned for `receipt`,
+/// so entry *i* describes `receipt.anchors()[i]`. A shorter slice leaves the
+/// remaining anchors unreported rather than mis-attributing facts to them.
+///
+/// `bitcoin_ots` anchors carry their network-free outcome here; the online
+/// pass replaces them in place.
+#[must_use]
+pub fn offline_results(
+    receipt: &atl_core::Receipt,
+    facts: &[AnchorFacts],
+) -> Vec<AnchorVerificationResult> {
+    receipt
+        .anchors()
+        .iter()
+        .zip(facts)
+        .map(|(anchor, facts)| result_from_facts(anchor, facts))
+        .collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use atl_core::{
+        CheckpointJson, Receipt, ReceiptBuilder, ReceiptEntry, ReceiptProof, SourceTextCheck,
+        SuperProof,
+    };
+
     const TEST_ROOT_HASH: &str =
         "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef";
+    const SUPER_ROOT_HASH: &str =
+        "sha256:00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
     const OTHER_HASH: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
-    fn rfc3161_details(
-        imprint: MessageImprint,
-        cms: CmsSignature,
-        chain: bool,
-        eku: bool,
-        path_status: PathStatus,
-        terminal_anchor: Option<TerminalAnchor>,
-    ) -> AnchorDetails {
-        rfc3161_details_full(
-            imprint,
-            cms,
-            chain,
-            if eku {
-                TimestampingEku::Ok
-            } else {
-                TimestampingEku::Absent
-            },
-            path_status,
-            terminal_anchor,
-        )
-    }
+    // ================================================================
+    // Fixtures
+    // ================================================================
 
-    /// The same, with the EKU state given explicitly — needed to exercise
-    /// `NotChecked`, which no boolean can express.
-    fn rfc3161_details_full(
-        imprint: MessageImprint,
-        cms: CmsSignature,
-        chain: bool,
-        eku: TimestampingEku,
-        path_status: PathStatus,
-        terminal_anchor: Option<TerminalAnchor>,
-    ) -> AnchorDetails {
-        AnchorDetails::Rfc3161 {
-            message_imprint: imprint,
-            cms_signature: cms,
-            chain_valid_at_gen_time: chain,
-            chain_diagnostic: None,
-            timestamping_eku_ok: eku.is_ok(),
-            timestamping_eku: eku,
-            path_status,
-            terminal_anchor,
-            revocation: Revocation::NotChecked,
-        }
-    }
-
-    #[test]
-    fn non_rfc3161_details_have_no_rfc3161_verdict() {
-        assert_eq!(AnchorDetails::Unknown.rfc3161_verdict(), None);
-        assert_eq!(AnchorDetails::Unknown.rfc3161_trust_state(), None);
-    }
-
-    #[test]
-    fn trusted_terminal_with_sound_facts_is_valid() {
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Verified,
-            true,
-            true,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [0u8; 32],
-            }),
-        );
-        assert_eq!(details.rfc3161_verdict(), Some(AnchorVerdict::Valid));
-        assert_eq!(details.rfc3161_trust_state(), Some("trusted"));
-    }
-
-    #[test]
-    fn assumed_terminal_is_untrusted_not_invalid() {
-        // Every cryptographic fact holds; only the trust root is missing.
-        // This must NOT be reported as broken evidence.
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Verified,
-            true,
-            true,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Assumed {
-                sha256_fingerprint: [7u8; 32],
-                self_signature: SelfSignature::Verified,
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("assumed"));
-        assert_eq!(
-            details.untrusted_root_fingerprint(),
-            Some(hex::encode([7u8; 32]))
-        );
-    }
-
-    #[test]
-    fn incomplete_path_is_untrusted_not_invalid() {
-        // The cross-signed Sectigo/DigiCert case: an issuer certificate is
-        // missing from the token, so `chain_valid_at_gen_time` is false --
-        // but nothing was refuted. This used to be reported as `Failed`.
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Verified,
-            false,
-            true,
-            PathStatus::Incomplete,
-            None,
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("incomplete"));
-        assert_eq!(details.untrusted_root_fingerprint(), None);
-    }
-
-    /// `Indeterminate` is routed explicitly, fails closed, and is NOT a
-    /// refutation. Its reason code must be the one that names the real
-    /// problem, not `tsa_chain_incomplete` (which would send the user
-    /// hunting for a certificate) and not `tsa_root_not_trusted`.
-    #[test]
-    fn indeterminate_path_is_untrusted_not_invalid() {
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Verified,
-            false,
-            true,
-            PathStatus::Indeterminate,
-            None,
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Untrusted(ReasonCode::TsaChainIndeterminate))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
-    }
-
-    /// An `Indeterminate` path carrying an `Assumed`/`Unverifiable`
-    /// terminal — the SHA-1 self-signed root case — is still reported as
-    /// indeterminate. Reading the terminal first would call it
-    /// `tsa_root_not_trusted`, which names the wrong problem: the root is
-    /// not merely un-vouched-for, its self-signature was never checked.
-    #[test]
-    fn an_unverifiable_self_signature_is_reported_as_indeterminate() {
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Verified,
-            false,
-            true,
-            PathStatus::Indeterminate,
-            Some(TerminalAnchor::Assumed {
-                sha256_fingerprint: [3u8; 32],
-                self_signature: SelfSignature::Unverifiable,
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Untrusted(ReasonCode::TsaChainIndeterminate))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
-    }
-
-    /// Neither `Incomplete` nor `Indeterminate` may ever produce a valid
-    /// anchor, under ANY combination of the other facts and terminal
-    /// anchors — including a `Trusted` terminal, which cannot occur
-    /// alongside them but must not be a way in if it ever did.
-    #[test]
-    fn incomplete_and_indeterminate_never_reach_success() {
-        let terminals = [
-            None,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [1u8; 32],
-            }),
-            Some(TerminalAnchor::Assumed {
-                sha256_fingerprint: [1u8; 32],
-                self_signature: SelfSignature::Verified,
-            }),
-            Some(TerminalAnchor::Assumed {
-                sha256_fingerprint: [1u8; 32],
-                self_signature: SelfSignature::Unverifiable,
-            }),
-        ];
-
-        for status in [PathStatus::Incomplete, PathStatus::Indeterminate] {
-            for terminal in terminals {
-                for chain_valid in [true, false] {
-                    let details = rfc3161_details(
-                        MessageImprint::Verified,
-                        CmsSignature::Verified,
-                        chain_valid,
-                        true,
-                        status,
-                        terminal,
-                    );
-                    let verdict = details.rfc3161_verdict().expect("rfc3161 details");
-                    assert!(
-                        !verdict.is_valid(),
-                        "{status:?} with terminal {terminal:?} and chain_valid={chain_valid} \
-                         must never be valid, got {verdict:?}"
-                    );
-                    assert!(
-                        matches!(verdict, AnchorVerdict::Untrusted(_)),
-                        "{status:?} must be Untrusted, never a refutation: {verdict:?}"
-                    );
-                    assert_ne!(details.rfc3161_trust_state(), Some("trusted"));
-                }
-            }
-        }
-    }
-
-    /// **Blocker regression.** A `messageImprint` naming a hash algorithm
-    /// this verifier does not implement was never *compared* with the
-    /// receipt's root, so it must not be reported as a mismatch. ATL
-    /// mandates a minimum of algorithm support, not a prohibition on the
-    /// rest, so this is the verifier's limitation, not the token's defect.
-    #[test]
-    fn an_uncomparable_imprint_is_untrusted_not_a_mismatch() {
-        let details = rfc3161_details(
-            MessageImprint::Indeterminate,
-            CmsSignature::Verified,
-            true,
-            true,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [1u8; 32],
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Untrusted(
-                ReasonCode::TsaImprintIndeterminate
-            ))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
-    }
-
-    /// An imprint that WAS compared and differs stays a refutation.
-    #[test]
-    fn a_refuted_imprint_is_still_a_refutation() {
-        let details = rfc3161_details(
-            MessageImprint::Mismatch,
-            CmsSignature::Verified,
-            true,
-            true,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [1u8; 32],
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(ReasonCode::TsaImprintMismatch))
-        );
-    }
-
-    /// Neither indeterminate fact may ever reach success, in any
-    /// combination with the others.
-    #[test]
-    fn indeterminate_facts_never_reach_success() {
-        let trusted = Some(TerminalAnchor::Trusted {
-            sha256_fingerprint: [1u8; 32],
-        });
-        for (imprint, cms) in [
-            (MessageImprint::Indeterminate, CmsSignature::Verified),
-            (MessageImprint::Verified, CmsSignature::Indeterminate),
-            (MessageImprint::Indeterminate, CmsSignature::Indeterminate),
-        ] {
-            let details = rfc3161_details(imprint, cms, true, true, PathStatus::Complete, trusted);
-            let verdict = details.rfc3161_verdict().expect("rfc3161 details");
-            assert!(
-                !verdict.is_valid(),
-                "{imprint:?}/{cms:?} must never be valid"
-            );
-            assert!(
-                matches!(verdict, AnchorVerdict::Untrusted(_)),
-                "{imprint:?}/{cms:?} must be Untrusted, never a refutation: {verdict:?}"
-            );
-        }
-    }
-
-    /// **The blocker regression.** Any refuted fact must outrank every
-    /// indeterminate fact, in every pairing, whichever order they are
-    /// inspected in.
+    /// A receipt whose `proof.root_hash` is [`TEST_ROOT_HASH`] and whose
+    /// `super_proof.super_root` is [`SUPER_ROOT_HASH`], carrying `anchors`.
     ///
-    /// The case that motivated it: `MessageImprint::Indeterminate` with
-    /// `CmsSignature::Refuted` used to return at the first non-verified fact
-    /// and come out `untrusted` — concealing a proven refutation behind
-    /// "nothing was refuted". Having spent this rework stopping the CLI
-    /// accusing without grounds, that was the mirror-image defect.
-    #[test]
-    fn any_refutation_outranks_every_indeterminate() {
-        let inconclusive_imprints = [MessageImprint::Verified, MessageImprint::Indeterminate];
-        let refuted_imprints = [MessageImprint::Mismatch, MessageImprint::Malformed];
-        let inconclusive_cms = [CmsSignature::Verified, CmsSignature::Indeterminate];
-        let inconclusive_ekus = [TimestampingEku::Ok, TimestampingEku::NotChecked];
-        let inconclusive_paths = [
-            PathStatus::Complete,
-            PathStatus::Incomplete,
-            PathStatus::Indeterminate,
-        ];
+    /// Only the anchor step is under test here, so nothing else about the
+    /// receipt has to hold: `verify_receipt_anchors` covers ATL v2.0 §5.5
+    /// and nothing else, and the two roots are the only fields it reads.
+    fn receipt_with(anchors: Vec<ReceiptAnchor>, super_proof: bool) -> Receipt {
+        let entry = ReceiptEntry {
+            id: "550e8400-e29b-41d4-a716-446655440000"
+                .parse()
+                .expect("fixture UUID"),
+            payload_hash: TEST_ROOT_HASH.to_string(),
+            metadata_hash: OTHER_HASH.to_string(),
+            metadata: serde_json::json!({}),
+        };
+        let proof = ReceiptProof {
+            tree_size: 1,
+            root_hash: TEST_ROOT_HASH.to_string(),
+            inclusion_path: vec![],
+            leaf_index: 0,
+            checkpoint: CheckpointJson {
+                origin: OTHER_HASH.to_string(),
+                tree_size: 1,
+                root_hash: TEST_ROOT_HASH.to_string(),
+                timestamp: 1_704_067_200_000_000_000,
+                signature: "base64:AAAA".to_string(),
+                key_id: OTHER_HASH.to_string(),
+            },
+            consistency_proof: None,
+        };
+        ReceiptBuilder::new("2.0.0".to_string(), entry, proof)
+            .super_proof_option(super_proof.then(|| SuperProof {
+                genesis_super_root: OTHER_HASH.to_string(),
+                data_tree_index: 0,
+                super_tree_size: 1,
+                super_root: SUPER_ROOT_HASH.to_string(),
+                inclusion: vec![],
+                consistency_to_origin: vec![],
+            }))
+            .anchors(anchors)
+            .build(SourceTextCheck::assume_duplicate_property_names_already_rejected())
+    }
 
-        // A refuted imprint, against every combination of inabilities.
-        for imprint in refuted_imprints {
-            for cms in inconclusive_cms {
-                for eku in inconclusive_ekus {
-                    for path in inconclusive_paths {
-                        let details = rfc3161_details_full(imprint, cms, true, eku, path, None);
-                        let verdict = details.rfc3161_verdict().expect("rfc3161 details");
-                        assert!(
-                            matches!(verdict, AnchorVerdict::Invalid(_)),
-                            "{imprint:?}+{cms:?}+{eku:?}+{path:?} must be Invalid, got {verdict:?}"
-                        );
-                    }
-                }
-            }
-        }
-
-        // A refuted CMS signature, against every combination of inabilities.
-        for imprint in inconclusive_imprints {
-            for eku in inconclusive_ekus {
-                for path in inconclusive_paths {
-                    let details =
-                        rfc3161_details_full(imprint, CmsSignature::Refuted, true, eku, path, None);
-                    assert_eq!(
-                        details.rfc3161_verdict(),
-                        Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid)),
-                        "{imprint:?}+Refuted+{eku:?}+{path:?} must be Invalid"
-                    );
-                }
-            }
-        }
-
-        // A refuted EKU, and a refuted path, likewise.
-        for imprint in inconclusive_imprints {
-            for cms in inconclusive_cms {
-                let refuted_eku = rfc3161_details_full(
-                    imprint,
-                    cms,
-                    true,
-                    TimestampingEku::Absent,
-                    PathStatus::Indeterminate,
-                    None,
-                );
-                assert!(
-                    matches!(
-                        refuted_eku.rfc3161_verdict(),
-                        Some(AnchorVerdict::Invalid(_))
-                    ),
-                    "a checked EKU failure must outrank {imprint:?}+{cms:?}"
-                );
-
-                let refuted_path = rfc3161_details_full(
-                    imprint,
-                    cms,
-                    false,
-                    TimestampingEku::NotChecked,
-                    PathStatus::Invalid,
-                    None,
-                );
-                assert_eq!(
-                    refuted_path.rfc3161_verdict(),
-                    Some(AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime)),
-                    "a refuted path must outrank {imprint:?}+{cms:?}"
-                );
-            }
+    fn rfc3161_anchor(target: &str, target_hash: &str, token_der: &str) -> ReceiptAnchor {
+        ReceiptAnchor::Rfc3161 {
+            target: target.to_string(),
+            target_hash: target_hash.to_string(),
+            tsa_url: "https://example.invalid/tsa".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            token_der: token_der.to_string(),
         }
     }
 
-    /// The exact counterexample from the review, spelled out on its own so a
-    /// regression names itself.
-    #[test]
-    fn an_indeterminate_imprint_never_conceals_a_refuted_signature() {
-        let details = rfc3161_details_full(
-            MessageImprint::Indeterminate,
-            CmsSignature::Refuted,
-            true,
-            TimestampingEku::Ok,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [1u8; 32],
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid)),
-            "untrusted means nothing was refuted; a refuted signature must not hide behind an \
-             uncomparable imprint"
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("failed"));
+    fn bitcoin_anchor(
+        target: &str,
+        target_hash: &str,
+        ots_proof: &str,
+        height: u64,
+    ) -> ReceiptAnchor {
+        ReceiptAnchor::BitcoinOts {
+            target: target.to_string(),
+            target_hash: target_hash.to_string(),
+            timestamp: "2026-01-19T07:01:20Z".to_string(),
+            bitcoin_block_height: height,
+            bitcoin_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+            ots_proof: ots_proof.to_string(),
+        }
     }
 
-    /// A malformed imprint is refuted, but must not be explained as a
-    /// mismatch: no comparison could be attempted at all.
-    #[test]
-    fn a_malformed_imprint_has_its_own_reason_code() {
-        let details = rfc3161_details_full(
-            MessageImprint::Malformed,
-            CmsSignature::Verified,
-            true,
-            TimestampingEku::Ok,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [1u8; 32],
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(ReasonCode::TsaImprintMalformed))
-        );
+    /// The single anchor's result, as the offline pass reports it.
+    fn only_result(anchor: ReceiptAnchor, super_proof: bool) -> AnchorVerificationResult {
+        let receipt = receipt_with(vec![anchor], super_proof);
+        let facts = establish_anchor_facts(&receipt, None);
+        let mut results = offline_results(&receipt, &facts);
+        assert_eq!(results.len(), 1, "one anchor in, one result out");
+        results.remove(0)
     }
 
-    /// An EKU that was never *examined* must not be reported as an EKU
-    /// failure. Before aggregation this was masked by the CMS check
-    /// returning first, but the boolean it read was `false` — one reordering
-    /// away from refuting on an unchecked fact.
-    #[test]
-    fn an_unexamined_eku_is_not_an_eku_failure() {
-        let details = rfc3161_details_full(
-            MessageImprint::Verified,
-            CmsSignature::Verified,
-            false,
-            TimestampingEku::NotChecked,
-            PathStatus::Indeterminate,
-            None,
-        );
-        let verdict = details.rfc3161_verdict().expect("rfc3161 details");
-        assert!(
-            !matches!(
-                verdict,
-                AnchorVerdict::Invalid(ReasonCode::TsaTimestampingEkuInvalid)
+    /// The single anchor's fact set, as `atl-core` established it.
+    fn only_facts(anchor: ReceiptAnchor, super_proof: bool) -> AnchorFacts {
+        let receipt = receipt_with(vec![anchor], super_proof);
+        let mut facts = establish_anchor_facts(&receipt, None);
+        assert_eq!(facts.len(), 1, "one anchor in, one fact set out");
+        facts.remove(0)
+    }
+
+    // ================================================================
+    // The translation table: `reason_for_finding`
+    // ================================================================
+
+    /// Every finding shape, with the code it must be named by.
+    ///
+    /// This is the whole classifier now: `atl-core` decides *what was found*
+    /// and whether it refutes, and this crate only names it. The table is
+    /// therefore the place the three-valued facts must not be flattened, and
+    /// each pair below that differs only in its payload is one of those
+    /// places.
+    fn finding_table() -> Vec<(VerificationError, ReasonCode)> {
+        vec![
+            (
+                VerificationError::AnchorTargetInvalid {
+                    anchor_type: "rfc3161".to_string(),
+                    expected: "data_tree_root".to_string(),
+                    actual: "nonsense".to_string(),
+                },
+                ReasonCode::AnchorTargetInvalid,
             ),
-            "an unexamined EKU must never be reported as a checked failure: {verdict:?}"
-        );
-        assert!(matches!(verdict, AnchorVerdict::Untrusted(_)));
+            (
+                VerificationError::AnchorTargetHashMismatch {
+                    anchor_type: "rfc3161".to_string(),
+                    expected: TEST_ROOT_HASH.to_string(),
+                    actual: OTHER_HASH.to_string(),
+                },
+                ReasonCode::AnchorTargetHashMismatch,
+            ),
+            (
+                VerificationError::InvalidHash {
+                    field: "anchor.target_hash".to_string(),
+                    message: "missing sha256: prefix".to_string(),
+                },
+                ReasonCode::AnchorHashMalformed,
+            ),
+            (
+                VerificationError::MissingSuperProof,
+                ReasonCode::SuperProofMissing,
+            ),
+            (
+                VerificationError::AnchorPayloadUndecodable {
+                    anchor_type: "rfc3161".to_string(),
+                    reason: "not CMS SignedData".to_string(),
+                },
+                ReasonCode::TsaTokenUnparsable,
+            ),
+            (
+                VerificationError::AnchorPayloadUndecodable {
+                    anchor_type: "bitcoin_ots".to_string(),
+                    reason: "not an OTS proof".to_string(),
+                },
+                ReasonCode::BitcoinOtsProofInvalid,
+            ),
+            (
+                VerificationError::AnchorTypeUnsupported {
+                    anchor_type: "bitcoin_ots".to_string(),
+                    required_feature: "bitcoin-ots".to_string(),
+                },
+                ReasonCode::AnchorTypeUnsupported,
+            ),
+            (
+                VerificationError::BitcoinHeightContradictsProof {
+                    claimed: 900_000,
+                    attested: vec![932_897],
+                },
+                ReasonCode::BitcoinClaimedHeightContradictsProof,
+            ),
+            (
+                VerificationError::BitcoinBlockNotObtained,
+                ReasonCode::BitcoinBlockNotChecked,
+            ),
+            // --- messageImprint: refuted twice, and by two different causes ---
+            (
+                VerificationError::Rfc3161MessageImprint(MessageImprint::Mismatch),
+                ReasonCode::TsaImprintMismatch,
+            ),
+            (
+                VerificationError::Rfc3161MessageImprint(MessageImprint::Malformed),
+                ReasonCode::TsaImprintMalformed,
+            ),
+            (
+                VerificationError::Rfc3161MessageImprint(MessageImprint::Indeterminate),
+                ReasonCode::TsaImprintIndeterminate,
+            ),
+            // --- CMS signature ---
+            (
+                VerificationError::Rfc3161CmsSignature(CmsSignature::Refuted),
+                ReasonCode::CmsSignatureInvalid,
+            ),
+            (
+                VerificationError::Rfc3161CmsSignature(CmsSignature::Indeterminate),
+                ReasonCode::CmsSignatureIndeterminate,
+            ),
+            // --- timestamping EKU: four checked failures, one unexamined ---
+            (
+                VerificationError::Rfc3161TimestampingEku(TimestampingEku::Absent),
+                ReasonCode::TsaTimestampingEkuInvalid,
+            ),
+            (
+                VerificationError::Rfc3161TimestampingEku(TimestampingEku::Malformed),
+                ReasonCode::TsaTimestampingEkuInvalid,
+            ),
+            (
+                VerificationError::Rfc3161TimestampingEku(TimestampingEku::NotCritical),
+                ReasonCode::TsaTimestampingEkuInvalid,
+            ),
+            (
+                VerificationError::Rfc3161TimestampingEku(TimestampingEku::NotExclusive),
+                ReasonCode::TsaTimestampingEkuInvalid,
+            ),
+            (
+                VerificationError::Rfc3161TimestampingEku(TimestampingEku::NotChecked),
+                ReasonCode::TsaTimestampingEkuNotChecked,
+            ),
+            // --- certificate path: one refutation, two inabilities, and the
+            //     complete-but-invalid contradiction ---
+            (
+                VerificationError::Rfc3161CertificatePath {
+                    status: PathStatus::Invalid,
+                    valid_at_gen_time: false,
+                },
+                ReasonCode::TsaChainInvalidAtGenTime,
+            ),
+            (
+                VerificationError::Rfc3161CertificatePath {
+                    status: PathStatus::Complete,
+                    valid_at_gen_time: false,
+                },
+                ReasonCode::TsaChainInvalidAtGenTime,
+            ),
+            (
+                VerificationError::Rfc3161CertificatePath {
+                    status: PathStatus::Incomplete,
+                    valid_at_gen_time: false,
+                },
+                ReasonCode::TsaChainIncomplete,
+            ),
+            (
+                VerificationError::Rfc3161CertificatePath {
+                    status: PathStatus::Indeterminate,
+                    valid_at_gen_time: false,
+                },
+                ReasonCode::TsaChainIndeterminate,
+            ),
+            // --- terminal anchor ---
+            (
+                VerificationError::Rfc3161TerminalNotTrusted {
+                    terminal: Some(TerminalAnchor::Assumed {
+                        sha256_fingerprint: [7u8; 32],
+                        self_signature: SelfSignature::Verified,
+                    }),
+                },
+                ReasonCode::TsaRootNotTrusted,
+            ),
+            (
+                VerificationError::Rfc3161TerminalNotTrusted { terminal: None },
+                ReasonCode::TsaChainIncomplete,
+            ),
+        ]
     }
 
-    /// Every *checked* EKU failure stays a refutation — the fix must not
-    /// soften real failures into "cannot tell".
     #[test]
-    fn checked_eku_failures_remain_refutations() {
-        for eku in [
-            TimestampingEku::Absent,
-            TimestampingEku::Malformed,
-            TimestampingEku::NotCritical,
-            TimestampingEku::NotExclusive,
-        ] {
-            let details = rfc3161_details_full(
-                MessageImprint::Verified,
-                CmsSignature::Verified,
-                true,
-                eku,
-                PathStatus::Complete,
-                Some(TerminalAnchor::Trusted {
-                    sha256_fingerprint: [1u8; 32],
-                }),
-            );
+    fn every_finding_is_named_by_its_own_reason_code() {
+        for (finding, expected) in finding_table() {
             assert_eq!(
-                details.rfc3161_verdict(),
-                Some(AnchorVerdict::Invalid(
-                    ReasonCode::TsaTimestampingEkuInvalid
-                )),
-                "{eku:?} was checked and failed; it must stay a refutation"
+                reason_for_finding(&finding),
+                expected,
+                "wrong reason code for {finding:?}"
             );
         }
     }
 
-    /// **Blocker regression.** A CMS signature this verifier cannot evaluate
-    /// must fail closed as `untrusted`, never as `invalid`. `atl-core`
-    /// explicitly does not implement P-521 or RSA-PSS, so this is a token a
-    /// real TSA can mint today -- and under the previous `is_ok()` collapse
-    /// its holder was told the evidence had been disproved.
+    /// **The classification may not drift from `atl-core`'s.**
+    ///
+    /// The refuted/indeterminate split is `VerificationError::is_refutation`
+    /// and nothing else; this crate only gives each finding a name. The two
+    /// must agree, so every code this table produces for a refutation has to
+    /// be one this CLI treats as a refutation, and every code produced for
+    /// an inability has to be one it treats as an inability.
+    ///
+    /// The check is by construction: [`AnchorState::from_reason`] is defined
+    /// only for the inability codes and answers `Unresolved` for every
+    /// refutation code, so an inability whose code is a refutation's would be
+    /// reported with a state that names nothing.
     #[test]
-    fn an_unevaluatable_cms_signature_is_untrusted_not_invalid() {
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Indeterminate,
-            true,
-            true,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [1u8; 32],
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Untrusted(
-                ReasonCode::CmsSignatureIndeterminate
-            ))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("indeterminate"));
-    }
-
-    /// A CMS signature that WAS checked and failed stays a refutation — the
-    /// fix must not soften real failures into "cannot tell".
-    #[test]
-    fn a_refuted_cms_signature_is_still_a_refutation() {
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Refuted,
-            true,
-            true,
-            PathStatus::Complete,
-            Some(TerminalAnchor::Trusted {
-                sha256_fingerprint: [1u8; 32],
-            }),
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("failed"));
-    }
-
-    /// An unevaluatable CMS signature never reaches success, whatever else
-    /// holds — including a fully trusted certificate path.
-    #[test]
-    fn an_unevaluatable_cms_signature_never_reaches_success() {
-        for status in [
-            PathStatus::Complete,
-            PathStatus::Incomplete,
-            PathStatus::Indeterminate,
-            PathStatus::Invalid,
-        ] {
-            for terminal in [
-                None,
-                Some(TerminalAnchor::Trusted {
-                    sha256_fingerprint: [1u8; 32],
-                }),
-            ] {
-                let details = rfc3161_details(
-                    MessageImprint::Verified,
-                    CmsSignature::Indeterminate,
-                    true,
-                    true,
-                    status,
-                    terminal,
+    fn refutation_and_inability_codes_do_not_cross() {
+        for (finding, code) in finding_table() {
+            if finding.is_refutation() {
+                assert_eq!(
+                    AnchorState::from_reason(code),
+                    AnchorState::Unresolved,
+                    "{code} names a refutation, so it must not double as an inability state"
                 );
-                let verdict = details.rfc3161_verdict().expect("rfc3161 details");
-                assert!(
-                    !verdict.is_valid(),
-                    "{status:?}/{terminal:?} must never be valid"
+            } else {
+                assert_ne!(
+                    AnchorState::from_reason(code),
+                    AnchorState::Unresolved,
+                    "{code} names an inability, so it must project onto a real state"
                 );
-                if matches!(status, PathStatus::Invalid) {
-                    // A refuted path is a proven defect and must not be
-                    // concealed behind an unevaluatable signature.
-                    assert!(
-                        matches!(verdict, AnchorVerdict::Invalid(_)),
-                        "a refuted path must outrank an indeterminate signature: {verdict:?}"
-                    );
-                } else {
-                    assert!(
-                        matches!(verdict, AnchorVerdict::Untrusted(_)),
-                        "{status:?}/{terminal:?} must be Untrusted, never a refutation"
-                    );
-                }
             }
         }
     }
 
+    // ================================================================
+    // `rfc3161_trust_state`, derived from the verdict
+    // ================================================================
+
+    fn rfc3161_result(verdict: AnchorVerdict) -> AnchorVerificationResult {
+        AnchorVerificationResult {
+            anchor_type: "rfc3161".to_string(),
+            verdict,
+            timestamp_nanos: None,
+            error: None,
+            details: AnchorDetails::Rfc3161 {
+                message_imprint: MessageImprint::Verified,
+                cms_signature: CmsSignature::Verified,
+                chain_valid_at_gen_time: true,
+                chain_diagnostic: None,
+                timestamping_eku_ok: true,
+                timestamping_eku: TimestampingEku::Ok,
+                path_status: PathStatus::Complete,
+                terminal_anchor: None,
+                revocation: Revocation::NotChecked,
+            },
+        }
+    }
+
     #[test]
-    fn invalid_path_is_a_refutation() {
-        let details = rfc3161_details(
-            MessageImprint::Verified,
-            CmsSignature::Verified,
-            false,
+    fn trust_state_follows_the_verdict() {
+        assert_eq!(
+            rfc3161_result(AnchorVerdict::Valid).rfc3161_trust_state(),
+            Some("trusted")
+        );
+        assert_eq!(
+            rfc3161_result(AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted))
+                .rfc3161_trust_state(),
+            Some("assumed")
+        );
+        assert_eq!(
+            rfc3161_result(AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete))
+                .rfc3161_trust_state(),
+            Some("incomplete")
+        );
+        for indeterminate in [
+            ReasonCode::TsaChainIndeterminate,
+            ReasonCode::CmsSignatureIndeterminate,
+            ReasonCode::TsaImprintIndeterminate,
+            ReasonCode::TsaTimestampingEkuNotChecked,
+        ] {
+            assert_eq!(
+                rfc3161_result(AnchorVerdict::Untrusted(indeterminate)).rfc3161_trust_state(),
+                Some("indeterminate"),
+                "{indeterminate}"
+            );
+        }
+        assert_eq!(
+            rfc3161_result(AnchorVerdict::Invalid(ReasonCode::TsaImprintMismatch))
+                .rfc3161_trust_state(),
+            Some("failed")
+        );
+    }
+
+    #[test]
+    fn a_non_rfc3161_anchor_has_no_trust_state() {
+        let mut result = rfc3161_result(AnchorVerdict::Valid);
+        result.details = AnchorDetails::Unknown;
+        assert_eq!(result.rfc3161_trust_state(), None);
+        // A `bitcoin_ots` anchor never has one either: `trust_state`
+        // describes an RFC 3161 certificate path and nothing else.
+        assert_eq!(
+            only_result(
+                bitcoin_anchor("super_root", SUPER_ROOT_HASH, "base64:proof", 800_000),
+                true
+            )
+            .rfc3161_trust_state(),
+            None
+        );
+    }
+
+    // ================================================================
+    // Binding the anchor to the receipt (§5.5.1 / §5.5.2 steps 1-2)
+    // ================================================================
+
+    #[test]
+    fn wrong_target_is_refuted() {
+        let result = only_result(
+            rfc3161_anchor("super_root", TEST_ROOT_HASH, "base64:x"),
             true,
-            PathStatus::Invalid,
-            None,
-        );
-        assert_eq!(
-            details.rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(ReasonCode::TsaChainInvalidAtGenTime))
-        );
-        assert_eq!(details.rfc3161_trust_state(), Some("failed"));
-    }
-
-    #[test]
-    fn false_facts_are_refutations_even_with_a_trusted_root() {
-        let trusted = Some(TerminalAnchor::Trusted {
-            sha256_fingerprint: [0u8; 32],
-        });
-        assert_eq!(
-            rfc3161_details(
-                MessageImprint::Mismatch,
-                CmsSignature::Verified,
-                true,
-                true,
-                PathStatus::Complete,
-                trusted
-            )
-            .rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(ReasonCode::TsaImprintMismatch))
-        );
-        assert_eq!(
-            rfc3161_details(
-                MessageImprint::Verified,
-                CmsSignature::Refuted,
-                true,
-                true,
-                PathStatus::Complete,
-                trusted
-            )
-            .rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid))
-        );
-        assert_eq!(
-            rfc3161_details(
-                MessageImprint::Verified,
-                CmsSignature::Verified,
-                true,
-                false,
-                PathStatus::Complete,
-                trusted
-            )
-            .rfc3161_verdict(),
-            Some(AnchorVerdict::Invalid(
-                ReasonCode::TsaTimestampingEkuInvalid
-            ))
-        );
-    }
-
-    #[test]
-    fn wrong_target_is_rejected() {
-        let result = verify_rfc3161_anchor(
-            "wrong_target",
-            TEST_ROOT_HASH,
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-            TEST_ROOT_HASH,
-            None,
         );
         assert_eq!(
             result.verdict,
             AnchorVerdict::Invalid(ReasonCode::AnchorTargetInvalid)
         );
-        assert!(!result.verified());
+        // Rejected before the token was read, so no fact set exists.
+        assert!(matches!(result.details, AnchorDetails::Unknown));
+        let error = result.error.expect("a refutation must say what it refuted");
+        assert!(error.contains("data_tree_root"), "{error}");
     }
 
     #[test]
-    fn target_hash_mismatch_is_rejected_before_token_verification() {
-        // A genuine token minted for an unrelated hash must never be
-        // reported as proof for THIS receipt.
-        let result = verify_rfc3161_anchor(
-            "data_tree_root",
-            OTHER_HASH,
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-            TEST_ROOT_HASH,
-            None,
+    fn target_hash_that_pins_to_another_root_is_refuted() {
+        let result = only_result(
+            rfc3161_anchor("data_tree_root", OTHER_HASH, "base64:x"),
+            true,
         );
         assert_eq!(
             result.verdict,
             AnchorVerdict::Invalid(ReasonCode::AnchorTargetHashMismatch)
         );
-        assert!(result
-            .error
-            .unwrap()
-            .contains("target_hash does not match proof.root_hash"));
     }
 
     #[test]
-    fn malformed_hashes_are_rejected() {
-        let bad_claim = verify_rfc3161_anchor(
-            "data_tree_root",
-            "sha256:notvalidhex",
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-            TEST_ROOT_HASH,
-            None,
+    fn a_malformed_target_hash_is_refuted() {
+        let result = only_result(
+            rfc3161_anchor("data_tree_root", "not-a-hash", "base64:x"),
+            true,
         );
         assert_eq!(
-            bad_claim.verdict,
+            result.verdict,
             AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed)
         );
+    }
 
-        let bad_root = verify_rfc3161_anchor(
-            "data_tree_root",
-            TEST_ROOT_HASH,
-            "2024-01-01T00:00:00Z",
-            "base64:token",
-            "sha256:not-valid-hex",
-            None,
+    #[test]
+    fn a_bitcoin_anchor_without_a_super_proof_is_refuted() {
+        let result = only_result(
+            bitcoin_anchor("super_root", SUPER_ROOT_HASH, "base64:proof", 800_000),
+            false,
         );
         assert_eq!(
-            bad_root.verdict,
-            AnchorVerdict::Invalid(ReasonCode::AnchorHashMalformed)
+            result.verdict,
+            AnchorVerdict::Invalid(ReasonCode::SuperProofMissing)
         );
-        assert!(bad_root.error.unwrap().contains("invalid proof.root_hash"));
+        assert_eq!(
+            result.error.as_deref(),
+            Some("Receipt has no super_proof"),
+            "the reader must be told which half of the pinning is missing"
+        );
+    }
+
+    /// **A damaged Bitcoin anchor still publishes the receipt's own claims.**
+    ///
+    /// The `bitcoin_block_height`, `bitcoin_block_time` and `target_hash` a
+    /// reader most wants to see are the receipt's assertions, not findings
+    /// about them, so they survive a rejection that happened before the
+    /// proof was ever decoded.
+    #[test]
+    fn a_rejected_bitcoin_anchor_still_carries_the_receipts_claims() {
+        for (anchor, expected) in [
+            (
+                bitcoin_anchor("data_tree_root", SUPER_ROOT_HASH, "base64:proof", 800_000),
+                ReasonCode::AnchorTargetInvalid,
+            ),
+            (
+                bitcoin_anchor("super_root", OTHER_HASH, "base64:proof", 800_000),
+                ReasonCode::AnchorTargetHashMismatch,
+            ),
+            (
+                bitcoin_anchor("super_root", "not-a-hash", "base64:proof", 800_000),
+                ReasonCode::AnchorHashMalformed,
+            ),
+            (
+                bitcoin_anchor("super_root", SUPER_ROOT_HASH, "base64:rubbish", 800_000),
+                ReasonCode::BitcoinOtsProofInvalid,
+            ),
+        ] {
+            let result = only_result(anchor, true);
+            assert_eq!(result.verdict, AnchorVerdict::Invalid(expected));
+            let AnchorDetails::Bitcoin {
+                receipt_block_height,
+                receipt_block_time,
+                target_hash,
+                claimed_time_check,
+                ..
+            } = &result.details
+            else {
+                panic!("{expected}: a bitcoin_ots anchor must carry a Bitcoin fact set");
+            };
+            assert_eq!(*receipt_block_height, 800_000);
+            assert_eq!(receipt_block_time, "2026-01-19T07:01:20+00:00");
+            assert!(!target_hash.is_empty());
+            // Nothing offline compared it, and saying otherwise would be the
+            // overclaim the four-valued type exists to prevent.
+            assert_eq!(*claimed_time_check, ClaimedTimeCheck::NotCompared);
+        }
     }
 
     #[test]
     fn garbage_token_is_unparsable_not_untrusted() {
-        let result = verify_rfc3161_anchor(
-            "data_tree_root",
-            TEST_ROOT_HASH,
-            "2024-01-01T00:00:00Z",
-            "base64:c29tZXRva2Vu", // "sometoken": not CMS/DER
-            TEST_ROOT_HASH,
-            None,
+        let result = only_result(
+            rfc3161_anchor("data_tree_root", TEST_ROOT_HASH, "base64:bm90YXRva2Vu"),
+            true,
         );
         assert_eq!(
             result.verdict,
             AnchorVerdict::Invalid(ReasonCode::TsaTokenUnparsable)
         );
-    }
-
-    #[test]
-    fn base64_prefix_is_optional() {
-        let with = verify_rfc3161_anchor(
-            "data_tree_root",
-            TEST_ROOT_HASH,
-            "2024-01-01T00:00:00Z",
-            "base64:c29tZXRva2Vu",
-            TEST_ROOT_HASH,
-            None,
-        );
-        let without = verify_rfc3161_anchor(
-            "data_tree_root",
-            TEST_ROOT_HASH,
-            "2024-01-01T00:00:00Z",
-            "c29tZXRva2Vu",
-            TEST_ROOT_HASH,
-            None,
-        );
-        assert_eq!(with.verdict, without.verdict);
-    }
-
-    #[test]
-    fn decode_hash_hex_matches_atl_core_rules() {
-        assert!(decode_hash_hex(TEST_ROOT_HASH).is_ok());
-        // No prefix, uppercase prefix, and empty string are all rejected.
-        for bad in [
-            "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "SHA256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
-            "",
-        ] {
-            let err = decode_hash_hex(bad).expect_err("must be rejected");
-            assert!(
-                err.contains("missing sha256: prefix"),
-                "unexpected error: {err}"
-            );
-        }
-        // Hex digits themselves are case-insensitive.
-        let mixed = "sha256:1234567890ABCDEF1234567890abcdef1234567890ABCDEF1234567890abcdef";
+        assert_eq!(result.rfc3161_trust_state(), None);
+        // The anchor's own `timestamp` field is the only time on offer once
+        // the token will not decode, and it is a claim, never established.
         assert_eq!(
-            decode_hash_hex(mixed).unwrap(),
-            decode_hash_hex(TEST_ROOT_HASH).unwrap()
+            result.timestamp_nanos,
+            Some(1_704_067_200_000_000_000),
+            "a token that would not decode still leaves the anchor's claim"
         );
     }
 
-    #[test]
-    fn bitcoin_preflight_rejects_wrong_target_and_missing_super_proof() {
-        let wrong_target = prepare_bitcoin_ots(
-            "wrong",
-            TEST_ROOT_HASH,
-            "base64:proof",
-            Some(TEST_ROOT_HASH),
-            0,
-            "2026-01-19T07:01:20Z",
-        );
-        let err = wrong_target.err().expect("must reject");
-        assert_eq!(
-            err.verdict,
-            AnchorVerdict::Invalid(ReasonCode::AnchorTargetInvalid)
-        );
-
-        let no_super = prepare_bitcoin_ots(
-            "super_root",
-            TEST_ROOT_HASH,
-            "base64:proof",
-            None,
-            0,
-            "2026-01-19T07:01:20Z",
-        );
-        let err = no_super.err().expect("must reject");
-        assert_eq!(
-            err.verdict,
-            AnchorVerdict::Invalid(ReasonCode::SuperProofMissing)
-        );
-    }
+    // ================================================================
+    // ATL v2.0 §5.5.2: OpenTimestamps
+    // ================================================================
 
     /// Build a real, serializable OTS proof whose single fork carries a
     /// Bitcoin attestation at each of `heights`, all under `start_digest`.
@@ -2166,7 +1775,7 @@ mod tests {
 
         let branch = |height: u64, marker: u8| Step {
             // One hash op per branch, so each attestation has a non-empty
-            // merkle path -- the shape `prepare_bitcoin_ots` requires.
+            // merkle path.
             data: StepData::Op(Op::Sha256),
             output: vec![marker; 32],
             next: vec![Step {
@@ -2202,34 +1811,60 @@ mod tests {
         )
     }
 
+    /// A receipt whose `super_root` is `digest`, so an OTS proof built over
+    /// `digest` pins to it.
+    fn ots_receipt(digest: [u8; 32], heights: &[u64], claimed: u64) -> Receipt {
+        let super_root = format!("sha256:{}", hex::encode(digest));
+        let proof = multi_attestation_proof(digest, heights);
+        let anchor = ReceiptAnchor::BitcoinOts {
+            target: "super_root".to_string(),
+            target_hash: super_root.clone(),
+            timestamp: "2026-01-19T07:01:20Z".to_string(),
+            bitcoin_block_height: claimed,
+            bitcoin_block_time: "2026-01-19T07:01:20+00:00".to_string(),
+            ots_proof: proof,
+        };
+        let mut receipt = receipt_with(vec![anchor], true);
+        // The fixture receipt's `super_root` has to be the digest the proof
+        // starts from, or the anchor never gets past pinning.
+        receipt = rebuild_with_super_root(&receipt, &super_root);
+        receipt
+    }
+
+    /// Rebuild `receipt` with a different `super_proof.super_root`.
+    ///
+    /// `Receipt` exposes no setters, so a changed field means a new receipt.
+    fn rebuild_with_super_root(receipt: &Receipt, super_root: &str) -> Receipt {
+        let mut super_proof = receipt.super_proof().cloned().expect("fixture has one");
+        super_proof.super_root = super_root.to_string();
+        ReceiptBuilder::new(
+            receipt.spec_version().to_string(),
+            receipt.entry().clone(),
+            receipt.proof().clone(),
+        )
+        .super_proof(super_proof)
+        .anchors(receipt.anchors().to_vec())
+        .build(SourceTextCheck::assume_duplicate_property_names_already_rejected())
+    }
+
     /// **A claim matching any attestation holds (ATL v2.0 §5.5.2 step 5).**
     ///
     /// A proof may carry several Bitcoin attestations. The specification
     /// says "match the proof" and never singles one out — the word
     /// *attestation* does not appear in it at all — so a receipt naming a
-    /// block its own proof genuinely attests to must not be refuted. This
-    /// code once compared against `min()`, which refuted every claim but the
-    /// lowest: an accusation on a criterion nobody set.
+    /// block its own proof genuinely attests to must not be refuted.
     #[test]
     fn any_attested_height_satisfies_the_receipt_claim() {
         let digest = [0x11; 32];
-        let target = format!("sha256:{}", hex::encode(digest));
-        let proof = multi_attestation_proof(digest, &[932_897, 932_910, 1_000_000]);
-
         for claimed in [932_897, 932_910, 1_000_000] {
-            let prepared = prepare_bitcoin_ots(
-                "super_root",
-                &target,
-                &proof,
-                Some(&target),
-                claimed,
-                "2026-01-19T07:01:20+00:00",
-            )
-            .unwrap_or_else(|e| panic!("height {claimed} is attested: {:?}", e.error));
+            let receipt = ots_receipt(digest, &[932_897, 932_910, 1_000_000], claimed);
+            let facts = establish_anchor_facts(&receipt, None);
+            let prepared = PreparedOts::from_facts(&facts[0])
+                .unwrap_or_else(|| panic!("height {claimed} is attested by the proof"));
 
             // The attestation SELECTED is the one the receipt named, not the
             // lowest: everything downstream -- the computed root and the
-            // block this run looks up -- must describe the claimed block.
+            // block the online pass looks up -- must describe that block.
             assert_eq!(prepared.attestation.block_height, claimed);
             assert_eq!(prepared.receipt_block_height, claimed);
             assert_eq!(
@@ -2245,42 +1880,36 @@ mod tests {
     #[test]
     fn a_height_no_attestation_carries_is_refuted_with_the_whole_set() {
         let digest = [0x11; 32];
-        let target = format!("sha256:{}", hex::encode(digest));
-        let proof = multi_attestation_proof(digest, &[932_897, 932_910]);
-
         for claimed in [900_000u64, 932_900, 2_097_151] {
-            let rejection = prepare_bitcoin_ots(
-                "super_root",
-                &target,
-                &proof,
-                Some(&target),
-                claimed,
-                "2026-01-19T07:01:20+00:00",
-            )
-            .err()
-            .unwrap_or_else(|| panic!("height {claimed} is attested by nothing"));
+            let receipt = ots_receipt(digest, &[932_897, 932_910], claimed);
+            let facts = establish_anchor_facts(&receipt, None);
+            let result = offline_results(&receipt, &facts).remove(0);
 
             assert_eq!(
-                rejection.verdict,
-                AnchorVerdict::Invalid(ReasonCode::BitcoinClaimedHeightContradictsProof)
+                result.verdict,
+                AnchorVerdict::Invalid(ReasonCode::BitcoinClaimedHeightContradictsProof),
+                "height {claimed} is attested by nothing"
             );
+            assert_eq!(result.state(), AnchorState::Refuted);
+            // No block lookup may be attempted for it: a refutation stands
+            // whatever a block explorer reports.
+            assert!(PreparedOts::from_facts(&facts[0]).is_none());
+
             let AnchorDetails::Bitcoin {
                 proof_block_height,
                 proof_block_heights,
                 receipt_block_height,
                 ..
-            } = &rejection.details
+            } = &result.details
             else {
                 panic!("a refuted Bitcoin anchor must still carry a Bitcoin fact set");
             };
             assert_eq!(*receipt_block_height, claimed);
-            // No attestation was selected, so none is named as "the"
-            // proof's height; the set is the evidence.
+            // No attestation was selected, so none is named as "the" proof's
+            // height; the set is the evidence.
             assert_eq!(*proof_block_height, None);
             assert_eq!(proof_block_heights, &vec![932_897, 932_910]);
-            let error = rejection
-                .error
-                .expect("a refutation must say what it refuted");
+            let error = result.error.expect("a refutation must say what it refuted");
             assert!(
                 error.contains("932897") && error.contains("932910"),
                 "{error}"
@@ -2288,42 +1917,200 @@ mod tests {
         }
     }
 
+    /// **Any refutation outranks every inability.**
+    ///
+    /// A `bitcoin_ots` anchor whose stated height its own proof contradicts
+    /// carries both kinds of finding at once: the height refutation, and the
+    /// block header `atl-core` never fetched. The refutation must decide,
+    /// and the inability must not be silently dropped from the fact set.
     #[test]
-    fn bitcoin_preflight_rejects_hash_mismatch() {
-        let err = prepare_bitcoin_ots(
-            "super_root",
-            TEST_ROOT_HASH,
-            "base64:proof",
-            Some(OTHER_HASH),
-            0,
-            "2026-01-19T07:01:20Z",
-        )
-        .err()
-        .expect("must reject");
+    fn a_refutation_beside_an_inability_decides_the_anchor() {
+        let receipt = ots_receipt([0x11; 32], &[932_897], 900_000);
+        let facts = establish_anchor_facts(&receipt, None);
+
+        assert!(facts[0].is_refuted());
+        assert!(!facts[0].is_indeterminate());
+        assert!(!facts[0].is_verified());
+        // Both findings are present; the ranking is the rule, not a filter.
+        assert_eq!(facts[0].refutations().count(), 1);
+        assert_eq!(facts[0].inabilities().count(), 1);
         assert_eq!(
-            err.verdict,
-            AnchorVerdict::Invalid(ReasonCode::AnchorTargetHashMismatch)
+            offline_results(&receipt, &facts)[0].verdict,
+            AnchorVerdict::Invalid(ReasonCode::BitcoinClaimedHeightContradictsProof)
         );
     }
 
+    /// A structurally sound OTS proof is `untrusted` offline, never
+    /// accepted: nothing has compared its Merkle root against a block.
     #[test]
-    fn requires_network_only_for_bitcoin() {
-        let rfc = ReceiptAnchor::Rfc3161 {
-            target: "data_tree_root".to_string(),
-            target_hash: TEST_ROOT_HASH.to_string(),
-            tsa_url: "https://example.invalid/tsa".to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            token_der: "base64:token".to_string(),
+    fn a_sound_ots_proof_is_untrusted_until_a_block_is_seen() {
+        let receipt = ots_receipt([0x11; 32], &[932_897], 932_897);
+        let facts = establish_anchor_facts(&receipt, None);
+        let result = offline_results(&receipt, &facts).remove(0);
+
+        assert_eq!(
+            result.verdict,
+            AnchorVerdict::Untrusted(ReasonCode::BitcoinBlockNotChecked)
+        );
+        assert_eq!(result.state(), AnchorState::NotChecked);
+        assert!(!result.verified());
+        // It is the one case the network can still settle.
+        let prepared = PreparedOts::from_facts(&facts[0]).expect("the block is still to be seen");
+        assert_eq!(prepared.attestation.block_height, 932_897);
+        assert!(prepared.computed_root.starts_with("sha256:"));
+        assert_eq!(
+            prepared.operation_count,
+            prepared.attestation.merkle_path.len()
+        );
+
+        let AnchorDetails::Bitcoin {
+            computed_root,
+            block_merkle_root,
+            merkle_match,
+            block_timestamp_secs,
+            block_sources,
+            ..
+        } = &result.details
+        else {
+            panic!("bitcoin fact set");
         };
-        let ots = ReceiptAnchor::BitcoinOts {
-            target: "super_root".to_string(),
-            target_hash: TEST_ROOT_HASH.to_string(),
-            timestamp: "2024-01-01T00:00:00Z".to_string(),
-            bitcoin_block_height: 800_000,
-            bitcoin_block_time: "2024-01-01T00:00:00Z".to_string(),
-            ots_proof: "base64:proof".to_string(),
+        assert_eq!(
+            computed_root.as_deref(),
+            Some(prepared.computed_root.as_str())
+        );
+        // No header was obtained, so nothing may be published as one.
+        assert_eq!(*block_merkle_root, None);
+        assert_eq!(*merkle_match, None);
+        assert_eq!(*block_timestamp_secs, None);
+        assert!(block_sources.is_empty());
+    }
+
+    /// A `bitcoin_ots` anchor publishes no `timestamp_nanos` offline.
+    ///
+    /// For this anchor type the field carries the time of the block header
+    /// the sources agreed on — an established fact — and offline there is no
+    /// header. Putting the anchor's own `timestamp` claim there instead
+    /// would publish it as `claimed_timestamp`, a field this anchor type has
+    /// never had.
+    #[test]
+    fn a_bitcoin_anchor_publishes_no_time_offline() {
+        let receipt = ots_receipt([0x11; 32], &[932_897], 932_897);
+        let facts = establish_anchor_facts(&receipt, None);
+        assert_eq!(offline_results(&receipt, &facts)[0].timestamp_nanos, None);
+    }
+
+    // ================================================================
+    // Plumbing
+    // ================================================================
+
+    /// **`token_der` must carry the `base64:` prefix ATL v2.0 §4.2 writes.**
+    ///
+    /// This crate used to prepend the prefix when a receipt omitted it, so a
+    /// bare base64 token verified here and nowhere else — `atl-core`'s
+    /// decoder requires it, as does every producer. A verifier that accepts
+    /// a wider set of inputs than the library it verifies with is two parts
+    /// of one system disagreeing about what a receipt is, which is how
+    /// "could not check" turns into "checked and false" (the `spec_version`
+    /// gate was the same shape). The set accepted is now exactly
+    /// `atl-core`'s.
+    #[test]
+    fn a_token_without_the_base64_prefix_is_not_decoded() {
+        let prefixed = only_result(
+            rfc3161_anchor("data_tree_root", TEST_ROOT_HASH, "base64:bm90YXRva2Vu"),
+            true,
+        );
+        let bare = only_result(
+            rfc3161_anchor("data_tree_root", TEST_ROOT_HASH, "bm90YXRva2Vu"),
+            true,
+        );
+        assert_eq!(
+            prefixed.verdict,
+            AnchorVerdict::Invalid(ReasonCode::TsaTokenUnparsable)
+        );
+        assert_eq!(
+            bare.verdict,
+            AnchorVerdict::Invalid(ReasonCode::TsaTokenUnparsable)
+        );
+        let error = bare.error.expect("the decoder says what it wanted");
+        assert!(error.contains("base64:"), "{error}");
+    }
+
+    #[test]
+    fn prepared_ots_is_never_built_for_an_rfc3161_anchor() {
+        let facts = only_facts(
+            rfc3161_anchor("data_tree_root", TEST_ROOT_HASH, "base64:bm90YXRva2Vu"),
+            true,
+        );
+        assert!(PreparedOts::from_facts(&facts).is_none());
+    }
+
+    /// **Only an anchor the network can still settle asks for the network.**
+    ///
+    /// `PreparedOts::from_facts` is the whole predicate — "is a Bitcoin
+    /// anchor present" is not, because a receipt's `anchors` array is
+    /// authenticated by nothing and appending one used to be enough to make
+    /// this tool go online. An appended Bitcoin anchor that cannot bind to
+    /// the receipt is refuted offline and asks for nothing.
+    #[test]
+    fn only_an_unsettled_bitcoin_anchor_asks_for_the_network() {
+        // An RFC 3161 anchor never does: its verification is pure
+        // computation.
+        assert!(PreparedOts::from_facts(&only_facts(
+            rfc3161_anchor("data_tree_root", TEST_ROOT_HASH, "base64:bm90YXRva2Vu"),
+            true
+        ))
+        .is_none());
+
+        // Nor does a Bitcoin anchor pinned to a root this receipt does not
+        // have -- the cheapest thing a relay can append.
+        assert!(PreparedOts::from_facts(&only_facts(
+            bitcoin_anchor("super_root", SUPER_ROOT_HASH, "base64:proof", 800_000),
+            false
+        ))
+        .is_none());
+        assert!(PreparedOts::from_facts(&only_facts(
+            bitcoin_anchor("super_root", OTHER_HASH, "base64:proof", 800_000),
+            true
+        ))
+        .is_none());
+
+        // A sound one does, and that is the case the network exists for.
+        let receipt = ots_receipt([0x11; 32], &[932_897], 932_897);
+        let facts = establish_anchor_facts(&receipt, None);
+        assert!(PreparedOts::from_facts(&facts[0]).is_some());
+    }
+
+    /// Facts and anchors are index-aligned, and a short fact slice reports
+    /// fewer anchors rather than mis-attributing facts to the wrong one.
+    #[test]
+    fn results_are_index_aligned_with_the_receipts_anchors() {
+        let receipt = receipt_with(
+            vec![
+                rfc3161_anchor("data_tree_root", TEST_ROOT_HASH, "base64:bm90YXRva2Vu"),
+                bitcoin_anchor("super_root", SUPER_ROOT_HASH, "base64:rubbish", 800_000),
+            ],
+            true,
+        );
+        let facts = establish_anchor_facts(&receipt, None);
+        let results = offline_results(&receipt, &facts);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].anchor_type, "rfc3161");
+        assert_eq!(results[1].anchor_type, "bitcoin_ots");
+        assert_eq!(offline_results(&receipt, &facts[..1]).len(), 1);
+    }
+
+    #[test]
+    fn sources_agree_is_the_only_definition_of_agreement() {
+        let report = |source: &str, time: u64| BlockSourceReport {
+            source: source.to_string(),
+            block_hash: "aa".repeat(32),
+            merkle_root: "bb".repeat(32),
+            block_timestamp_secs: time,
         };
-        assert!(!requires_network(&rfc));
-        assert!(requires_network(&ots));
+        assert!(sources_agree(&[]));
+        assert!(sources_agree(&[report("one", 1)]));
+        assert!(sources_agree(&[report("one", 1), report("two", 1)]));
+        // A conflict about nothing but the time is still a conflict.
+        assert!(!sources_agree(&[report("one", 1), report("two", 2)]));
     }
 }

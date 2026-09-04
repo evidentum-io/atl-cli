@@ -7,7 +7,14 @@
 //! (Receipt-Full)". This CLI defaults to the strict reading (every anchor the
 //! receipt presents must be verified) and lets a caller drop to the floor
 //! explicitly. These tests pin both ends, and pin what the flag may not
-//! reach: a refutation, and a receipt with no anchors at all.
+//! reach: a receipt with no anchors at all (no quorum of one is met by
+//! zero), and a receipt this run disproved.
+//!
+//! They also pin the direction that has nothing to do with the flag: an
+//! anchor that was checked and found false changes no status, under either
+//! policy, because a receipt's `anchors` array is signed and hashed by
+//! nothing and anybody who relays a receipt can append an entry to it. It is
+//! reported in full all the same.
 //!
 //! Everything here runs `--offline`, so the Bitcoin anchor of a Receipt-Full
 //! is deliberately left unresolved. That is the one situation in which the
@@ -96,7 +103,16 @@ fn a_receipt_full_with_an_unconfirmed_bitcoin_anchor_is_untrusted_by_default() {
 
     assert_eq!(code, 3, "{json}");
     assert_eq!(json["status"], "untrusted");
-    assert_eq!(json["reason_code"], "bitcoin_block_not_checked");
+    // §5.5's floor IS met -- the TSA anchor verified -- so the receipt's own
+    // reason names the caller's stricter profile and no anchor. The Bitcoin
+    // anchor's own `bitcoin_block_not_checked` is on the anchor, in the
+    // coverage axis, and in `errors[]`; the top-level code may not be a
+    // function of an array anybody who relays the receipt can rewrite.
+    assert_eq!(json["reason_code"], "anchor_quorum_unmet");
+    assert_eq!(
+        json["assessment"]["coverage"]["unresolved"][0]["reason_code"],
+        "bitcoin_block_not_checked"
+    );
     // The three axes disagree with each other, which is the entire reason
     // they are published separately: trust IS established, the quorum is
     // NOT met, and coverage is NOT complete.
@@ -193,50 +209,163 @@ fn allow_single_anchor_never_accepts_an_unanchored_receipt() {
         assert_eq!(code, 3, "{json}");
         assert_eq!(json["status"], "untrusted");
         assert_eq!(json["reason_code"], "receipt_unanchored");
-        assert!(
-            json["assessment"].is_null(),
-            "there is no quorum to report on when no anchor was presented: {json}"
+        // The axes are answered for a Receipt-Lite too. Their *presence*
+        // used to depend on the `anchors` array, which is authenticated by
+        // nothing, so appending one anchor made four unmovable fields
+        // appear out of nowhere.
+        assert_eq!(
+            json["assessment"]["evidence"]["established"], false,
+            "{json}"
         );
+        assert_eq!(
+            json["assessment"]["evidence"]["verified_anchors"], 0,
+            "{json}"
+        );
+        assert_eq!(json["assessment"]["evidence"]["total_anchors"], 0, "{json}");
+        assert!(
+            json["assessment"]["evidence"]["refuted_by"].is_null(),
+            "{json}"
+        );
+        assert_eq!(
+            json["assessment"]["policy"]["max_trust_profile"], false,
+            "{json}"
+        );
+        assert_eq!(json["assessment"]["policy"]["satisfied"], false, "{json}");
     }
 }
 
-/// **A refutation must poison every supporting field.**
+/// Everything the top level of the report says **about the receipt**, as one
+/// comparable value.
 ///
-/// The fixture is a real Receipt-Full plus one extra RFC 3161 anchor pointed
-/// at a hash that is not this receipt's Data Tree root, so exactly three
-/// outcomes coexist: one verified anchor, one unresolved (its Bitcoin block
-/// was never fetched, this being an offline run) and one refuted.
+/// A receipt's `anchors` array is covered by neither the leaf hash nor the
+/// checkpoint blob, so a relay can rewrite it at will. Every field below is
+/// therefore required to be a function of facts a relay cannot move —
+/// chiefly the count of anchors that reached a trust root the *caller*
+/// supplied, which nothing a stranger can do will raise.
 ///
-/// The verdict is `invalid`, and nothing printed beside it may claim
-/// achieved trust. This is the defect the axes reintroduced when they were
-/// added: they were tallied from the verified anchors alone, so
-/// `evidence.established`, `coverage.complete` and `max_trust_profile` could
-/// all report success next to a `status: "invalid"` verdict.
+/// # What is deliberately left out, and why
+///
+/// Three groups, each a per-anchor enumeration that **must** grow when an
+/// anchor is appended, because concealing the appended anchor would be the
+/// opposite defect:
+///
+/// * `anchor_verification.results[]` — the anchors themselves;
+/// * `assessment.coverage.*` and `assessment.evidence.total_anchors` /
+///   `refuted_anchors` — coverage accounts for every anchor *presented*, so
+///   it is a statement about the presented set by definition;
+/// * `assessment.policy.satisfied` under the default profile, which asks
+///   that every anchor presented be verified and so is likewise defined over
+///   the presented set. `--allow-single-anchor` is immune, and this test
+///   runs both.
+///
+/// `anchor_status.presented` is left out for the same reason and reported as
+/// the relay-controlled number it is; `anchor_status.verified` and
+/// `.state` are compared, because those are the facts a relay cannot move.
+fn receipt_level_tuple(code: i32, json: &serde_json::Value) -> String {
+    let mut fields = vec![format!("exit={code}")];
+    for key in [
+        "status",
+        "reason_code",
+        "anchor_status.state",
+        "anchor_status.verified",
+        "mode",
+        "file_hash.match",
+        "file_hash.computed",
+        "file_hash.expected",
+        "verification.inclusion_valid",
+        "verification.super_inclusion_valid",
+        "verification.super_consistency_valid",
+        "verification.proofs_valid",
+        "verification.entry_id",
+        "assessment.evidence.established",
+        "assessment.evidence.verified_anchors",
+        "assessment.evidence.refuted_by",
+        "assessment.policy.max_trust_profile",
+    ] {
+        let mut node = json;
+        for part in key.split('.') {
+            node = &node[part];
+        }
+        fields.push(format!("{key}={node}"));
+    }
+    // The receipt's own statement in `errors[]`. Entry 0 is that statement;
+    // the entries after it are the per-anchor findings and must be free to
+    // grow.
+    fields.push(format!("errors[0]={}", json["errors"][0]));
+    fields.join("\n")
+}
+
+/// **A Receipt-Lite must not stop looking unanchored because a stranger
+/// appended an anchor.**
+///
+/// The coordinator's experiment, pinned. A receipt with no anchors reports
+/// `receipt_unanchored`: no trust was established and none ever was. Append
+/// one rubbish anchor — which anybody who relays the receipt can do, with no
+/// key — and the tool used to report `anchor_target_hash_mismatch` with
+/// `anchor_status: "anchored"` instead. "There is no anchor here" became
+/// "one anchor did not match", which sounds like a local mishap and hides
+/// the larger fact; and a reader reads one line.
+///
+/// Every top-level field is compared, not just the status: this leaked once
+/// through `reason_code` and `anchor_status` while the status held.
 #[test]
-fn a_refuted_anchor_leaves_no_axis_claiming_trust() {
+fn an_appended_anchor_cannot_make_a_receipt_lite_stop_looking_unanchored() {
     let dir = TempDir::new().unwrap();
     let (anchor_pem, intermediate_pem) = trust_material(&dir);
-    let receipt_path = dir.path().join("mixed.atl");
 
-    let mut receipt: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(real_data("receipt-full.atl")).unwrap()).unwrap();
-    let anchors = receipt["anchors"].as_array_mut().unwrap();
-    let mut refuted = anchors
-        .iter()
-        .find(|a| a["type"] == "rfc3161")
-        .expect("the fixture carries an RFC 3161 anchor")
-        .clone();
-    refuted["target_hash"] = serde_json::Value::String(format!("sha256:{}", "ab".repeat(32)));
-    anchors.push(refuted);
-    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+    let clean: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(real_data("receipt-lite.atl")).unwrap()).unwrap();
+    assert!(
+        clean
+            .get("anchors")
+            .is_none_or(|a| a.as_array().unwrap().is_empty()),
+        "the fixture must be a Receipt-Lite"
+    );
 
-    for extra in [&[][..], &["--allow-single-anchor"][..]] {
+    // Four things a relay can attach with no key at all.
+    let junk = [
+        serde_json::json!({
+            "type": "rfc3161", "target": "data_tree_root",
+            "target_hash": format!("sha256:{}", "ab".repeat(32)),
+            "tsa_url": "https://example.invalid/tsa",
+            "timestamp": "2024-01-01T00:00:00Z", "token_der": "base64:bm90YXRva2Vu"
+        }),
+        serde_json::json!({
+            "type": "rfc3161", "target": "super_root",
+            "target_hash": format!("sha256:{}", "cd".repeat(32)),
+            "tsa_url": "https://example.invalid/tsa",
+            "timestamp": "2024-01-01T00:00:00Z", "token_der": "base64:bm90YXRva2Vu"
+        }),
+        serde_json::json!({
+            "type": "bitcoin_ots", "target": "super_root",
+            "target_hash": format!("sha256:{}", "ef".repeat(32)),
+            "timestamp": "2024-01-01T00:00:00Z",
+            "bitcoin_block_height": 800_000,
+            "bitcoin_block_time": "2024-01-01T00:00:00Z",
+            "ots_proof": "base64:cnViYmlzaA=="
+        }),
+        serde_json::json!({
+            "type": "rfc3161", "target": "data_tree_root",
+            "target_hash": "not-a-hash",
+            "tsa_url": "https://example.invalid/tsa",
+            "timestamp": "2024-01-01T00:00:00Z", "token_der": "base64:bm90YXRva2Vu"
+        }),
+    ];
+
+    let write = |name: &str, value: &serde_json::Value| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        path
+    };
+    let clean_path = write("lite-clean.atl", &clean);
+
+    let run = |receipt: &PathBuf, extra: &[&str]| {
         let mut cmd = Command::cargo_bin("atl-cli").unwrap();
         let output = cmd
             .args([
                 "verify",
                 real_data("testfile.txt").to_str().unwrap(),
-                receipt_path.to_str().unwrap(),
+                receipt.to_str().unwrap(),
                 "--offline",
                 "--json",
                 "--tsa-trust-store",
@@ -246,47 +375,457 @@ fn a_refuted_anchor_leaves_no_axis_claiming_trust() {
             ])
             .args(extra)
             .assert()
-            .code(1)
             .get_output()
             .clone();
         let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code().unwrap(), json)
+    };
 
-        assert_eq!(json["status"], "invalid", "{json}");
-        assert_eq!(json["reason_code"], "anchor_target_hash_mismatch");
+    // Both settings, not just the default: a guard that only ever runs under
+    // one of them has not been shown to hold under the other.
+    for extra in [&[][..], &["--allow-single-anchor"][..]] {
+        let (clean_code, clean_json) = run(&clean_path, extra);
+        assert_eq!(clean_code, 3, "{clean_json}");
+        assert_eq!(clean_json["status"], "untrusted", "{clean_json}");
+        assert_eq!(
+            clean_json["reason_code"], "receipt_unanchored",
+            "{clean_json}"
+        );
 
-        let a = &json["assessment"];
-        // One anchor really did reach a trusted root, and the count says so.
-        assert_eq!(a["evidence"]["verified_anchors"], 1, "{json}");
-        assert_eq!(a["evidence"]["refuted_anchors"], 1, "{json}");
-        assert_eq!(a["evidence"]["total_anchors"], 3, "{json}");
-        // And yet nothing here may report achieved trust.
-        assert_eq!(
-            a["evidence"]["established"], false,
-            "trust is not established in refuted evidence: {json}"
-        );
-        assert_eq!(a["policy"]["satisfied"], false, "{json}");
-        assert_eq!(a["policy"]["max_trust_profile"], false, "{json}");
-        assert_eq!(
-            a["coverage"]["complete"], false,
-            "the refuted anchor must be accounted for, not counted as settled: {json}"
-        );
-        assert_eq!(a["coverage"]["accepted_with_gaps"], false, "{json}");
+        for (i, anchor) in junk.iter().enumerate() {
+            let mut tampered = clean.clone();
+            tampered["anchors"] = serde_json::json!([anchor]);
+            let path = write(&format!("lite-tampered-{i}.atl"), &tampered);
+            let (code, json) = run(&path, extra);
 
-        // The refuted anchor is named in the coverage axis, not merely
-        // counted, and it is kept apart from the merely-unresolved one:
-        // the two call for opposite reactions.
-        assert_eq!(a["coverage"]["refuted"][0]["type"], "rfc3161", "{json}");
-        assert_eq!(a["coverage"]["refuted"][0]["state"], "refuted");
+            assert_eq!(
+                receipt_level_tuple(code, &json),
+                receipt_level_tuple(clean_code, &clean_json),
+                "junk anchor {i} moved what the receipt reports about itself \
+                 ({extra:?})\nclean: {clean_json}\ntampered: {json}"
+            );
+            // Specifically, and because these are the two the experiment
+            // caught: the reason a reader is given, and the anchor headline.
+            assert_eq!(json["reason_code"], "receipt_unanchored", "{json}");
+            assert_eq!(json["anchor_status"]["state"], "none_verified", "{json}");
+            assert_eq!(json["anchor_status"]["verified"], 0, "{json}");
+
+            // And the appended anchor is not concealed: `presented` counts
+            // it, and it appears in full with its own finding.
+            assert_eq!(json["anchor_status"]["presented"], 1, "{json}");
+            assert_eq!(
+                json["anchor_verification"]["results"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                1,
+                "{json}"
+            );
+        }
+    }
+}
+
+/// **The one thing a relay can still move, pinned so it stays deliberate.**
+///
+/// The default profile asks that *every anchor the receipt presents* be
+/// verified. That is a rule about the presented set, and the presented set
+/// is a relay's to change — so appending one rubbish anchor to an accepted
+/// receipt takes it from `valid` (exit 0) to `untrusted` (exit 3).
+///
+/// It is a denial of verification, and it is deliberately not fixed here,
+/// because the only fix is to stop asking the question the profile exists to
+/// ask. What matters is the shape of what a relay gets:
+///
+/// * never an accusation — the status is `untrusted`, never `invalid`, and
+///   nothing reports the receipt as refuted;
+/// * never a reason of their choosing — `anchor_quorum_unmet` names the
+///   caller's own profile and no anchor;
+/// * never `--allow-single-anchor`, which asks ATL v2.0 §5.5's own question
+///   ("at least one verified anchor") and cannot be moved by appending,
+///   since appending cannot lower a count.
+///
+/// A caller who does not want a relay able to do this should pass
+/// `--allow-single-anchor` and read §5.5's answer.
+#[test]
+fn the_default_profile_is_relay_sensitive_and_the_relaxed_one_is_not() {
+    let dir = TempDir::new().unwrap();
+    let (anchor_pem, intermediate_pem) = trust_material(&dir);
+
+    // `receipt-tsa.atl` presents exactly one anchor, and `trust_material`
+    // is the material that verifies it -- so the clean receipt satisfies
+    // even the default profile, which is the case this test needs.
+    let clean: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(real_data("receipt-tsa.atl")).unwrap()).unwrap();
+    let mut appended = clean.clone();
+    appended["anchors"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "rfc3161", "target": "data_tree_root",
+            "target_hash": format!("sha256:{}", "ab".repeat(32)),
+            "tsa_url": "https://example.invalid/tsa",
+            "timestamp": "2024-01-01T00:00:00Z", "token_der": "base64:bm90YXRva2Vu"
+        }));
+
+    let write = |name: &str, value: &serde_json::Value| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        path
+    };
+    let clean_path = write("q-clean.atl", &clean);
+    let appended_path = write("q-appended.atl", &appended);
+
+    let run = |receipt: &PathBuf, extra: &[&str]| {
+        let mut cmd = Command::cargo_bin("atl-cli").unwrap();
+        let output = cmd
+            .args([
+                "verify",
+                real_data("testfile.txt").to_str().unwrap(),
+                receipt.to_str().unwrap(),
+                "--offline",
+                "--json",
+                "--tsa-trust-store",
+                anchor_pem.to_str().unwrap(),
+                "--tsa-intermediates",
+                intermediate_pem.to_str().unwrap(),
+            ])
+            .args(extra)
+            .assert()
+            .get_output()
+            .clone();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code().unwrap(), json)
+    };
+
+    // --- The default profile: the relay CAN move acceptance ---
+    let (clean_code, clean_json) = run(&clean_path, &[]);
+    assert_eq!(clean_code, 0, "{clean_json}");
+    assert_eq!(clean_json["status"], "valid", "{clean_json}");
+
+    let (code, json) = run(&appended_path, &[]);
+    assert_eq!(code, 3, "{json}");
+    assert_eq!(json["status"], "untrusted", "{json}");
+    // But only into `untrusted`, and only under a fixed code naming the
+    // caller's own profile. Never `invalid`, and never a code the relay
+    // picked by choosing which anchor to append.
+    assert_ne!(json["status"], "invalid", "{json}");
+    assert_eq!(json["reason_code"], "anchor_quorum_unmet", "{json}");
+    assert!(
+        json["assessment"]["evidence"]["refuted_by"].is_null(),
+        "{json}"
+    );
+    // §5.5's floor is still met, and the report says so.
+    assert_eq!(
+        json["assessment"]["evidence"]["established"], true,
+        "{json}"
+    );
+    assert_eq!(
+        json["assessment"]["evidence"]["verified_anchors"], 1,
+        "{json}"
+    );
+    assert_eq!(json["anchor_status"]["state"], "verified", "{json}");
+
+    // --- `--allow-single-anchor`: the relay CANNOT ---
+    let (clean_code, clean_json) = run(&clean_path, &["--allow-single-anchor"]);
+    let (code, json) = run(&appended_path, &["--allow-single-anchor"]);
+    assert_eq!(clean_code, 0, "{clean_json}");
+    assert_eq!(
+        receipt_level_tuple(code, &json),
+        receipt_level_tuple(clean_code, &clean_json),
+        "the §5.5 quorum must not be movable by appending\nclean: {clean_json}\nafter: {json}"
+    );
+    assert_eq!(json["status"], "valid", "{json}");
+}
+
+/// The guard above is only worth anything if the tuple it compares can
+/// differ. Two receipts that genuinely differ must produce different tuples,
+/// or a bug in `receipt_level_tuple` would make every invariance assertion
+/// in this file pass for free.
+#[test]
+fn the_receipt_level_tuple_is_not_constant() {
+    let dir = TempDir::new().unwrap();
+    let (anchor_pem, _) = trust_material(&dir);
+
+    let run = |source: &str, receipt: &str| {
+        let mut cmd = Command::cargo_bin("atl-cli").unwrap();
+        let output = cmd
+            .args([
+                "verify",
+                real_data(source).to_str().unwrap(),
+                real_data(receipt).to_str().unwrap(),
+                "--offline",
+                "--json",
+                "--tsa-trust-store",
+                anchor_pem.to_str().unwrap(),
+            ])
+            .assert()
+            .get_output()
+            .clone();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        receipt_level_tuple(output.status.code().unwrap(), &json)
+    };
+
+    // A Receipt-Lite, an accepted Receipt-TSA and a receipt verified against
+    // the wrong source file: three different outcomes, three different
+    // tuples.
+    let lite = run("testfile.txt", "receipt-lite.atl");
+    let accepted = run("testfile2.txt", "receipt2-tsa.atl");
+    let wrong_file = run("testfile.txt", "receipt2-tsa.atl");
+
+    assert_ne!(lite, accepted);
+    assert_ne!(lite, wrong_file);
+    assert_ne!(accepted, wrong_file);
+}
+
+/// **An anchor anybody could have appended may not refute the receipt.**
+///
+/// A receipt authenticates neither the presence nor the contents of its
+/// `anchors` array: the leaf hash covers `payload_hash` and `metadata_hash`,
+/// the checkpoint blob covers origin, tree size, timestamp and root hash, and
+/// the array appears in neither. **Anyone who relays a receipt can append an
+/// anchor to it, with no key.**
+///
+/// The fixture is a real Receipt-Full plus one extra RFC 3161 anchor pointed
+/// at a hash that is not this receipt's Data Tree root — the cheapest
+/// possible forgery — so exactly three outcomes coexist: one verified anchor,
+/// one unresolved (its Bitcoin block was never fetched, this being an offline
+/// run) and one refuted.
+///
+/// The receipt was `untrusted` before the append and must stay `untrusted`
+/// after it. It used to become `invalid`, exit 1: a stranger could turn
+/// *trust could not be established* into *this evidence is disproved*, which
+/// is a denial of verification available for free to every relay.
+///
+/// **Both halves are asserted**, because the first alone cannot tell "the
+/// invariant holds" from "anchors do not matter":
+///
+/// 1. appending an anchor that fails verification changes no status;
+/// 2. the anchor that **passes** is what carries the receipt — removing it
+///    takes the acceptance away.
+#[test]
+fn an_appended_failed_anchor_changes_no_status() {
+    let dir = TempDir::new().unwrap();
+    let (anchor_pem, intermediate_pem) = trust_material(&dir);
+
+    let genuine: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(real_data("receipt-full.atl")).unwrap()).unwrap();
+
+    let mut appended = genuine.clone();
+    {
+        let anchors = appended["anchors"].as_array_mut().unwrap();
+        let mut refuted = anchors
+            .iter()
+            .find(|a| a["type"] == "rfc3161")
+            .expect("the fixture carries an RFC 3161 anchor")
+            .clone();
+        refuted["target_hash"] = serde_json::Value::String(format!("sha256:{}", "ab".repeat(32)));
+        anchors.push(refuted);
+    }
+
+    // The same receipt with its one *verified* anchor removed: the control
+    // for half 2.
+    let mut without_tsa = genuine.clone();
+    {
+        let anchors = without_tsa["anchors"].as_array_mut().unwrap();
+        anchors.retain(|a| a["type"] != "rfc3161");
+    }
+
+    let write = |name: &str, value: &serde_json::Value| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, serde_json::to_vec(value).unwrap()).unwrap();
+        path
+    };
+    let genuine_path = write("genuine.atl", &genuine);
+    let appended_path = write("appended.atl", &appended);
+    let without_tsa_path = write("without-tsa.atl", &without_tsa);
+
+    let run = |receipt: &PathBuf, extra: &[&str]| {
+        let mut cmd = Command::cargo_bin("atl-cli").unwrap();
+        let output = cmd
+            .args([
+                "verify",
+                real_data("testfile.txt").to_str().unwrap(),
+                receipt.to_str().unwrap(),
+                "--offline",
+                "--json",
+                "--tsa-trust-store",
+                anchor_pem.to_str().unwrap(),
+                "--tsa-intermediates",
+                intermediate_pem.to_str().unwrap(),
+            ])
+            .args(extra)
+            .assert()
+            .get_output()
+            .clone();
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        (output.status.code().unwrap(), json)
+    };
+
+    // ---- Half 1: appending moves nothing the receipt reports about itself ----
+    for extra in [&[][..], &["--allow-single-anchor"][..]] {
+        let (before_code, before) = run(&genuine_path, extra);
+        let (after_code, after) = run(&appended_path, extra);
+
+        // The WHOLE reported tuple, not just the status.
+        //
+        // Comparing one field is how this leaked twice already: `is_valid`
+        // held while `is_indeterminate` moved, then the status held while
+        // `reason_code` and `anchor_status` moved. Everything a reader of
+        // the top level sees is compared here, and the per-anchor
+        // enumerations -- which MUST grow, or the appended anchor would be
+        // concealed -- are the only exemptions, named one by one.
         assert_eq!(
-            a["coverage"]["refuted"][0]["reason_code"],
-            "anchor_target_hash_mismatch"
+            receipt_level_tuple(before_code, &before),
+            receipt_level_tuple(after_code, &after),
+            "appending an anchor that fails verification moved something the \
+             receipt reports about itself ({extra:?})\nbefore: {before}\nafter: {after}"
         );
+        assert_ne!(
+            after["status"], "invalid",
+            "a stranger must never be able to make a receipt read as disproved: {after}"
+        );
+
+        // And it is never hidden. The refuted anchor keeps its own state and
+        // reason code, is listed in the coverage axis, and keeps coverage
+        // incomplete -- an appended anchor is evidence of interference, and
+        // "does not decide the verdict" may not become "is not shown".
+        let a = &after["assessment"];
+        assert_eq!(a["evidence"]["refuted_anchors"], 1, "{after}");
+        assert_eq!(a["evidence"]["total_anchors"], 3, "{after}");
+        assert_eq!(a["evidence"]["verified_anchors"], 1, "{after}");
+        assert_eq!(a["coverage"]["complete"], false, "{after}");
+        assert_eq!(a["coverage"]["refuted"][0]["type"], "rfc3161", "{after}");
+        assert_eq!(a["coverage"]["refuted"][0]["state"], "refuted", "{after}");
+        assert_eq!(
+            a["coverage"]["refuted"][0]["reason_code"], "anchor_target_hash_mismatch",
+            "{after}"
+        );
+        // The merely-unresolved anchor stays in its own list: the two call
+        // for opposite reactions and must not be run together.
         assert_eq!(
             a["coverage"]["unresolved"][0]["type"], "bitcoin_ots",
-            "{json}"
+            "{after}"
         );
-        assert_eq!(a["coverage"]["unresolved"][0]["state"], "not_checked");
+        assert_eq!(
+            a["coverage"]["unresolved"][0]["state"], "not_checked",
+            "{after}"
+        );
+        // Three outcomes, not two: verified, unresolved and refuted all
+        // appear on the same receipt.
+        let anchors = after["anchor_verification"]["results"].as_array().unwrap();
+        let states: Vec<&str> = anchors
+            .iter()
+            .map(|a| a["state"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            states,
+            vec!["verified", "not_checked", "refuted"],
+            "{after}"
+        );
     }
+
+    // ---- Half 2: the anchor that passes is what carries the receipt ----
+    //
+    // Under `--allow-single-anchor` the genuine receipt is accepted, and the
+    // appended rubbish did not take that away. Remove the one *verified*
+    // anchor and the acceptance goes with it -- so the test above is
+    // measuring an invariant, not an inert flag.
+    let (code, json) = run(&genuine_path, &["--allow-single-anchor"]);
+    assert_eq!(code, 0, "a verified anchor meets the §5.5 floor: {json}");
+    assert_eq!(json["status"], "valid", "{json}");
+
+    let (code, json) = run(&appended_path, &["--allow-single-anchor"]);
+    assert_eq!(code, 0, "appended rubbish may not withdraw it: {json}");
+    assert_eq!(json["status"], "valid", "{json}");
+
+    let (code, json) = run(&without_tsa_path, &["--allow-single-anchor"]);
+    assert_eq!(
+        code, 3,
+        "with no verified anchor the receipt is unattested: {json}"
+    );
+    assert_eq!(json["status"], "untrusted", "{json}");
+    assert_eq!(
+        json["assessment"]["evidence"]["verified_anchors"], 0,
+        "{json}"
+    );
+}
+
+/// **An accepted receipt still shows the anchor that failed.**
+///
+/// Under `--allow-single-anchor` one verified anchor meets the quorum, so a
+/// receipt can be accepted while carrying an anchor that was checked and
+/// found false. That is the invariant working — an entry anybody could have
+/// appended did not withdraw what a genuine anchor established — and it is
+/// also the case where the finding is easiest to lose, because none of the
+/// failure paths run. It must be visible in the status line, in the coverage
+/// axis, and in prose that says what it means.
+///
+/// The status stays `valid`, exit 0: this test is the second half of
+/// `an_appended_failed_anchor_changes_no_status`, and without it that one
+/// cannot tell "the invariant holds" from "anchors do not matter".
+#[test]
+fn an_accepted_receipt_still_reports_a_failed_anchor() {
+    let dir = TempDir::new().unwrap();
+    let (anchor_pem, intermediate_pem) = trust_material(&dir);
+    let receipt_path = dir.path().join("appended.atl");
+
+    let mut receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(real_data("receipt-full.atl")).unwrap()).unwrap();
+    {
+        let anchors = receipt["anchors"].as_array_mut().unwrap();
+        let mut failed = anchors
+            .iter()
+            .find(|a| a["type"] == "rfc3161")
+            .expect("the fixture carries an RFC 3161 anchor")
+            .clone();
+        failed["target_hash"] = serde_json::Value::String(format!("sha256:{}", "ab".repeat(32)));
+        anchors.push(failed);
+    }
+    std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+
+    let mut cmd = Command::cargo_bin("atl-cli").unwrap();
+    let output = cmd
+        .args([
+            "verify",
+            real_data("testfile.txt").to_str().unwrap(),
+            receipt_path.to_str().unwrap(),
+            "--offline",
+            "--no-color",
+            "--allow-single-anchor",
+            "--tsa-trust-store",
+            anchor_pem.to_str().unwrap(),
+            "--tsa-intermediates",
+            intermediate_pem.to_str().unwrap(),
+        ])
+        .assert()
+        .code(0)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    // Accepted -- and the success line says on what terms, counting BOTH
+    // kinds of gap. Counting only the unresolved ones printed "0 unresolved"
+    // beside "1 of 3 anchors verified" and left the reader to work out where
+    // the other two went.
+    assert!(
+        stdout.contains("VALID under policy 'single-anchor'"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("1 unresolved, 1 REFUTED"), "{stdout}");
+    // Named in the coverage axis...
+    assert!(
+        stdout.contains("REFUTED: refuted (anchor_target_hash_mismatch)"),
+        "{stdout}"
+    );
+    // ...and explained, so a reader is told what an appended anchor means
+    // rather than left to infer it from a reason code.
+    assert!(
+        stdout.contains("An anchor attached to this receipt was checked and FAILED:"),
+        "an accepted receipt must still explain the failed anchor:\n{stdout}"
+    );
+    assert!(stdout.contains("does not disprove the receipt"), "{stdout}");
+    // Nothing here may read as a refutation of the document.
+    assert!(!stdout.contains("Status: INVALID"), "{stdout}");
 }
 
 /// The same fixture, human-readable: the §5.6 line must not carry the word
@@ -310,11 +849,14 @@ fn a_refuted_receipt_never_prints_an_attained_profile() {
     anchors.push(refuted);
     std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
 
+    // Verified against the WRONG source file, so the receipt itself is
+    // refuted -- which is the only kind of refutation that may reach the
+    // verdict. The appended anchor rides along and must still be printed.
     let mut cmd = Command::cargo_bin("atl-cli").unwrap();
     let output = cmd
         .args([
             "verify",
-            real_data("testfile.txt").to_str().unwrap(),
+            real_data("testfile2.txt").to_str().unwrap(),
             receipt_path.to_str().unwrap(),
             "--offline",
             "--no-color",
@@ -334,23 +876,44 @@ fn a_refuted_receipt_never_prints_an_attained_profile() {
         "no form of the attainment word may appear beside a refuted verdict:\n{stdout}"
     );
     assert!(stdout.contains("Status: INVALID"), "{stdout}");
-    assert!(
-        stdout.contains("Receipt-Full profile (§5.6, both anchor types verified): NO"),
-        "{stdout}"
-    );
+    assert!(!stdout.contains("Evidence: ESTABLISHED"), "{stdout}");
+
+    // And the same receipt against its OWN source file: nothing about the
+    // receipt is refuted, so the verdict is not `invalid` -- but the anchor
+    // somebody appended is still named, in full, in the coverage axis.
+    let mut cmd = Command::cargo_bin("atl-cli").unwrap();
+    let output = cmd
+        .args([
+            "verify",
+            real_data("testfile.txt").to_str().unwrap(),
+            receipt_path.to_str().unwrap(),
+            "--offline",
+            "--no-color",
+            "--tsa-trust-store",
+            anchor_pem.to_str().unwrap(),
+            "--tsa-intermediates",
+            intermediate_pem.to_str().unwrap(),
+        ])
+        .assert()
+        .code(3)
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+
+    assert!(!stdout.contains("Status: INVALID"), "{stdout}");
     assert!(stdout.contains("Coverage: INCOMPLETE"), "{stdout}");
     assert!(
         stdout.contains("REFUTED: refuted (anchor_target_hash_mismatch)"),
-        "the refuted anchor must be listed in the coverage axis:\n{stdout}"
+        "the appended anchor must be listed in the coverage axis:\n{stdout}"
     );
-    assert!(!stdout.contains("Evidence: ESTABLISHED"), "{stdout}");
 }
 
-/// **Every `invalid` reason poisons the axes, not just an anchor-level one.**
+/// **Every `invalid` reason poisons the axes.**
 ///
-/// `verdict()` declares `invalid` for reasons that never touch an anchor —
-/// a source file whose hash does not match, a broken inclusion proof, a
-/// broken Super-Tree proof. The assessment used to be tallied from the
+/// Every reason for which `verdict()` declares `invalid` is one that never
+/// touches an anchor — a source file whose hash does not match, a broken
+/// inclusion proof, a broken Super-Tree proof — because an anchor cannot
+/// produce `invalid` at all. The assessment used to be tallied from the
 /// anchors alone, so those receipts reported `evidence.established: true`,
 /// `policy.satisfied: true` and `coverage.complete: true` beside
 /// `status: "invalid"`. Hand the tool the wrong source file and the trust

@@ -1,6 +1,6 @@
 //! Integration tests for `--tsa-trust-store` against REAL production data.
 //!
-//! `real-data/receipt2-tsa.atl` is a genuine Evidentum-issued Receipt-Lite
+//! `real-data/receipt2-tsa.atl` is a genuine Evidentum-issued Receipt-TSA
 //! anchored by exactly one RFC 3161 anchor (GlobalSign), matched to
 //! `real-data/testfile2.txt` by `entry.payload_hash` (not filename -- see
 //! `docs-md/atl-trust-model-decisions.md`). Its token's certificate chain
@@ -98,7 +98,11 @@ fn assumed_root_without_trust_store_never_reports_valid() {
 
     let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(json["status"], "untrusted");
-    assert_eq!(json["reason_code"], "tsa_root_not_trusted");
+    assert_eq!(json["reason_code"], "receipt_unanchored");
+    assert_eq!(
+        json["anchor_verification"]["results"][0]["reason_code"],
+        "tsa_root_not_trusted"
+    );
     let anchors = json["anchor_verification"]["results"]
         .as_array()
         .expect("must have anchor results");
@@ -133,9 +137,12 @@ fn assumed_root_without_trust_store_never_reports_valid() {
         .clone();
     let human = String::from_utf8(human_output).unwrap();
     assert!(
-        human.contains("NOT VERIFIED: trust root unavailable"),
+        human.contains("NOT VERIFIED: no anchor was verified"),
         "human output must name the untrusted state explicitly:\n{human}"
     );
+    // The anchor's own stable code is still in the output -- on the anchor
+    // and in the advice block. It is no longer the receipt's headline,
+    // because a code read off the `anchors` array is a relay's to choose.
     assert!(
         human.contains("tsa_root_not_trusted"),
         "human output must carry the stable reason code:\n{human}"

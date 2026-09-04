@@ -35,11 +35,16 @@ fn lite_batch() -> TempDir {
 }
 
 fn run(dir: &TempDir) -> (i32, serde_json::Value) {
+    run_with(dir, &[])
+}
+
+fn run_with(dir: &TempDir, extra: &[&str]) -> (i32, serde_json::Value) {
     let s = dir.path().join("s").to_str().unwrap().to_string();
     let r = dir.path().join("r").to_str().unwrap().to_string();
     let output = Command::cargo_bin("atl-cli")
         .unwrap()
         .args(["--json", "verify", s.as_str(), r.as_str()])
+        .args(extra)
         .assert()
         .get_output()
         .clone();
@@ -59,7 +64,7 @@ fn an_unanchored_batch_is_untrusted_but_not_an_operational_failure() {
 
     assert_eq!(code, 3, "no verified anchor anywhere: {json}");
     assert_eq!(json["status"], "untrusted");
-    assert_eq!(json["reason_code"], "batch_items_unanchored");
+    assert_eq!(json["reason_code"], "batch_items_untrusted");
     assert_eq!(
         json["summary"]["errors"], 0,
         "an unanchored receipt was processed fine; it simply has no anchor"
@@ -150,4 +155,64 @@ fn non_utf8_names_do_not_collapse_onto_one_match_key() {
     );
     assert_eq!(json["status"], "untrusted");
     assert_eq!(code, 3);
+}
+
+/// **The same defect one storey up: a batch's reason must not depend on one
+/// item's anchor array.**
+///
+/// `batch_items_unanchored` used to be reported ahead of
+/// `batch_items_untrusted` whenever any item presented no anchors. Bucket
+/// membership is decided by that item's `anchors` array, which is signed and
+/// hashed by nothing — so appending one rubbish anchor to one Receipt-Lite
+/// in the directory changed what the whole BATCH said its reason was.
+///
+/// The batch reason is now a function of what was verified, and both buckets
+/// verified nothing. The `unanchored` summary count still moves, because it
+/// describes the documents that arrived and is exactly where the appended
+/// anchor must show up.
+#[test]
+fn appending_an_anchor_to_one_item_does_not_move_the_batch_reason() {
+    for extra in [&[][..], &["--allow-single-anchor"][..]] {
+        let clean = lite_batch();
+        let (clean_code, clean_json) = run_with(&clean, extra);
+
+        let tampered = lite_batch();
+        let receipt = tampered.path().join("r").join("testfile.txt.atl");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt).unwrap()).unwrap();
+        value["anchors"] = serde_json::json!([{
+            "type": "rfc3161",
+            "target": "data_tree_root",
+            "target_hash": format!("sha256:{}", "ab".repeat(32)),
+            "tsa_url": "https://example.invalid/tsa",
+            "timestamp": "2024-01-01T00:00:00Z",
+            "token_der": "base64:bm90YXRva2Vu"
+        }]);
+        std::fs::write(&receipt, serde_json::to_vec(&value).unwrap()).unwrap();
+        let (code, json) = run_with(&tampered, extra);
+
+        assert_eq!(code, clean_code, "{extra:?}\n{clean_json}\n{json}");
+        assert_eq!(json["status"], clean_json["status"], "{extra:?}");
+        assert_eq!(
+            json["reason_code"], clean_json["reason_code"],
+            "appending to one item moved the batch's reason ({extra:?})\n\
+             clean: {clean_json}\ntampered: {json}"
+        );
+        assert_eq!(json["reason_code"], "batch_items_untrusted", "{json}");
+        assert_eq!(json["summary"]["total"], clean_json["summary"]["total"]);
+        assert_eq!(json["summary"]["valid"], 0, "{json}");
+        assert_eq!(json["summary"]["invalid"], 0, "{json}");
+
+        // The appended anchor is not concealed: the item moves between the
+        // two descriptive buckets, and that is where it must be visible.
+        assert_eq!(clean_json["summary"]["unanchored"], 1, "{clean_json}");
+        assert_eq!(json["summary"]["unanchored"], 0, "{json}");
+        assert_eq!(json["summary"]["untrusted"], 1, "{json}");
+        // The item's own reason is the same either way, for the same reason
+        // the batch's is.
+        assert_eq!(
+            json["items"][0]["reason_code"], "receipt_unanchored",
+            "{json}"
+        );
+    }
 }
