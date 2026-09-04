@@ -30,10 +30,12 @@
 //! is also `false` for `TimestampingEku::NotChecked`, where the check never
 //! ran. Branch on the enum, not the boolean.
 //!
-//! [`Status::Untrusted`] means **nothing was refuted** and this verifier
-//! could not finish the check. Note the wording: it does *not* mean every
-//! fact holds — a fact may have been impossible to evaluate at all. Several
-//! distinct situations land here, and only the first two are about missing
+//! [`Status::Untrusted`] means **the receipt was not refuted** and it was
+//! not accepted either. Note the wording: it does *not* mean every fact
+//! holds — a fact may have been impossible to evaluate at all, and one of
+//! the receipt's *anchors* may have been checked and found false (see
+//! "A refuted anchor is not a refuted receipt" below). Several distinct
+//! situations land here, and only the first two are about missing
 //! trust material:
 //!
 //! - `TerminalAnchor::Assumed` — a self-issued terminal nobody vouched for;
@@ -58,10 +60,14 @@
 //! user as "trust material is missing" and nothing more: there the missing
 //! thing may be an algorithm implementation, and telling the user to go find
 //! an intermediate certificate would send them after something that does not
-//! exist. What unites every case is that nothing was refuted.
+//! exist. What unites every case is that nothing about the **receipt** was
+//! refuted.
 //!
-//! A receipt with **no anchors at all** (Receipt-Lite) is
-//! [`Status::Untrusted`] with reason [`ReasonCode::ReceiptUnanchored`].
+//! A receipt with **no verified anchor** is [`Status::Untrusted`] with
+//! reason [`ReasonCode::ReceiptUnanchored`] — whether it presented no
+//! anchors at all (Receipt-Lite) or presented some that all failed. Those
+//! are one fact, and the tool cannot tell them apart: the second is what the
+//! first looks like after a relay appends to it.
 //! ATL v2.0 §5.5 is explicit: "At least one anchor MUST be verified to
 //! establish trust in the receipt", and "A receipt without any verified
 //! anchors SHOULD be treated as untrustworthy". A receipt carrying no
@@ -71,7 +77,7 @@
 //! untrustworthy.
 //!
 //! "Pending" survives as a *description* of the receipt's state — it is
-//! genuinely not yet anchored, and the prose and the `anchor_status` field
+//! genuinely not yet anchored, and the prose and `anchor_status.presented`
 //! still say so — but it is no longer a status and no longer exit 0.
 //!
 //! [`Status::Valid`] is acceptance. Acceptance is relative to the anchor
@@ -89,11 +95,26 @@
 //! validated. That flag being `false` is therefore NOT by itself evidence
 //! that anything is wrong — it is only a refutation when a candidate path
 //! was found and rejected, which `atl-core` reports distinctly as
-//! `PathStatus::Invalid`. The classifier that applies this rule is
-//! [`crate::verify::anchor::AnchorDetails::rfc3161_verdict`], not anything
-//! in this file: it gathers every refutation before forming a verdict, and
-//! reads `chain_valid_at_gen_time` only for a `Complete` path, where a
-//! `false` really would be a contradiction.
+//! `PathStatus::Invalid`. The rule lives in `atl-core`, which carries both
+//! halves inside one finding (`Rfc3161CertificatePath { status,
+//! valid_at_gen_time }`) and answers `is_refutation` for it, so this crate
+//! never has to know it: [`crate::verify::anchor`] only gives the finding a
+//! reason code.
+//!
+//! # A refuted anchor is not a refuted receipt
+//!
+//! [`Status::Invalid`] is reached only through
+//! [`crate::verify::single::SingleVerificationResult::receipt_refutation`] —
+//! never from an anchor. Nothing signs or hashes a receipt's `anchors`
+//! array, so any anchor finding is something a relay could have manufactured,
+//! and a status derived from one would let a stranger turn *trust could not
+//! be established* into *this evidence is disproved*. A receipt whose every
+//! anchor was checked and found false is **unattested**: [`Status::Untrusted`],
+//! exit 3, reason [`ReasonCode::ReceiptUnanchored`] — the same code a receipt
+//! presenting no anchors reports, because no anchor was verified in either
+//! case and this tool cannot tell the two apart. The anchor keeps its own
+//! `refuted` state and its own reason code throughout, and the renderers
+//! print both.
 
 use crate::error::ExitCode;
 
@@ -127,7 +148,14 @@ pub enum ReasonCode {
     /// specific mapping here.
     ReceiptVerificationFailed,
 
-    // --- Anchor-level refutations (Invalid) ---
+    // --- Anchor-level refutations ---
+    //
+    // A fact about one ANCHOR was checked and is false, so the anchor's own
+    // state is `refuted`. The receipt's status is not: these codes reach the
+    // receipt as [`Status::Untrusted`], because nothing signs or hashes a
+    // receipt's `anchors` array and an anchor that fails verification is one
+    // anybody who relayed the receipt could have attached. See
+    // [`crate::verify::single::SingleVerificationResult::verdict`].
     /// The anchor's `target` field names something other than the anchor
     /// type's mandatory target.
     AnchorTargetInvalid,
@@ -262,6 +290,17 @@ pub enum ReasonCode {
     /// either, for exactly the same reason — a fact that is not established
     /// cannot be established as false.
     BitcoinSingleSourceOnly,
+    /// This build cannot verify anchors of this type: the Cargo feature
+    /// that implements them was compiled out, so nothing about the anchor
+    /// was examined.
+    ///
+    /// An inability, and one no certificate and no network access changes.
+    /// Reporting it as a defect would assert a verification performed by
+    /// code that is not present. Unreachable in a released `atl-cli`, which
+    /// always enables both of `atl-core`'s anchor features; it exists so
+    /// that a build which does not cannot silently report an unexamined
+    /// anchor as merely unresolved for some other reason.
+    AnchorTypeUnsupported,
     /// The receipt's own `bitcoin_block_time` could not be read as a
     /// timestamp by this build, so ATL v2.0 §5.5.2 step 5's time half could
     /// not be carried out.
@@ -278,17 +317,96 @@ pub enum ReasonCode {
     /// accepted.
     BitcoinClaimedTimeUnreadable,
 
-    // --- Receipt-level aggregates ---
-    /// The receipt carries no anchors at all (Receipt-Lite), so it has zero
-    /// **verified anchors** and ATL v2.0 §5.5's floor is not met.
+    /// A receipt-level check `atl-core` reported that it could not finish.
     ///
-    /// Maps to [`Status::Untrusted`] and exit code 3. It is not a
-    /// refutation: the receipt's proofs may be entirely sound, and nothing
-    /// about it has been shown false. What is absent is any external
-    /// attestation that the entry existed at a point in time — which is the
-    /// whole claim an ATL receipt is for. §5.5: "A receipt without any
-    /// verified anchors SHOULD be treated as untrustworthy."
+    /// The catch-all for the *inability* half of `atl-core`'s receipt-level
+    /// errors — today `metadata_not_canonicalizable` (the metadata has no
+    /// RFC 8785 canonical form, so `metadata_hash` was never computed and so
+    /// never contradicted), `source_text_not_checked` (the receipt's bytes
+    /// were never examined for duplicate property names) and a
+    /// `spec_version` this build has never implemented.
+    ///
+    /// It exists so that failing closed is the default. `atl-core` may add
+    /// receipt-level findings, and the two silent answers available to a
+    /// wildcard — "this evidence is disproved" and "nothing to see here" —
+    /// are both wrong: the first accuses without grounds, the second accepts
+    /// a receipt on the strength of a check that never ran. This is the
+    /// third answer, and it maps to [`Status::Untrusted`].
+    ///
+    /// Unreachable through the CLI today: `load_receipt` rejects an
+    /// unsupported `spec_version` before verification and parses through
+    /// `Receipt::from_json`, which performs the duplicate-property-name
+    /// check, and no JSON text can produce a value with no canonical form.
+    ReceiptCheckIncomplete,
+
+    // --- Receipt-level aggregates ---
+    /// **No anchor was verified**, so ATL v2.0 §5.5's floor is not met.
+    ///
+    /// §5.5 in its own words: "A receipt without any verified anchors SHOULD
+    /// be treated as untrustworthy." That is the fact this code reports, and
+    /// the only one: it covers a receipt that presented no anchors at all
+    /// (Receipt-Lite), one whose anchors were all left unresolved, and one
+    /// whose anchors were all checked and found false, without
+    /// distinguishing them.
+    ///
+    /// # Why it does not name the anchor that failed
+    ///
+    /// It used to. The top-level reason was the first unresolved anchor's
+    /// own code, falling back to the first refuted one — which made it a
+    /// function of the `anchors` array. Nothing signs or hashes that array,
+    /// so **anybody who relays a receipt can rewrite it**: append, prepend,
+    /// reorder. A stranger could therefore choose what this tool called the
+    /// reason. Against a Receipt-Lite the swap read
+    /// `receipt_unanchored` → `anchor_target_hash_mismatch`: "there is no
+    /// anchor here" became "one anchor did not match", which sounds like a
+    /// local mishap and hides the larger fact that no trust was established
+    /// at all. A reader who reads one line — and a reader reads one line —
+    /// was handed a choice made by somebody else.
+    ///
+    /// This code is computed from [`crate::verify::policy::TrustAssessment::verified_anchors`]
+    /// alone. That count rises only for an anchor bearing a timestamp over
+    /// this receipt's own root and chaining to a trust root the **caller**
+    /// supplied, which is exactly what a relay cannot produce; so a relay
+    /// can never clear this code, and appending rubbish never changes it.
+    ///
+    /// Whether any anchors were *presented* is a separate question with a
+    /// separate answer — `anchor_status.presented` in the JSON — and it is
+    /// published as the relay-controlled number it is.
+    ///
+    /// The per-anchor reasons are not lost. Every anchor that did not verify
+    /// keeps its own code in `anchor_verification.results[]`, in
+    /// `assessment.coverage.unresolved[]` / `.refuted[]`, in the `errors[]`
+    /// array, and in the human renderer's advice block — which is where
+    /// per-anchor advice belongs.
+    ///
+    /// Maps to [`Status::Untrusted`] and exit code 3. Never a refutation:
+    /// the receipt's proofs may be entirely sound, and nothing about it has
+    /// been shown false. What is absent is any external attestation that the
+    /// entry existed at a point in time — the whole claim an ATL receipt is
+    /// for.
     ReceiptUnanchored,
+    /// At least one anchor was verified — ATL v2.0 §5.5's floor **is** met —
+    /// but the quorum the caller selected is not.
+    ///
+    /// Reachable only under [`crate::verify::policy::AnchorPolicy::AllAnchors`],
+    /// which asks that every anchor the receipt presents be verified.
+    /// `--allow-single-anchor` is §5.5's floor itself, and a receipt meeting
+    /// it is accepted.
+    ///
+    /// A statement about the **caller's own profile**, deliberately naming
+    /// no anchor: like [`Self::ReceiptUnanchored`], the top-level reason may
+    /// not be a function of an array anybody who relays the receipt can
+    /// rewrite. Read `assessment.coverage.unresolved[]` and `.refuted[]` for
+    /// which anchors did not count and why.
+    ///
+    /// Note what this profile does and does not guarantee. Because it is
+    /// defined over the anchors *presented*, a relay that appends an anchor
+    /// can take a receipt from `valid` to `untrusted` under it — a denial of
+    /// verification, though never an accusation: the status never becomes
+    /// `invalid` and nothing about the receipt is reported as refuted.
+    /// `--allow-single-anchor` is immune, because a verified anchor already
+    /// met its threshold and nothing appended can lower the count.
+    AnchorQuorumUnmet,
     /// At least one batch item was refuted.
     BatchItemsInvalid,
     /// At least one batch item could not be processed at all — an unreadable
@@ -308,14 +426,6 @@ pub enum ReasonCode {
     /// completion — a missing trust root, or a check that could not be
     /// performed. See that item's own reason code for which.
     BatchItemsUntrusted,
-    /// At least one batch item carries no anchors at all (Receipt-Lite), so
-    /// the batch as a whole contains a receipt with zero verified anchors.
-    ///
-    /// [`Status::Untrusted`], exit code 3 — the same answer single-file mode
-    /// gives for the same receipt, for the same ATL v2.0 §5.5 reason. It was
-    /// `pending` and exit 0 on both paths until that was recognised as
-    /// accepting what §5.5 says to treat as untrustworthy.
-    BatchItemsUnanchored,
     /// At least one path the caller named was never verified at all: a
     /// source file with no matching receipt, or a receipt with no matching
     /// source file.
@@ -378,10 +488,12 @@ impl ReasonCode {
             Self::BitcoinProvidersDisagree => "bitcoin_providers_disagree",
             Self::BitcoinSingleSourceOnly => "bitcoin_single_source_only",
             Self::BitcoinClaimedTimeUnreadable => "bitcoin_claimed_time_unreadable",
+            Self::AnchorTypeUnsupported => "anchor_type_unsupported",
+            Self::ReceiptCheckIncomplete => "receipt_check_incomplete",
             Self::ReceiptUnanchored => "receipt_unanchored",
+            Self::AnchorQuorumUnmet => "anchor_quorum_unmet",
             Self::BatchItemsInvalid => "batch_items_invalid",
             Self::BatchItemsUntrusted => "batch_items_untrusted",
-            Self::BatchItemsUnanchored => "batch_items_unanchored",
             Self::BatchItemsUnmatched => "batch_items_unmatched",
             Self::BatchNothingVerified => "batch_nothing_verified",
             Self::BatchItemsErrored => "batch_items_errored",
@@ -418,14 +530,24 @@ pub enum Status {
     /// receipt presents reached a caller-supplied trust root; under
     /// `--allow-single-anchor` it means at least one did.
     Valid,
-    /// Not refuted, not accepted. Three shapes reach here: the receipt
-    /// presents no anchors at all (§5.5's floor cannot be met); material is
-    /// missing on the verifier's side (an untrusted terminal root, an
-    /// incomplete certificate path, an unfetched Bitcoin block); or a fact
-    /// could not be evaluated at all (an imprint, CMS signature or
-    /// certificate signature using cryptography this verifier does not
-    /// implement). The reason code says which; what unites them is that
-    /// nothing was refuted.
+    /// The **receipt** was not refuted, and it was not accepted either.
+    /// Five shapes reach here:
+    ///
+    /// - no anchor was verified — §5.5's floor is unmet, whether the receipt
+    ///   presented none at all or presented some that all failed;
+    /// - §5.5's floor is met and the caller's stricter quorum is not;
+    /// - material is missing on the verifier's side (an untrusted terminal
+    ///   root, an incomplete certificate path, an unfetched Bitcoin block);
+    /// - a fact could not be evaluated at all (an imprint, CMS signature or
+    ///   certificate signature using cryptography this verifier does not
+    ///   implement, or a receipt-level check `atl-core` could not finish);
+    /// - **an anchor was checked and found false.** That refutes the anchor
+    ///   and not the receipt: a receipt's `anchors` array is signed and
+    ///   hashed by nothing, so anybody who relays a receipt can append an
+    ///   entry to it. Such a receipt is *unattested*, not disproved.
+    ///
+    /// The reason code says which. What unites them is that nothing about
+    /// the receipt itself was refuted.
     Untrusted,
     /// Could not be processed: a file that would not open, or a receipt that
     /// would not parse. Not a statement about the evidence at all — the tool
@@ -437,7 +559,11 @@ pub enum Status {
     /// and calling an unreadable file "refuted" made the contract depend on
     /// how the tool was invoked.
     Error,
-    /// Refuted: at least one checkable fact is false.
+    /// Refuted: at least one checkable fact **about the receipt** is false
+    /// — its source file's hash, its inclusion or Super-Tree proof, its
+    /// checkpoint, its `metadata_hash`, its structure.
+    ///
+    /// Never reached from an anchor. See [`Self::Untrusted`].
     Invalid,
 }
 
@@ -456,12 +582,14 @@ impl Status {
     /// The process exit code for this status.
     ///
     /// `Untrusted` gets its own code (3) precisely so a script can tell
-    /// "this evidence is broken" (1) from "I could not finish checking it"
-    /// (3) without parsing JSON. Code 3 covers missing trust material, a
-    /// check that could not be performed at all, **and** a receipt with no
-    /// anchors — read the reason code before telling a user to go and supply
-    /// something. `Error` is the operational code (2): the tool failed to
-    /// process an input, which says nothing about the evidence.
+    /// "this receipt is disproved" (1) from "I could not establish trust in
+    /// it" (3) without parsing JSON. Code 3 covers missing trust material, a
+    /// check that could not be performed at all, a receipt with no anchors,
+    /// **and** a receipt one of whose anchors was checked and found false —
+    /// read the reason code before telling a user to go and supply
+    /// something, and read it before telling them their receipt is sound.
+    /// `Error` is the operational code (2): the tool failed to process an
+    /// input, which says nothing about the evidence.
     ///
     /// Exactly one status exits 0. That is the point: a caller who tests
     /// `if atl-cli verify ...` is asking "was this evidence accepted", and
@@ -523,12 +651,16 @@ impl ReceiptVerdict {
         }
     }
 
-    /// The verdict for a receipt carrying no anchors at all (Receipt-Lite).
+    /// The verdict for a receipt with **no verified anchor**.
     ///
     /// [`Status::Untrusted`], exit 3, reason `receipt_unanchored`. Named
     /// separately from [`Self::untrusted`] so the call site reads as the
     /// ATL v2.0 §5.5 rule it implements, and so nothing can quietly turn it
     /// back into a success.
+    ///
+    /// Not "carrying no anchors": that would be a statement about the
+    /// `anchors` array, which anybody who relays a receipt can rewrite. See
+    /// [`ReasonCode::ReceiptUnanchored`].
     #[must_use]
     pub const fn unanchored() -> Self {
         Self {
@@ -676,9 +808,9 @@ mod tests {
             ReasonCode::BitcoinProvidersDisagree,
             ReasonCode::BitcoinSingleSourceOnly,
             ReasonCode::ReceiptUnanchored,
+            ReasonCode::AnchorQuorumUnmet,
             ReasonCode::BatchItemsInvalid,
             ReasonCode::BatchItemsErrored,
-            ReasonCode::BatchItemsUnanchored,
             ReasonCode::BatchItemsUnmatched,
             ReasonCode::BatchNothingVerified,
             ReasonCode::BatchItemsUntrusted,

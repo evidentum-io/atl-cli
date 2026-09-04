@@ -104,14 +104,15 @@ fn test_exit_code_1_batch_failure() {
 /// identity belongs to the receipt, not to filesystem ordering; and §5.4.3
 /// defines what to conclude when two identifiers agree, defining no error
 /// for the case where they differ. Nothing about either receipt is false:
-/// each is a sound Receipt-Lite that exits 0 on its own, and a *tampered*
-/// genesis is caught per receipt as a broken §5.4.2 proof long before this
-/// check.
+/// each is a sound Receipt-Lite -- untrusted on its own for want of a
+/// verified anchor, never refuted -- and a *tampered* genesis is caught per
+/// receipt as a broken §5.4.2 proof long before this check.
 ///
 /// §5.4.3 is now applied within each log instance, and the batch verdict
-/// comes from the receipts themselves: two unanchored ones, so `untrusted`
-/// with reason `batch_items_unanchored` (ATL v2.0 §5.5) -- and crucially
-/// NOT `invalid`, which would assert the evidence had been disproved.
+/// comes from the receipts themselves: two with no verified anchor, so
+/// `untrusted` with reason `batch_items_untrusted` (ATL v2.0 §5.5) -- and
+/// crucially NOT `invalid`, which would assert the evidence had been
+/// disproved.
 #[test]
 fn receipts_from_two_log_instances_are_reported_not_refuted() {
     let mut cmd = Command::cargo_bin("atl-cli").unwrap();
@@ -129,7 +130,7 @@ fn receipts_from_two_log_instances_are_reported_not_refuted() {
     .code(3)
     .stdout(predicate::str::contains("\"status\": \"untrusted\""))
     .stdout(predicate::str::contains(
-        "\"reason_code\": \"batch_items_unanchored\"",
+        "\"reason_code\": \"batch_items_untrusted\"",
     ))
     .stdout(predicate::str::contains("\"log_instances\": 2"))
     // No pair satisfied §5.4.3 step 2, so no comparison ran -- and a check
@@ -349,16 +350,24 @@ fn allow_single_anchor_does_not_rescue_an_unanchored_receipt() {
     ));
 }
 
-/// **The rule that is not policy-dependent.** One refuted fact makes the
-/// receipt `invalid` (exit 1) however lenient the anchor quorum is, and
-/// however many other anchors are trusted.
+/// **A refuted anchor never yields exit 1, under any anchor quorum.**
 ///
-/// The fixture is a real Receipt-Full whose RFC 3161 anchor has been repointed
-/// at a hash that is not this receipt's Data Tree root: ATL v2.0 §5.5.1 step 2
-/// ("verify that anchor.target_hash equals proof.root_hash") is checked and
-/// false, so the token attests to some *other* data.
+/// The fixture is a real Receipt-Full whose RFC 3161 anchor has been
+/// repointed at a hash that is not this receipt's Data Tree root: ATL v2.0
+/// §5.5.1 step 2 ("verify that `anchor.target_hash` equals
+/// `proof.root_hash`") is checked and false, so that token attests to some
+/// *other* data.
+///
+/// It used to be exit 1, `invalid`. But nothing signs or hashes a receipt's
+/// `anchors` array, so this edit is one anybody who relays the receipt can
+/// make with no key — and exit 1 says *this evidence is disproved*. The
+/// receipt is `untrusted` (exit 3): unattested, because no anchor was
+/// verified, which is a different and honest statement.
+///
+/// The anchor's own outcome is unchanged and still published: `refuted`,
+/// with `anchor_target_hash_mismatch`. Three outcomes, not two.
 #[test]
-fn a_refuted_anchor_is_invalid_under_every_anchor_policy() {
+fn a_refuted_anchor_is_untrusted_under_every_anchor_policy() {
     let dir = tempfile::TempDir::new().unwrap();
     let source = real_data_path("testfile.txt");
     let receipt_path = dir.path().join("tampered.atl");
@@ -385,8 +394,11 @@ fn a_refuted_anchor_is_invalid_under_every_anchor_policy() {
         ])
         .args(extra)
         .assert()
-        .code(1)
-        .stdout(predicate::str::contains("\"status\": \"invalid\""))
+        .code(3)
+        .stdout(predicate::str::contains("\"status\": \"untrusted\""))
+        // The refuted anchor is never hidden: its own state and reason code
+        // are published even though they do not decide the receipt.
+        .stdout(predicate::str::contains("\"state\": \"refuted\""))
         .stdout(predicate::str::contains(
             "\"reason_code\": \"anchor_target_hash_mismatch\"",
         ));

@@ -155,7 +155,7 @@ fn an_unanchored_item_beside_a_valid_one_is_untrusted() {
         .unanchored_item("b.txt")
         .run();
     assert_eq!(json["status"], "untrusted", "{json}");
-    assert_eq!(json["reason_code"], "batch_items_unanchored");
+    assert_eq!(json["reason_code"], "batch_items_untrusted");
     assert_eq!(code, 3, "not 0: one receipt has no verified anchor");
     assert_eq!(json["summary"]["valid"], 1);
     assert_eq!(json["summary"]["unanchored"], 1);
@@ -171,7 +171,7 @@ fn allow_single_anchor_does_not_accept_an_unanchored_item() {
         .unanchored_item("a.txt")
         .run();
     assert_eq!(json["status"], "untrusted", "{json}");
-    assert_eq!(json["reason_code"], "batch_items_unanchored");
+    assert_eq!(json["reason_code"], "batch_items_untrusted");
     assert_eq!(code, 3);
     assert_eq!(json["policy_profile"], "single-anchor");
 }

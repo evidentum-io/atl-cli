@@ -59,8 +59,13 @@ fn offline_json_unanchored_valid_receipt_has_true_inclusion_flags() {
 
 /// Same receipt, human-readable offline output: must print "Inclusion
 /// Proof: VALID" (not blocked on the missing trust anchor, which is
-/// reported separately as "Anchor Status: UNANCHORED", and drives the
-/// untrusted headline).
+/// reported separately on the `Anchors:` line, and drives the untrusted
+/// headline).
+///
+/// The `Anchors:` line carries two numbers because they are two facts:
+/// `presented` describes the document that arrived and a relay can raise it,
+/// `verified` counts anchors that reached a caller-supplied trust root and
+/// nothing a stranger can do will. The headline is computed from the second.
 #[test]
 fn offline_human_unanchored_valid_receipt_shows_valid_inclusion() {
     let mut cmd = Command::cargo_bin("atl-cli").unwrap();
@@ -76,9 +81,16 @@ fn offline_human_unanchored_valid_receipt_shows_valid_inclusion() {
     .assert()
     .code(3)
     .stdout(predicate::str::contains("Inclusion Proof: VALID"))
-    .stdout(predicate::str::contains("Anchor Status: UNANCHORED"))
     .stdout(predicate::str::contains(
-        "NOT VERIFIED: the receipt carries no anchors (Receipt-Lite)",
+        "Anchors: NONE VERIFIED (0 presented)",
+    ))
+    .stdout(predicate::str::contains(
+        "NOT VERIFIED: no anchor was verified",
+    ))
+    // The Receipt-Lite tier is still explained, and labelled as a statement
+    // about the document that arrived.
+    .stdout(predicate::str::contains(
+        "Receipt-Lite as it reached this tool",
     ));
 }
 

@@ -189,7 +189,7 @@ fn an_unanchored_receipt_is_counted_in_its_own_bucket() {
     );
     assert_eq!(json["summary"]["untrusted"], 0);
     assert_eq!(json["summary"]["total"], 1);
-    assert_eq!(json["reason_code"], "batch_items_unanchored");
+    assert_eq!(json["reason_code"], "batch_items_untrusted");
 }
 
 /// An anchored receipt with no trust material is `untrusted` in both modes,

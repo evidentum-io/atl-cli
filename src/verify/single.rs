@@ -3,12 +3,12 @@
 use std::path::Path;
 
 use atl_core::{
-    verify_receipt_with_options, Receipt, TrustStore, VerificationError, VerificationResult,
-    VerifyOptions,
+    verify_receipt_with_options, AnchorFacts, Receipt, TrustStore, VerificationError,
+    VerificationResult, VerifyOptions,
 };
 
 use crate::error::{CliError, CliResult};
-use crate::verify::anchor::{verify_anchors_offline, AnchorVerdict, AnchorVerificationResult};
+use crate::verify::anchor::{establish_anchor_facts, offline_results, AnchorVerificationResult};
 use crate::verify::file::{compare_hash, hash_file, MAX_RECEIPT_SIZE};
 use crate::verify::policy::{AnchorPolicy, TrustAssessment};
 use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
@@ -119,6 +119,13 @@ pub struct SingleVerificationResult {
     /// pure computation). `bitcoin_ots` anchors carry their network-free
     /// verdict until [`crate::verify::online`] upgrades them in place.
     pub anchor_results: Vec<AnchorVerificationResult>,
+    /// The per-anchor fact sets `atl-core` established, in receipt order.
+    ///
+    /// Carried so the online pass reads the same facts the offline pass was
+    /// built from, rather than establishing a second set of its own: two
+    /// fact sets are two things that can disagree about one receipt, and the
+    /// online pass would have to re-run RFC 3161 verification to obtain one.
+    pub anchor_facts: Vec<AnchorFacts>,
     /// The anchor quorum this receipt is judged against.
     ///
     /// Carried on the result rather than passed to [`Self::verdict`] so that
@@ -140,57 +147,107 @@ impl SingleVerificationResult {
     ///
     /// 1. Everything [`Self::receipt_refutation`] covers — a source file
     ///    whose hash does not match, a structural failure `atl-core`
-    ///    reported, a broken inclusion or Super-Tree proof — is a
-    ///    refutation, and is checked first.
-    /// 2. A refuted anchor makes the receipt [`Status::Invalid`] — before
-    ///    anything else about the anchors is considered, and regardless of
-    ///    the policy in force. A refutation is never policy-dependent.
-    /// 3. A receipt with no anchors at all is [`Status::Untrusted`] with
-    ///    reason `receipt_unanchored`: ATL v2.0 §5.5 requires at least one
-    ///    *verified* anchor, and zero anchors yield zero verified ones. No
-    ///    policy relaxes this — a quorum of one cannot be met by none.
-    /// 4. Otherwise the [`TrustAssessment`] decides: if the policy's quorum
-    ///    is satisfied the receipt is [`Status::Valid`], and if it is not,
-    ///    [`Status::Untrusted`] carrying the first unresolved anchor's own
-    ///    reason.
+    ///    reported about the receipt, a broken inclusion or Super-Tree proof
+    ///    — is a refutation, and is checked first.
+    /// 2. A receipt-level check `atl-core` could not finish
+    ///    ([`Self::receipt_inability`]) is [`Status::Untrusted`]: nothing was
+    ///    disproved and nothing was confirmed either, so the receipt may not
+    ///    be accepted.
+    /// 3. Otherwise the [`TrustAssessment`] decides: if the quorum is
+    ///    satisfied the receipt is [`Status::Valid`], and if it is not,
+    ///    [`Status::Untrusted`] carrying
+    ///    [`TrustAssessment::unsatisfied_reason`] — `receipt_unanchored`
+    ///    when no anchor was verified, `anchor_quorum_unmet` when ATL v2.0
+    ///    §5.5's floor is met and the caller's stricter profile is not.
     ///
-    /// # Why the refutation check moved above the unanchored check
+    /// # There is deliberately no "the receipt presents no anchors" branch
     ///
-    /// It cannot matter in practice — a receipt with no anchors has no
-    /// anchor to refute — but the ordering is the rule this crate is built
-    /// on, and a reader must be able to see it applied without first
-    /// proving to themselves that the two cases are disjoint.
+    /// There used to be one, between 2 and 3: an empty `anchors` array was
+    /// `receipt_unanchored`, and everything else fell through to the first
+    /// unresolved anchor's own reason. Both halves of that read the
+    /// `anchors` array — which is covered by neither the leaf hash nor the
+    /// checkpoint blob, so **anybody who relays a receipt can rewrite it**.
+    /// Appending one rubbish anchor to a Receipt-Lite therefore swapped
+    /// `receipt_unanchored` for `anchor_target_hash_mismatch`: "there is no
+    /// anchor here" became "one anchor did not match", which sounds like a
+    /// local mishap and hides the fact that no trust was established at all.
+    ///
+    /// Step 3 answers from [`TrustAssessment::verified_anchors`] instead,
+    /// which is the same for a receipt with no anchors and a receipt whose
+    /// anchors all failed — because those are the same fact, and the second
+    /// is what the first looks like after somebody appends to it. Whether
+    /// any were *presented* is a separate question with its own answer
+    /// (`anchor_status.presented`), published as the relay-controlled number
+    /// it is.
+    ///
+    /// # A refuted anchor is not a refuted receipt
+    ///
+    /// A step used to sit between 1 and 3: *any* refuted anchor made the
+    /// receipt [`Status::Invalid`], regardless of policy. It is gone, and
+    /// its absence is the point.
+    ///
+    /// An ATL receipt does not authenticate its own anchors. The leaf hash
+    /// is `SHA256(0x00 || payload_hash || metadata_hash)` and the checkpoint
+    /// blob is 98 bytes of origin, tree size, timestamp and root hash — the
+    /// `anchors` array appears in neither, so nothing signs it and nothing
+    /// hashes it. **Anybody who relays a receipt can append an anchor to it,
+    /// with no key.** Every anchor refutation this tool can produce is
+    /// reachable that way: a wrong `target`, a `target_hash` naming another
+    /// root, an undecodable payload, a genuine token minted over other data,
+    /// a stated Bitcoin height the proof contradicts. So a refuted anchor
+    /// never distinguishes "this receipt was altered" from "somebody
+    /// appended rubbish", and while it did decide the status, any relay
+    /// could turn *trust could not be established* into *this evidence is
+    /// disproved* — an accusation manufactured for free against a document
+    /// nothing had disproved, and a denial of verification available to
+    /// everyone who handles a receipt.
+    ///
+    /// Nothing is lost. Altering a receipt so that a genuine anchor stops
+    /// matching means changing `proof.root_hash`, which the checkpoint
+    /// comparison and the inclusion proof catch at step 1.
+    ///
+    /// The guarantee is one-sided, and only the one side is claimed: an
+    /// anchor that **fails** verification changes no status. An anchor that
+    /// **passes** raises [`TrustAssessment::verified_anchors`] and can carry
+    /// the receipt over the quorum — as it must, since that is what anchors
+    /// are for, and producing one needs a token over this receipt's own root
+    /// chaining to a trust root the caller supplied.
+    ///
+    /// **And it is never hidden.** A refuted anchor keeps its own
+    /// `refuted` state and reason code, is listed in
+    /// [`TrustAssessment::refuted`], makes [`TrustAssessment::coverage_complete`]
+    /// false, and is printed by both renderers. An appended anchor is
+    /// evidence that somebody interfered, and concealing it because it does
+    /// not gate the verdict would be the mirror-image defect.
     #[must_use]
     pub fn verdict(&self) -> ReceiptVerdict {
         if let Some(reason) = self.receipt_refutation() {
             return ReceiptVerdict::invalid(reason);
         }
 
-        // A refutation anywhere outranks every inability everywhere, and is
-        // independent of the anchor policy: no quorum, however lenient,
-        // accepts a fact that has been shown false.
-        if let Some(reason) = self.anchor_results.iter().find_map(|a| match a.verdict {
-            AnchorVerdict::Invalid(code) => Some(code),
-            _ => None,
-        }) {
-            return ReceiptVerdict::invalid(reason);
+        // Nothing was disproved, and a check about the receipt itself did
+        // not finish. Not acceptance and not an accusation.
+        if let Some(reason) = self.receipt_inability() {
+            return ReceiptVerdict::untrusted(reason);
         }
 
-        // ATL v2.0 §5.5: no anchors means no verified anchors, and "a
-        // receipt without any verified anchors SHOULD be treated as
-        // untrustworthy".
-        if self.receipt.anchors.is_empty() {
-            return ReceiptVerdict::unanchored();
-        }
-
+        // The quorum, and nothing else. There is deliberately no separate
+        // "the receipt presents no anchors" branch above this: that question
+        // is answered by the `anchors` array, which is authenticated by
+        // nothing, so a branch on it let a relay pick which of two codes the
+        // receipt reported. `unsatisfied_reason` answers from
+        // `verified_anchors`, which is the same for a receipt with no
+        // anchors and a receipt whose anchors all failed -- because those
+        // two are the same fact, and this tool cannot tell them apart in any
+        // case: the second is what the first looks like after somebody
+        // appends to it.
         let assessment = self.assessment();
         if assessment.policy_satisfied() {
             return ReceiptVerdict::VALID;
         }
         assessment.unsatisfied_reason().map_or(
-            // Unreachable: an unsatisfied policy over a non-empty anchor
-            // list with nothing refuted means at least one anchor is
-            // unresolved. Kept as the honest fallback rather than a panic.
+            // Unreachable: `unsatisfied_reason` is total. Kept as the honest
+            // fallback rather than a panic.
             ReceiptVerdict::unanchored(),
             ReceiptVerdict::untrusted,
         )
@@ -226,13 +283,27 @@ impl SingleVerificationResult {
     /// 3. The proof flags, as defence in depth: `atl-core` reports each of
     ///    these as an error too, but a proof flag must never be able to be
     ///    false while the receipt is reported as anything but refuted.
+    ///
+    /// # Only receipt-level errors are read
+    ///
+    /// `atl-core`'s error list mixes statements about the receipt with
+    /// findings about its anchors, and only the first kind may reach a
+    /// verdict about the receipt. `receipt_errors()` is the filter, and it
+    /// is asked here rather than `errors()` for the reason spelled out on
+    /// [`Self::verdict`]: the `anchors` array is authenticated by nothing,
+    /// so anything derived from the full list can be steered by whoever last
+    /// handled the receipt.
     #[must_use]
     pub fn receipt_refutation(&self) -> Option<ReasonCode> {
         if !self.file_hash_valid {
             return Some(ReasonCode::FileHashMismatch);
         }
 
-        if let Some(reason) = self.core_result.errors.iter().find_map(map_core_error) {
+        if let Some(reason) = self
+            .core_result
+            .receipt_errors()
+            .find_map(|e| classify_core_error(e).refutation())
+        {
             return Some(reason);
         }
 
@@ -250,6 +321,23 @@ impl SingleVerificationResult {
         }
 
         None
+    }
+
+    /// A receipt-level check `atl-core` reported that it could not finish.
+    ///
+    /// The counterpart to [`Self::receipt_refutation`], and read from the
+    /// same `receipt_errors()` for the same reason. Nothing here is evidence
+    /// against the receipt; what it says is that the receipt cannot be
+    /// accepted either, because a check it needs did not run.
+    ///
+    /// `NoTrustAnchor` is deliberately excluded — see
+    /// [`classify_core_error`]. Every other inability arrives as
+    /// [`ReasonCode::ReceiptCheckIncomplete`].
+    #[must_use]
+    pub fn receipt_inability(&self) -> Option<ReasonCode> {
+        self.core_result
+            .receipt_errors()
+            .find_map(|e| classify_core_error(e).inability())
     }
 
     /// The three axes — evidence, policy, coverage — for this receipt, under
@@ -285,61 +373,163 @@ impl SingleVerificationResult {
     /// flags, so the two output formats cannot structurally diverge.
     #[must_use]
     pub fn proof_verdict(&self) -> ProofVerdict {
-        ProofVerdict::compute(&self.core_result, self.receipt.super_proof.is_some())
+        ProofVerdict::compute(&self.core_result, self.receipt.has_super_proof())
     }
 
-    /// Check if this is a Receipt-Lite: cryptographically sound and carrying
-    /// no anchors at all.
+    /// The receipt **as it reached this tool** presents no anchors at all
+    /// (Receipt-Lite).
     ///
     /// Not a success predicate. Such a receipt is [`Status::Untrusted`] and
     /// exits 3; this only identifies *which* untrusted it is, so the
     /// renderers can explain the Receipt-Lite tier rather than send the
     /// reader looking for a certificate.
     ///
-    /// # Why "no anchors at all" is required
+    /// # A statement about what was presented, and only that
     ///
-    /// `atl-core`'s `NoTrustAnchor` error fires whenever zero anchors ended
-    /// up valid — which is also what happens for a receipt that DOES carry
-    /// an RFC 3161 anchor whose cryptography is sound but whose terminal
-    /// certificate nobody vouches for. Describing that as "unanchored" would
-    /// be false: the receipt is anchored, its anchor's root simply isn't
-    /// trusted. That case has its own reason code, and this method is
-    /// `false` for it.
+    /// The `anchors` array is covered by neither the leaf hash nor the
+    /// checkpoint blob, so anybody who relays a receipt can append to it.
+    /// This predicate therefore says what arrived, not what the log issued:
+    /// a relay can make it `false` for a receipt that left the log with no
+    /// anchors, and nothing here can detect that.
+    ///
+    /// That is why it no longer reads the verdict's reason code, and why no
+    /// verdict is derived from it. The reason code is
+    /// [`ReasonCode::ReceiptUnanchored`] whenever no anchor was *verified*,
+    /// which is the fact a relay cannot move; this is a description printed
+    /// beside it, and the renderers say "as it reached this tool" when they
+    /// use it.
     #[must_use]
-    #[allow(dead_code)] // exercised by unit tests; kept as the readable predicate
-    pub fn is_lite(&self) -> bool {
-        self.verdict().reason_code == Some(ReasonCode::ReceiptUnanchored)
+    pub fn presents_no_anchors(&self) -> bool {
+        self.receipt.anchors().is_empty()
     }
 }
 
-/// Map an `atl-core` verification error to a stable reason code, or `None`
-/// for errors that are not, by themselves, refutations of the evidence.
+/// What one of `atl-core`'s receipt-level errors means for this CLI's
+/// verdict.
 ///
-/// `NoTrustAnchor` and `AnchorFailed` are deliberately `None`: they report
-/// the *aggregate* anchor outcome, which [`SingleVerificationResult::verdict`]
-/// computes itself from the richer per-anchor verdicts. Mapping them here
-/// would collapse "root not trusted" back into "refuted", which is precisely
-/// the conflation this design removes.
-fn map_core_error(error: &VerificationError) -> Option<ReasonCode> {
+/// Three answers, never two. `atl-core` draws the same line with
+/// [`VerificationError::is_refutation`], and this type exists so that the
+/// answer is chosen once, by name, for every variant — a `bool` would have
+/// to lie about one of the three, and an `Option<ReasonCode>` conflated
+/// "nothing was disproved" with "nothing to report".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreFinding {
+    /// Something checkable about the receipt was checked and is false.
+    Refutation(ReasonCode),
+    /// Nothing was refuted, and a check about the receipt did not finish.
+    Inability(ReasonCode),
+    /// Reported by `atl-core`, and this crate answers the same question
+    /// itself with more information. Takes no part in the verdict.
+    Deferred,
+}
+
+impl CoreFinding {
+    /// The reason code when this is a refutation.
+    #[must_use]
+    pub const fn refutation(self) -> Option<ReasonCode> {
+        match self {
+            Self::Refutation(code) => Some(code),
+            Self::Inability(_) | Self::Deferred => None,
+        }
+    }
+
+    /// The reason code when this is an inability.
+    #[must_use]
+    pub const fn inability(self) -> Option<ReasonCode> {
+        match self {
+            Self::Inability(code) => Some(code),
+            Self::Refutation(_) | Self::Deferred => None,
+        }
+    }
+}
+
+/// Classify one `atl-core` receipt-level error.
+///
+/// # Exhaustive on purpose
+///
+/// No wildcard arm. A variant `atl-core` adds later must be classified
+/// deliberately, because both answers a wildcard could give are wrong: one
+/// accuses a receipt nothing has disproved, the other accepts a receipt on
+/// the strength of a check that never ran. The default for anything not
+/// individually understood is [`ReasonCode::ReceiptCheckIncomplete`] —
+/// `Untrusted`, which is neither.
+///
+/// # The two deliberate `Deferred`s
+///
+/// `NoTrustAnchor` reports the *aggregate* anchor outcome, which
+/// [`SingleVerificationResult::verdict`] computes itself from the richer
+/// per-anchor verdicts and the caller's own policy. Accepting `atl-core`'s
+/// tally here would collapse "root not trusted" back into one number and
+/// override `--allow-single-anchor`.
+///
+/// `AnchorFinding` is a statement about an anchor, not about the receipt, so
+/// it may not reach a receipt verdict at all — see
+/// [`SingleVerificationResult::verdict`]. It is unreachable from here in any
+/// case: the caller filters through `receipt_errors()`, which excludes it by
+/// construction. The arm is the belt to that braces.
+fn classify_core_error(error: &VerificationError) -> CoreFinding {
     match error {
-        VerificationError::NoTrustAnchor | VerificationError::AnchorFailed { .. } => None,
-        VerificationError::SignatureFailed => Some(ReasonCode::CheckpointSignatureInvalid),
-        VerificationError::InclusionProofFailed { .. } => Some(ReasonCode::InclusionProofInvalid),
+        // --- Answered by this crate, with more information ---
+        VerificationError::NoTrustAnchor { .. } | VerificationError::AnchorFinding { .. } => {
+            CoreFinding::Deferred
+        }
+
+        // --- Refutations: checked, and false ---
+        VerificationError::SignatureFailed => {
+            CoreFinding::Refutation(ReasonCode::CheckpointSignatureInvalid)
+        }
+        VerificationError::InclusionProofFailed { .. } => {
+            CoreFinding::Refutation(ReasonCode::InclusionProofInvalid)
+        }
         VerificationError::SuperInclusionFailed { .. } => {
-            Some(ReasonCode::SuperInclusionProofInvalid)
+            CoreFinding::Refutation(ReasonCode::SuperInclusionProofInvalid)
         }
         VerificationError::ConsistencyProofFailed { .. }
         | VerificationError::SuperConsistencyFailed { .. } => {
-            Some(ReasonCode::SuperConsistencyProofInvalid)
+            CoreFinding::Refutation(ReasonCode::SuperConsistencyProofInvalid)
         }
-        VerificationError::RootHashMismatch => Some(ReasonCode::CheckpointRootHashMismatch),
-        VerificationError::TreeSizeMismatch => Some(ReasonCode::CheckpointTreeSizeMismatch),
-        VerificationError::MetadataHashMismatch { .. } => Some(ReasonCode::MetadataHashMismatch),
+        VerificationError::RootHashMismatch => {
+            CoreFinding::Refutation(ReasonCode::CheckpointRootHashMismatch)
+        }
+        VerificationError::TreeSizeMismatch => {
+            CoreFinding::Refutation(ReasonCode::CheckpointTreeSizeMismatch)
+        }
+        VerificationError::MetadataHashMismatch { .. } => {
+            CoreFinding::Refutation(ReasonCode::MetadataHashMismatch)
+        }
         VerificationError::InvalidReceipt(_)
         | VerificationError::InvalidHash { .. }
         | VerificationError::SuperDataMismatch { .. }
-        | VerificationError::MissingSuperProof
-        | VerificationError::UnsupportedVersion(_) => Some(ReasonCode::ReceiptMalformed),
+        | VerificationError::MissingSuperProof => {
+            CoreFinding::Refutation(ReasonCode::ReceiptMalformed)
+        }
+
+        // --- Inabilities: nothing disproved, nothing established ---
+        //
+        // `UnsupportedVersion` is one of these and not a malformed receipt:
+        // a revision this build has never implemented was never read under
+        // its own rules. `load_receipt` rejects it before verification, so
+        // this arm is unreachable; it is classified honestly all the same.
+        VerificationError::UnsupportedVersion(_)
+        | VerificationError::MetadataNotCanonicalizable { .. }
+        | VerificationError::SourceTextNotChecked => {
+            CoreFinding::Inability(ReasonCode::ReceiptCheckIncomplete)
+        }
+
+        // --- Anchor findings, which `verify_receipt_anchors` reports and
+        // `crate::verify::anchor` translates. None of them describes the
+        // receipt, so none may be read as a fact about it. ---
+        VerificationError::AnchorTargetInvalid { .. }
+        | VerificationError::AnchorTargetHashMismatch { .. }
+        | VerificationError::AnchorPayloadUndecodable { .. }
+        | VerificationError::AnchorTypeUnsupported { .. }
+        | VerificationError::BitcoinHeightContradictsProof { .. }
+        | VerificationError::BitcoinBlockNotObtained
+        | VerificationError::Rfc3161MessageImprint(_)
+        | VerificationError::Rfc3161CmsSignature(_)
+        | VerificationError::Rfc3161TimestampingEku(_)
+        | VerificationError::Rfc3161CertificatePath { .. }
+        | VerificationError::Rfc3161TerminalNotTrusted { .. } => CoreFinding::Deferred,
     }
 }
 
@@ -376,29 +566,55 @@ pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
     // Read and parse
     let contents = std::fs::read_to_string(path).map_err(|e| CliError::file_read_error(path, e))?;
 
-    let receipt: Receipt =
-        serde_json::from_str(&contents).map_err(|e| CliError::ReceiptParseError(e.to_string()))?;
+    // `Receipt::from_json`, never `serde_json::from_str`. RFC 8785 §3.1
+    // forbids duplicate property names, and that is a property of a byte
+    // stream: once JSON has been parsed the duplicate is gone and no
+    // inspection recovers it. `serde_json` keeps the last occurrence, so a
+    // receipt stating `root_hash` twice is a document two conformant
+    // verifiers can reach opposite verdicts on. `from_json` scans the text
+    // and refuses it, and it is also the only parse that records the check
+    // was made -- a receipt without that record is one `atl-core` will not
+    // confirm (`source_text_not_checked`).
+    let receipt = Receipt::from_json(&contents).map_err(|e| match e {
+        // `from_json` gates the version too, and it reports the version it
+        // saw and nothing else. This CLI has always told the caller which
+        // revision this build implements, which is the actionable half.
+        atl_core::AtlError::UnsupportedReceiptVersion(version) => {
+            CliError::UnsupportedReceiptVersion {
+                version,
+                expected: atl_core::RECEIPT_SPEC_VERSION.to_string(),
+            }
+        }
+        // The RFC 8785 §3.1 refusal, which has no other spelling: this
+        // receipt repeats a property name, so two conformant verifiers can
+        // read different documents out of one byte sequence and both be
+        // right. Not a verdict about the evidence -- the file cannot be read
+        // as a receipt at all, which is exit 2, exactly like malformed JSON.
+        atl_core::AtlError::JcsInputConstraint { path, reason } => CliError::InvalidReceiptFormat(
+            format!("duplicate property name at {path}: {reason} (RFC 8785 §3.1)"),
+        ),
+        // `InvalidReceipt` already wraps `serde_json`'s message; unwrapping
+        // it keeps the parse error the caller sees free of a second prefix.
+        atl_core::AtlError::InvalidReceipt(message) => CliError::ReceiptParseError(message),
+        other => CliError::ReceiptParseError(other.to_string()),
+    })?;
 
-    // Validate version.
-    //
-    // Asked of `atl-core`, never decided here. This gate used to admit every
+    // The version gate is `Receipt::from_json`'s, mapped above. It is asked
+    // of `atl-core` and never decided here: this crate once admitted every
     // `2.x` while the core verifier admitted only `2.0.0`, so a `2.0.1`
     // receipt got through the door and was then reported as a *defective
     // receipt* (`receipt_malformed`, exit 1) rather than as a revision this
     // build does not implement. Two parts of one system disagreeing about
-    // what they accept is how "could not check" became "checked and false".
+    // what they accept is how "could not check" became "checked and false" —
+    // and a second gate here, however faithful today, is that same shape
+    // waiting to happen.
     //
     // ATL v2.0 §4.2 defines `spec_version` and stops there: no compatibility
     // rule, no statement that a verifier must accept later revisions of the
     // same major version. With nothing written down to rely on, the accepted
-    // set is exactly what this build implements -- see
+    // set is exactly what this build implements — see
     // `atl_core::is_supported_spec_version`.
-    if !atl_core::is_supported_spec_version(&receipt.spec_version) {
-        return Err(CliError::UnsupportedReceiptVersion {
-            version: receipt.spec_version.clone(),
-            expected: atl_core::RECEIPT_SPEC_VERSION.to_string(),
-        });
-    }
+    debug_assert!(atl_core::is_supported_spec_version(receipt.spec_version()));
 
     Ok(receipt)
 }
@@ -451,24 +667,27 @@ pub fn verify_single(
     let file_hash = hash_file(source_path)?;
 
     // Compare hash with receipt
-    let file_hash_valid = compare_hash(&file_hash, &receipt.entry.payload_hash);
+    let file_hash_valid = compare_hash(&file_hash, &receipt.entry().payload_hash);
 
-    // Verify the receipt's structure and proofs with atl-core. Anchors are
-    // skipped here on purpose: `atl-core` collapses each one to a bare
-    // `is_valid: bool`, which cannot distinguish a refuted anchor from one
-    // whose root simply isn't in our trust store. This crate verifies them
-    // itself, below, keeping the full fact set.
+    // ATL v2.0 §§5.1-5.4 -- the receipt itself. Anchors are skipped here
+    // because `verify` collapses each one to a bare `is_valid: bool`, which
+    // cannot tell a refuted anchor from one whose root simply isn't in our
+    // trust store. The three-valued fact set comes from the call below
+    // instead, which is the same §5.5 orchestration `verify` runs
+    // internally -- so the two can never disagree about what was checked.
     let options = VerifyOptions {
         skip_anchors: true,
-        ..Default::default()
+        ..VerifyOptions::default()
     };
     let core_result = verify_receipt_with_options(&receipt, options)
         .map_err(|e| CliError::VerificationFailed(e.to_string()))?;
 
-    // `trust_store` is threaded straight from the CLI flags -- never derived
-    // from the receipt or the token itself (see the ATL trust-model
-    // decisions doc: no identity lives in the protocol implementation).
-    let anchor_results = verify_anchors_offline(&receipt, trust_store);
+    // ATL v2.0 §5.5 -- the anchors. `trust_store` is threaded straight from
+    // the CLI flags, never derived from the receipt or the token itself (see
+    // the ATL trust-model decisions doc: no identity lives in the protocol
+    // implementation).
+    let anchor_facts = establish_anchor_facts(&receipt, trust_store);
+    let anchor_results = offline_results(&receipt, &anchor_facts);
 
     Ok(SingleVerificationResult {
         source_path: source_path.to_path_buf(),
@@ -478,6 +697,7 @@ pub fn verify_single(
         file_hash_valid,
         core_result,
         anchor_results,
+        anchor_facts,
         policy,
     })
 }
@@ -487,8 +707,13 @@ mod tests {
     use super::*;
 
     fn create_test_receipt() -> atl_core::Receipt {
-        // Load a minimal valid receipt from test data
-        serde_json::from_str(include_str!(
+        // Load a minimal valid receipt from test data, through the same
+        // parse production uses (`load_receipt`). `serde_json::from_str`
+        // produces a receipt whose bytes were never checked for duplicate
+        // property names, which `atl-core` reports as
+        // `source_text_not_checked` and this crate as
+        // `receipt_check_incomplete` -- a state no real run can reach.
+        atl_core::Receipt::from_json(include_str!(
             "../../test_data/receipts/valid/document.pdf.atl"
         ))
         .expect("Failed to parse test receipt")
@@ -532,6 +757,7 @@ mod tests {
             file_hash_valid: true,
             core_result: create_test_verification_result(true),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
@@ -549,6 +775,7 @@ mod tests {
             file_hash_valid: false,
             core_result: create_test_verification_result(true),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
@@ -565,6 +792,7 @@ mod tests {
             file_hash_valid: true,
             core_result: create_test_verification_result(false),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
@@ -579,7 +807,10 @@ mod tests {
 
         // Simulate NoTrustAnchor scenario
         core_result.is_valid = false;
-        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor {
+            required: 1,
+            verified: 0,
+        }];
 
         let result = SingleVerificationResult {
             source_path: std::path::PathBuf::from("test.pdf"),
@@ -589,6 +820,7 @@ mod tests {
             file_hash_valid: true,
             core_result,
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
@@ -610,6 +842,7 @@ mod tests {
             file_hash_valid: true,
             core_result: create_test_verification_result(true),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
@@ -621,14 +854,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_lite_true() {
+    fn a_receipt_presenting_no_anchors_is_identified_as_such() {
         let receipt = create_test_receipt();
         let mut core_result =
             atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
 
         // Simulate lite receipt condition
         core_result.is_valid = false;
-        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor {
+            required: 1,
+            verified: 0,
+        }];
 
         let result = SingleVerificationResult {
             source_path: std::path::PathBuf::from("test.pdf"),
@@ -638,13 +874,14 @@ mod tests {
             receipt,
             core_result,
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
         // ATL v2.0 §5.5: a Receipt-Lite has no verified anchor, so it is
         // untrusted (exit 3) -- identified as the Receipt-Lite case, but
         // never accepted.
-        assert!(result.is_lite());
+        assert!(result.presents_no_anchors());
         assert!(!result.is_valid());
         assert_eq!(result.verdict().status, Status::Untrusted);
         assert_eq!(
@@ -655,14 +892,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_lite_false_hash_mismatch() {
+    fn a_refuted_receipt_is_not_reported_as_unanchored_when_the_hash_mismatches() {
         let receipt = create_test_receipt();
         let mut core_result =
             atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
 
         // Simulate lite receipt with hash mismatch
         core_result.is_valid = false;
-        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor {
+            required: 1,
+            verified: 0,
+        }];
 
         let result = SingleVerificationResult {
             source_path: std::path::PathBuf::from("test.pdf"),
@@ -672,15 +912,25 @@ mod tests {
             receipt,
             core_result,
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
-        assert!(!result.is_lite());
+        // The receipt structurally presents no anchors -- that is a fact
+        // about the bytes and stays true. What must NOT happen is the
+        // verdict reporting `receipt_unanchored`: the receipt was refuted,
+        // and a refutation outranks an unmet threshold.
+        assert!(result.presents_no_anchors());
+        assert_ne!(
+            result.verdict().reason_code,
+            Some(ReasonCode::ReceiptUnanchored)
+        );
+        assert_eq!(result.verdict().status, Status::Invalid);
         assert!(!result.is_valid());
     }
 
     #[test]
-    fn test_is_lite_false_proof_failed() {
+    fn a_refuted_receipt_is_not_reported_as_unanchored_when_a_proof_failed() {
         let receipt = create_test_receipt();
         let mut core_result =
             atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
@@ -688,7 +938,10 @@ mod tests {
         // Simulate failed proofs
         core_result.is_valid = false;
         core_result.inclusion_valid = false; // Proof failed
-        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor];
+        core_result.errors = vec![atl_core::VerificationError::NoTrustAnchor {
+            required: 1,
+            verified: 0,
+        }];
 
         let result = SingleVerificationResult {
             source_path: std::path::PathBuf::from("test.pdf"),
@@ -698,15 +951,25 @@ mod tests {
             receipt,
             core_result,
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
-        assert!(!result.is_lite());
+        // The receipt structurally presents no anchors -- that is a fact
+        // about the bytes and stays true. What must NOT happen is the
+        // verdict reporting `receipt_unanchored`: the receipt was refuted,
+        // and a refutation outranks an unmet threshold.
+        assert!(result.presents_no_anchors());
+        assert_ne!(
+            result.verdict().reason_code,
+            Some(ReasonCode::ReceiptUnanchored)
+        );
+        assert_eq!(result.verdict().status, Status::Invalid);
         assert!(!result.is_valid());
     }
 
     #[test]
-    fn test_is_lite_false_other_errors() {
+    fn a_refuted_receipt_is_not_reported_as_unanchored_for_other_errors_when_anchors_exist() {
         let receipt = create_test_receipt();
         let mut core_result =
             atl_core::verify_receipt_anchor_only(&receipt).expect("Failed to verify test receipt");
@@ -726,10 +989,20 @@ mod tests {
             receipt,
             core_result,
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
 
-        assert!(!result.is_lite());
+        // The receipt structurally presents no anchors -- that is a fact
+        // about the bytes and stays true. What must NOT happen is the
+        // verdict reporting `receipt_unanchored`: the receipt was refuted,
+        // and a refutation outranks an unmet threshold.
+        assert!(result.presents_no_anchors());
+        assert_ne!(
+            result.verdict().reason_code,
+            Some(ReasonCode::ReceiptUnanchored)
+        );
+        assert_eq!(result.verdict().status, Status::Invalid);
         assert!(!result.is_valid());
     }
 
@@ -919,10 +1192,10 @@ mod tests {
     #[test]
     fn single_verification_result_proof_verdict_uses_receipt_super_proof_presence() {
         // `SingleVerificationResult::proof_verdict()` must key `has_super_proof`
-        // off `receipt.super_proof.is_some()`, not off the core result alone.
-        let mut receipt = create_test_receipt();
+        // off `receipt.super_proof().is_some()`, not off the core result alone.
+        let receipt = create_test_receipt();
         assert!(
-            receipt.super_proof.is_some(),
+            receipt.super_proof().is_some(),
             "fixture must carry a super_proof"
         );
 
@@ -939,12 +1212,21 @@ mod tests {
             receipt: receipt.clone(),
             core_result: core_result.clone(),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
         // With super_proof present, the broken super_inclusion must fail proofs_valid.
         assert!(!result_with_super.proof_verdict().proofs_valid());
 
-        receipt.super_proof = None;
+        // `Receipt` has no setters, so "the same receipt without its
+        // super_proof" is spelled as a new receipt assembled from the parts.
+        let receipt = atl_core::ReceiptBuilder::new(
+            receipt.spec_version().to_string(),
+            receipt.entry().clone(),
+            receipt.proof().clone(),
+        )
+        .anchors(receipt.anchors().to_vec())
+        .build(atl_core::SourceTextCheck::assume_duplicate_property_names_already_rejected());
         let result_without_super = SingleVerificationResult {
             source_path: std::path::PathBuf::from("test.pdf"),
             receipt_path: std::path::PathBuf::from("test.pdf.atl"),
@@ -953,6 +1235,7 @@ mod tests {
             receipt,
             core_result,
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         };
         // With no super_proof, the (irrelevant) broken super fields are ignored.

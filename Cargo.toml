@@ -1,6 +1,6 @@
 [package]
 name = "atl-cli"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2021"
 rust-version = "1.92.0"
 license = "Apache-2.0"
@@ -19,13 +19,15 @@ path = "test_data/fixtures/generate_test_data.rs"
 
 [dependencies]
 # Core - always required (with online features)
-atl-core = { version = "0.27", features = ["rfc3161-verify", "bitcoin-ots"] }
+atl-core = { version = "0.30", features = ["rfc3161-verify", "bitcoin-ots"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 hex = "0.4"
-# Constant-time comparison for anchor target_hash pinning (see src/verify/online.rs)
+# Constant-time comparison of block-header hashes reported by the
+# block-explorer APIs (src/verify/anchor.rs, src/net/bitcoin.rs). Anchor
+# `target_hash` pinning is `atl-core`'s, and uses the same crate there.
 subtle = "2"
 # Parsing caller-supplied PEM/DER certificates for `--tsa-trust-store`
 # (src/verify/trust_store.rs). Pinned to the same "0.2" line atl-core itself

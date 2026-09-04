@@ -23,9 +23,12 @@
 //!     --tsa-trust-store roots.pem --tsa-intermediates bridge.pem
 //! ```
 //!
-//! Exit codes: 0 valid, 1 refuted, 2 runtime error, 3 untrusted (which
-//! includes an unanchored receipt -- ATL v2.0 §5.5)
-//! -- see [`error::ExitCode`].
+//! Exit codes: 0 valid, 1 the RECEIPT was refuted, 2 runtime error, 3
+//! untrusted -- which covers a receipt with no verified anchor (ATL v2.0
+//! §5.5) and one whose anchors were checked and found false, since a
+//! receipt's anchors are authenticated by nothing and an anchor that fails
+//! is one anybody who relayed the receipt could have attached. See
+//! [`error::ExitCode`].
 
 mod cli;
 mod commands;

@@ -183,7 +183,7 @@ pub fn verify_consistency(results: &[SingleVerificationResult]) -> CliResult<Con
     // be "the right one".
     let mut log_instances: BTreeMap<&str, Vec<&SingleVerificationResult>> = BTreeMap::new();
     for result in results {
-        let Some(super_proof) = result.receipt.super_proof.as_ref() else {
+        let Some(super_proof) = result.receipt.super_proof() else {
             continue;
         };
         log_instances
@@ -199,12 +199,7 @@ pub fn verify_consistency(results: &[SingleVerificationResult]) -> CliResult<Con
 
     for group in log_instances.values() {
         let mut sorted: Vec<&SingleVerificationResult> = group.clone();
-        sorted.sort_by_key(|r| {
-            r.receipt
-                .super_proof
-                .as_ref()
-                .map_or(0, |sp| sp.super_tree_size)
-        });
+        sorted.sort_by_key(|r| r.receipt.super_proof().map_or(0, |sp| sp.super_tree_size));
 
         // Where this log instance's participants begin in the shared list,
         // so the indices a renderer prints name the receipts compared.

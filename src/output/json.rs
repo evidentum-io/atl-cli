@@ -20,18 +20,36 @@ use crate::verify::verdict::{ReasonCode, ReceiptVerdict, Status};
 struct SingleResultJson {
     /// `"valid"` / `"untrusted"` / `"invalid"`.
     ///
-    /// `"untrusted"` means nothing about the evidence was refuted and the
-    /// check could not be finished — either this verifier was not given the
-    /// trust material, or a fact could not be evaluated at all (cryptography
-    /// this verifier does not implement). It is never a success. Read
-    /// `reason_code` before telling anyone what to supply: for the
-    /// `*_indeterminate` and `*_not_checked` reasons there is nothing to
-    /// supply.
+    /// `"untrusted"` means nothing about the **receipt** was refuted and
+    /// trust in it was not established — this verifier was not given the
+    /// trust material, a fact could not be evaluated at all (cryptography
+    /// this verifier does not implement), the receipt carries no anchors, or
+    /// an anchor was checked and found false (which refutes that anchor and
+    /// not the receipt: a receipt's `anchors` array is signed and hashed by
+    /// nothing, so anybody who relays it can append an entry). It is never a
+    /// success. Read `reason_code` before telling anyone what to supply: for
+    /// the `*_indeterminate` and `*_not_checked` reasons there is nothing to
+    /// supply, and for a refuted anchor what is called for is the receipt as
+    /// the log operator issued it.
     status: &'static str,
     /// Stable machine-readable reason; absent when `status` is `"valid"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     reason_code: Option<&'static str>,
-    anchor_status: &'static str,
+    /// How many anchors were **presented**, how many were **verified**, and
+    /// the state that follows from the second number alone.
+    ///
+    /// This was a single string, `"anchored"` / `"unanchored"`, computed
+    /// from `receipt.anchors().is_empty()`. That made it a relay's to
+    /// choose: appending one rubbish anchor to a Receipt-Lite flipped it to
+    /// `"anchored"`, so a receipt that had never been anchored stopped
+    /// looking unanchored — on the word of somebody who supplied no key.
+    ///
+    /// The two numbers are different facts and are now reported as two.
+    /// `presented` describes the document that arrived and moves with it;
+    /// `verified` counts anchors bearing a timestamp over this receipt's own
+    /// root that chain to a trust root the caller supplied, which nothing a
+    /// stranger can do will raise. `state` is derived from `verified` alone.
+    anchor_status: AnchorStatusJson,
     mode: &'static str,
     source_file: String,
     receipt_file: String,
@@ -41,10 +59,47 @@ struct SingleResultJson {
     anchor_verification: Option<AnchorVerificationJson>,
     /// The three axes -- evidence (§5.5), policy (the selected quorum) and
     /// coverage -- reported separately from `status`, which can only carry
-    /// one of them. Absent for a receipt with no anchors.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    assessment: Option<AssessmentJson>,
+    /// one of them.
+    ///
+    /// **Always present.** It used to be omitted for a receipt presenting no
+    /// anchors, on the grounds that there was no quorum to report on. But
+    /// presence was then a function of the `anchors` array, which is
+    /// authenticated by nothing: appending one rubbish anchor to a
+    /// Receipt-Lite made four unmovable fields --
+    /// `evidence.established`, `evidence.verified_anchors`,
+    /// `evidence.refuted_by`, `policy.max_trust_profile` -- appear where
+    /// there had been nothing, so a consumer reading them had to handle an
+    /// absence a stranger controlled. They are all answerable for a receipt
+    /// with no anchors (`false`, `0`, `null`, `false`), and answering them
+    /// costs nothing.
+    assessment: AssessmentJson,
     errors: Vec<ErrorJson>,
+}
+
+/// What became of the receipt's anchors, in the one place a reader looks
+/// first.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+struct AnchorStatusJson {
+    /// `"verified"` when at least one anchor reached a caller-supplied trust
+    /// root, `"none_verified"` otherwise.
+    ///
+    /// Derived from [`Self::verified`] alone, so it is exactly as unmovable
+    /// as that count: a relay can add anchors but cannot make one verify.
+    /// It is **not** "does this receipt carry anchors" — that is
+    /// [`Self::presented`], and the two are different questions.
+    state: &'static str,
+    /// Anchors that reached a caller-supplied trust root. Nothing a stranger
+    /// can do raises this.
+    verified: usize,
+    /// Anchors the receipt presented **as it reached this tool**.
+    ///
+    /// A description of the document that arrived, not of the one the log
+    /// issued: the `anchors` array is covered by neither the leaf hash nor
+    /// the checkpoint blob, so anybody who relayed it could have added to
+    /// it. `presented: 0` does mean this tool saw a Receipt-Lite; it does
+    /// not prove the log issued one, and a non-zero value proves nothing at
+    /// all about the log.
+    presented: usize,
 }
 
 #[derive(Serialize)]
@@ -105,14 +160,19 @@ fn build_single_result_json(
     mode: VerificationMode,
 ) -> SingleResultJson {
     let verdict = result.verdict();
+    let assessment = result.assessment();
 
     SingleResultJson {
         status: verdict.status.as_str(),
         reason_code: verdict.reason_code.map(ReasonCode::as_str),
-        anchor_status: if result.receipt.anchors.is_empty() {
-            "unanchored"
-        } else {
-            "anchored"
+        anchor_status: AnchorStatusJson {
+            state: if assessment.verified_anchors > 0 {
+                "verified"
+            } else {
+                "none_verified"
+            },
+            verified: assessment.verified_anchors,
+            presented: assessment.total_anchors,
         },
         mode: match mode {
             VerificationMode::Online => "online",
@@ -122,12 +182,12 @@ fn build_single_result_json(
         receipt_file: result.receipt_path.display().to_string(),
         file_hash: FileHashJson {
             computed: format!("sha256:{}", hex::encode(result.file_hash)),
-            expected: result.receipt.entry.payload_hash.clone(),
+            expected: result.receipt.entry().payload_hash.clone(),
             is_match: result.file_hash_valid,
         },
         verification: if result.file_hash_valid {
             Some(VerificationJson::from_verdict(
-                result.receipt.entry.id.to_string(),
+                result.receipt.entry().id.to_string(),
                 result.proof_verdict(),
             ))
         } else {
@@ -154,6 +214,19 @@ fn build_errors(verdict: ReceiptVerdict, result: &SingleVerificationResult) -> V
         return Vec::new();
     }
 
+    // Entry 0 is the receipt's own reason, and it is always present.
+    //
+    // The `_detail` entries used to be filtered to anchors whose code
+    // *equalled* the top-level reason -- which, while the top-level reason
+    // was itself an anchor's code, meant the array a machine consumer reads
+    // was chosen by whoever last handled the receipt. Against a clean
+    // Receipt-Lite the whole array went from `[receipt_unanchored]` to
+    // `[anchor_target_hash_mismatch, ..._detail]`: the receipt-level
+    // statement did not merely lose its place, it was gone.
+    //
+    // Now the receipt's reason leads and every anchor that did not verify
+    // follows, so a relay can only ever *add* to this array. That it can add
+    // is unavoidable and correct -- an appended anchor must be visible.
     let mut errors = vec![ErrorJson {
         error_type: reason.as_str().to_string(),
         message: describe(reason),
@@ -161,9 +234,6 @@ fn build_errors(verdict: ReceiptVerdict, result: &SingleVerificationResult) -> V
 
     for anchor in &result.anchor_results {
         if let (Some(code), Some(message)) = (anchor.verdict.reason_code(), anchor.error.as_ref()) {
-            if code != reason {
-                continue;
-            }
             errors.push(ErrorJson {
                 error_type: format!("{}_detail", code.as_str()),
                 message: message.clone(),
@@ -215,12 +285,12 @@ fn describe(reason: ReasonCode) -> String {
             "One or more named files were never verified: no matching receipt or source file"
         }
         ReasonCode::BatchNothingVerified => "No file in this batch was verified",
-        ReasonCode::BatchItemsUnanchored => {
-            "One or more receipts carry no anchors at all, so they have no verified anchor \
-             (ATL v2.0 5.5)"
-        }
         ReasonCode::ReceiptUnanchored => {
-            "The receipt carries no anchors at all, so it has no verified anchor (ATL v2.0 5.5)"
+            "No anchor was verified, so ATL v2.0 5.5's floor is unmet. See \
+             anchor_status.presented for whether any were offered at all"
+        }
+        ReasonCode::AnchorQuorumUnmet => {
+            "At least one anchor was verified, but not every anchor the receipt presents was"
         }
         ReasonCode::BatchItemsErrored => "One or more items could not be processed",
         ReasonCode::LogConsistencyFailed => "Cross-receipt log consistency verification failed",
@@ -320,7 +390,7 @@ struct CrossCheckJson {
 /// One row of a batch report.
 ///
 /// `status` is the item's own verdict word for every bucket that reached a
-/// verdict (`valid` / `pending` / `untrusted` / `invalid`), so a row can
+/// verdict (`valid` / `untrusted` / `invalid`), so a row can
 /// never say something the summary contradicts. Two extra words appear for
 /// items that never reached a verdict at all -- `no_receipt` and `no_source`
 /// -- plus `error` for one that could not be processed; all three carry the
@@ -351,19 +421,15 @@ struct BatchItemJson {
 /// print anything but `"valid"`/`"pending"`.
 fn batch_item_json(result: &SingleVerificationResult) -> BatchItemJson {
     let verdict = result.verdict();
-    let (super_root, data_tree_index) = result
-        .receipt
-        .super_proof
-        .as_ref()
-        .map_or((None, None), |sp| {
-            (Some(sp.super_root.clone()), Some(sp.data_tree_index))
-        });
+    let (super_root, data_tree_index) = result.receipt.super_proof().map_or((None, None), |sp| {
+        (Some(sp.super_root.clone()), Some(sp.data_tree_index))
+    });
 
     BatchItemJson {
         file: file_name(&result.source_path),
         receipt: Some(file_name(&result.receipt_path)),
         status: verdict.status.as_str(),
-        assessment: build_assessment(&result.assessment()),
+        assessment: Some(build_assessment(&result.assessment())),
         reason_code: verdict.reason_code.map(ReasonCode::as_str),
         file_hash_match: Some(result.file_hash_valid),
         super_root,
@@ -1082,7 +1148,7 @@ fn anchor_result_json(anchor: &AnchorVerificationResult) -> AnchorResultJson {
         computed_root: bitcoin.computed_root,
         block_merkle_root: bitcoin.block_merkle_root,
         merkle_match: bitcoin.merkle_match,
-        trust_state: anchor.details.rfc3161_trust_state(),
+        trust_state: anchor.rfc3161_trust_state(),
         message_imprint,
         cms_signature,
         chain_valid_at_gen_time,
@@ -1108,14 +1174,12 @@ fn build_anchor_verification(
 
 /// The three axes, as JSON.
 ///
-/// `None` for a receipt with no anchors: there is no quorum to report on,
-/// and the `receipt_unanchored` reason code already says everything there is
-/// to say.
-fn build_assessment(assessment: &TrustAssessment) -> Option<AssessmentJson> {
-    if assessment.total_anchors == 0 {
-        return None;
-    }
-    Some(AssessmentJson {
+/// Answered for every receipt, a Receipt-Lite included. It used to return
+/// `None` when no anchors were presented — which made the object's very
+/// presence a function of the `anchors` array, and that array is
+/// authenticated by nothing. See the field's own documentation.
+fn build_assessment(assessment: &TrustAssessment) -> AssessmentJson {
+    AssessmentJson {
         evidence: EvidenceJson {
             established: assessment.evidence_established(),
             verified_anchors: assessment.verified_anchors,
@@ -1135,7 +1199,7 @@ fn build_assessment(assessment: &TrustAssessment) -> Option<AssessmentJson> {
             unresolved: anchor_list(&assessment.unresolved),
             refuted: anchor_list(&assessment.refuted),
         },
-    })
+    }
 }
 
 /// The three axes a receipt's anchors are reported on, published separately
@@ -1162,14 +1226,16 @@ struct EvidenceJson {
     /// and `refuted_by` is what names that case.
     refuted_anchors: usize,
     total_anchors: usize,
-    /// The reason code that disqualifies this receipt, from whatever source:
-    /// a refuted anchor, or the receipt itself. Absent when nothing was
-    /// refuted, and always equal to the top-level `reason_code` when
-    /// present.
+    /// The reason code that disqualifies this receipt — a refutation of the
+    /// **receipt**, and nothing else. Absent when the receipt was not
+    /// refuted, and equal to the top-level `reason_code` when present.
     ///
-    /// This is what makes `established: false` beside `verified_anchors: 1`
-    /// legible rather than contradictory: an anchor really did reach a
-    /// trusted root, and a refutation outranks it.
+    /// It used to fall back to the first refuted anchor's reason, which made
+    /// it a function of the `anchors` array: against a clean Receipt-Lite,
+    /// appending one junk anchor turned `null` into
+    /// `"anchor_target_hash_mismatch"` — a refutation's name on a receipt
+    /// nothing had refuted. A refuted anchor is counted by `refuted_anchors`
+    /// and listed in `coverage.refuted[]` instead.
     #[serde(skip_serializing_if = "Option::is_none")]
     refuted_by: Option<&'static str>,
 }
@@ -1184,13 +1250,20 @@ struct PolicyJson {
     requirement: &'static str,
     satisfied: bool,
     /// ATL v2.0 §5.6: both an RFC 3161 and a Bitcoin OTS anchor are
-    /// verified **and nothing was refuted**. Reported on every run whatever
-    /// the profile, because §5.6 describes the maximum-trust tier rather
-    /// than this tool's acceptance threshold.
+    /// verified **and the receipt itself was not refuted**. Reported on
+    /// every run whatever the profile, because §5.6 describes the
+    /// maximum-trust tier rather than this tool's acceptance threshold.
     ///
-    /// The refutation clause is not pedantry. Without it a receipt with two
-    /// verified anchors and a third refuted one reported `status: "invalid"`
-    /// and `max_trust_profile: true` side by side.
+    /// The receipt clause is not pedantry: a receipt disproved at the level
+    /// its anchors commit to is at no trust tier, and reporting
+    /// `max_trust_profile: true` beside `status: "invalid"` would hand a
+    /// reader the opposite of what the run concluded.
+    ///
+    /// A refuted **anchor** deliberately does not clear it. §5.6 asks
+    /// whether both anchor types are verified, and a third entry that failed
+    /// verification is something anybody who relayed the receipt could have
+    /// appended — letting it withdraw the tier would hand every relay a free
+    /// downgrade. It appears in `coverage.refuted` regardless.
     max_trust_profile: bool,
 }
 
@@ -1219,9 +1292,17 @@ struct CoverageJson {
     /// Anchors that reached no result at all. Each may be fixable by
     /// supplying trust material, going online, or not at all — read `state`.
     unresolved: Vec<UnresolvedAnchorJson>,
-    /// Anchors that were checked and found false. Never empty beside
-    /// `status: "invalid"` caused by an anchor, and never non-empty beside
-    /// `status: "valid"`.
+    /// Anchors that were checked and found false.
+    ///
+    /// **This list is the only place a consumer learns that somebody
+    /// attached an anchor that fails.** It does not gate `status`: a receipt
+    /// whose `anchors` array carries one is *unattested* rather than
+    /// disproved, because nothing signs or hashes that array. So it can be
+    /// non-empty beside `status: "untrusted"` and — under
+    /// `--allow-single-anchor`, where one verified anchor meets the quorum —
+    /// beside `status: "valid"` as well. `complete` is `false` whenever it
+    /// is non-empty, and a consumer that ignores it is concealing exactly
+    /// the interference it exists to reveal.
     refuted: Vec<UnresolvedAnchorJson>,
 }
 
@@ -1239,11 +1320,13 @@ mod tests {
     use super::*;
     use crate::verify::anchor::{AnchorVerdict, BlockSourceReport, ClaimedTimeCheck};
     use crate::verify::policy::AnchorPolicy;
-    use atl_core::{PathStatus, Revocation, TerminalAnchor};
+    use atl_core::{PathStatus, ReceiptAnchor, Revocation, TerminalAnchor};
     use std::path::{Path, PathBuf};
 
     fn create_test_receipt() -> atl_core::Receipt {
-        serde_json::from_str(include_str!(
+        // See the note in `crate::output::human`'s test module: production
+        // parses through `Receipt::from_json`, and so must a fixture.
+        atl_core::Receipt::from_json(include_str!(
             "../../test_data/receipts/valid/document.pdf.atl"
         ))
         .expect("Failed to parse test receipt")
@@ -1266,6 +1349,40 @@ mod tests {
         result
     }
 
+    /// Attach one anchor to a receipt.
+    ///
+    /// `Receipt` exposes no setters and no `&mut` accessors, so "add an
+    /// anchor" is spelled as "assemble a new receipt from the parts". That
+    /// is exactly what a relay appending one has to do, which is the point
+    /// the invariant tests turn on.
+    fn receipt_plus_anchor(
+        receipt: &atl_core::Receipt,
+        anchor: ReceiptAnchor,
+    ) -> atl_core::Receipt {
+        let mut anchors = receipt.anchors().to_vec();
+        anchors.push(anchor);
+        atl_core::ReceiptBuilder::new(
+            receipt.spec_version().to_string(),
+            receipt.entry().clone(),
+            receipt.proof().clone(),
+        )
+        .super_proof_option(receipt.super_proof().cloned())
+        .anchors(anchors)
+        .upgrade_url_option(receipt.upgrade_url().map(str::to_string))
+        .build(atl_core::SourceTextCheck::assume_duplicate_property_names_already_rejected())
+    }
+
+    /// A well-formed RFC 3161 anchor pinned to this receipt's own root.
+    fn test_rfc3161_anchor(receipt: &atl_core::Receipt) -> ReceiptAnchor {
+        ReceiptAnchor::Rfc3161 {
+            target: "data_tree_root".to_string(),
+            target_hash: receipt.proof().root_hash.clone(),
+            tsa_url: "https://example.invalid/tsa".to_string(),
+            timestamp: "2024-01-01T00:00:00Z".to_string(),
+            token_der: "base64:token".to_string(),
+        }
+    }
+
     fn single_result(file_hash_valid: bool, core_valid: bool) -> SingleVerificationResult {
         SingleVerificationResult {
             source_path: PathBuf::from("test.pdf"),
@@ -1275,6 +1392,7 @@ mod tests {
             receipt: create_test_receipt(),
             core_result: create_test_verification_result(core_valid),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         }
     }
@@ -1313,16 +1431,23 @@ mod tests {
     }
 
     /// ATL v2.0 §5.5: a receipt with no anchors has no verified anchor, so
-    /// it is `untrusted` and never exit 0. `anchor_status` keeps the plain
-    /// description of the state -- "unanchored" -- which is where a machine
-    /// consumer should read the Receipt-Lite tier from.
+    /// it is `untrusted` and never exit 0. `anchor_status` carries the two
+    /// numbers a consumer needs -- `presented: 0` is where the Receipt-Lite
+    /// tier is read from, and `verified: 0` is the fact no relay can move.
     #[test]
     fn unanchored_receipt_reports_untrusted() {
         let result = single_result(true, true);
         let json = build_single_result_json(&result, VerificationMode::Offline);
         assert_eq!(json.status, "untrusted");
         assert_eq!(json.reason_code, Some("receipt_unanchored"));
-        assert_eq!(json.anchor_status, "unanchored");
+        assert_eq!(
+            json.anchor_status,
+            AnchorStatusJson {
+                state: "none_verified",
+                verified: 0,
+                presented: 0,
+            }
+        );
         assert_eq!(
             json.errors.len(),
             1,
@@ -1330,10 +1455,14 @@ mod tests {
         );
         assert_eq!(json.errors[0].error_type, "receipt_unanchored");
         assert!(json.anchor_verification.is_none());
-        assert!(
-            json.assessment.is_none(),
-            "there is no quorum to report on when no anchor was presented"
-        );
+        // The axes are answered even with nothing presented -- see the
+        // field's documentation for why their presence may not depend on the
+        // `anchors` array.
+        assert!(!json.assessment.evidence.established);
+        assert_eq!(json.assessment.evidence.verified_anchors, 0);
+        assert_eq!(json.assessment.evidence.total_anchors, 0);
+        assert_eq!(json.assessment.evidence.refuted_by, None);
+        assert!(!json.assessment.policy.max_trust_profile);
     }
 
     #[test]
@@ -1352,16 +1481,7 @@ mod tests {
         // an unvouched-for root is `untrusted`, not `invalid` and never
         // `valid`.
         let mut result = single_result(true, true);
-        result
-            .receipt
-            .anchors
-            .push(atl_core::ReceiptAnchor::Rfc3161 {
-                target: "data_tree_root".to_string(),
-                target_hash: result.receipt.proof.root_hash.clone(),
-                tsa_url: "https://example.invalid/tsa".to_string(),
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
-                token_der: "base64:token".to_string(),
-            });
+        result.receipt = receipt_plus_anchor(&result.receipt, test_rfc3161_anchor(&result.receipt));
         result.anchor_results.push(rfc3161_anchor(
             AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted),
             Some(TerminalAnchor::Assumed {
@@ -1372,29 +1492,36 @@ mod tests {
 
         let json = build_single_result_json(&result, VerificationMode::Offline);
         assert_eq!(json.status, "untrusted");
-        assert_eq!(json.reason_code, Some("tsa_root_not_trusted"));
-        assert_eq!(json.anchor_status, "anchored");
+        // The receipt's own reason: no anchor was verified. It names no
+        // anchor -- see `ReasonCode::ReceiptUnanchored` for why the top-level
+        // reason may not be a function of the `anchors` array.
+        assert_eq!(json.reason_code, Some("receipt_unanchored"));
+        assert_eq!(
+            json.anchor_status,
+            AnchorStatusJson {
+                state: "none_verified",
+                verified: 0,
+                presented: 1,
+            }
+        );
 
+        // The actionable per-anchor reason is not lost: it stays on the
+        // anchor, and in `errors[]`, which is where per-anchor advice belongs.
         let anchors = json.anchor_verification.expect("anchors must be reported");
         assert!(!anchors.all_verified);
         assert!(!anchors.results[0].verified);
         assert_eq!(anchors.results[0].trust_state, Some("assumed"));
         assert_eq!(anchors.results[0].reason_code, Some("tsa_root_not_trusted"));
+        assert_eq!(
+            json.errors[1].error_type, "tsa_root_not_trusted_detail",
+            "the anchor's own reason must still reach the errors array"
+        );
     }
 
     #[test]
     fn incomplete_chain_reports_untrusted_not_invalid() {
         let mut result = single_result(true, true);
-        result
-            .receipt
-            .anchors
-            .push(atl_core::ReceiptAnchor::Rfc3161 {
-                target: "data_tree_root".to_string(),
-                target_hash: result.receipt.proof.root_hash.clone(),
-                tsa_url: "https://example.invalid/tsa".to_string(),
-                timestamp: "2024-01-01T00:00:00Z".to_string(),
-                token_der: "base64:token".to_string(),
-            });
+        result.receipt = receipt_plus_anchor(&result.receipt, test_rfc3161_anchor(&result.receipt));
         result.anchor_results.push(rfc3161_anchor(
             AnchorVerdict::Untrusted(ReasonCode::TsaChainIncomplete),
             None,
@@ -1402,25 +1529,30 @@ mod tests {
 
         let json = build_single_result_json(&result, VerificationMode::Offline);
         assert_eq!(json.status, "untrusted");
-        assert_eq!(json.reason_code, Some("tsa_chain_incomplete"));
+        assert_eq!(json.reason_code, Some("receipt_unanchored"));
         let anchors = json.anchor_verification.expect("anchors must be reported");
         assert_eq!(anchors.results[0].trust_state, Some("incomplete"));
+        assert_eq!(anchors.results[0].reason_code, Some("tsa_chain_incomplete"));
     }
 
+    /// **Neither an unresolved nor a refuted anchor makes the receipt
+    /// `invalid`, and both are published.**
+    ///
+    /// The `anchors` array is authenticated by nothing, so an entry that
+    /// failed verification is one any relay could have appended. Reporting
+    /// the receipt as *disproved* on that basis would hand every relay a
+    /// free accusation; reporting nothing at all would conceal the
+    /// interference. So: `untrusted`, and both anchors in the output with
+    /// their own states and reason codes.
+    ///
+    /// An unresolved anchor leads the top-level reason, because it is the
+    /// one a caller can usually act on.
     #[test]
-    fn refuted_anchor_outranks_untrusted_anchor() {
+    fn unresolved_and_refuted_anchors_are_published_without_refuting_the_receipt() {
         let mut result = single_result(true, true);
         for _ in 0..2 {
-            result
-                .receipt
-                .anchors
-                .push(atl_core::ReceiptAnchor::Rfc3161 {
-                    target: "data_tree_root".to_string(),
-                    target_hash: result.receipt.proof.root_hash.clone(),
-                    tsa_url: "https://example.invalid/tsa".to_string(),
-                    timestamp: "2024-01-01T00:00:00Z".to_string(),
-                    token_der: "base64:token".to_string(),
-                });
+            result.receipt =
+                receipt_plus_anchor(&result.receipt, test_rfc3161_anchor(&result.receipt));
         }
         result.anchor_results.push(rfc3161_anchor(
             AnchorVerdict::Untrusted(ReasonCode::TsaRootNotTrusted),
@@ -1435,8 +1567,51 @@ mod tests {
         ));
 
         let json = build_single_result_json(&result, VerificationMode::Offline);
-        assert_eq!(json.status, "invalid");
-        assert_eq!(json.reason_code, Some("cms_signature_invalid"));
+        assert_eq!(json.status, "untrusted");
+        // One code, computed from the verified count, naming no anchor: the
+        // `anchors` array is authenticated by nothing, so whichever anchor
+        // happens to come first must not decide what the receipt reports.
+        assert_eq!(json.reason_code, Some("receipt_unanchored"));
+
+        let anchors = json.anchor_verification.expect("anchors must be reported");
+        assert!(!anchors.all_verified);
+        assert_eq!(anchors.results[0].state, "cryptographically_consistent");
+        assert_eq!(anchors.results[0].reason_code, Some("tsa_root_not_trusted"));
+        // The refuted one keeps its own three-valued state and code, so a
+        // reader can see that somebody attached an anchor that fails.
+        assert_eq!(anchors.results[1].state, "refuted");
+        assert_eq!(
+            anchors.results[1].reason_code,
+            Some("cms_signature_invalid")
+        );
+
+        let assessment = json.assessment;
+        assert_eq!(assessment.evidence.refuted_anchors, 1);
+        assert!(!assessment.coverage.complete);
+    }
+
+    /// A refuted anchor and nothing else: the receipt is still `untrusted`,
+    /// and its reason names the anchor that did not count.
+    #[test]
+    fn a_receipt_whose_only_anchor_is_refuted_is_unattested_not_refuted() {
+        let mut result = single_result(true, true);
+        result.receipt = receipt_plus_anchor(&result.receipt, test_rfc3161_anchor(&result.receipt));
+        result.anchor_results.push(rfc3161_anchor(
+            AnchorVerdict::Invalid(ReasonCode::CmsSignatureInvalid),
+            None,
+        ));
+
+        for policy in [AnchorPolicy::AllAnchors, AnchorPolicy::SingleAnchor] {
+            result.policy = policy;
+            let json = build_single_result_json(&result, VerificationMode::Offline);
+            assert_eq!(json.status, "untrusted", "{policy}");
+            assert_eq!(json.reason_code, Some("receipt_unanchored"), "{policy}");
+            // The anchor's own finding is still published, in its own place.
+            assert_eq!(
+                json.errors[1].error_type, "cms_signature_invalid_detail",
+                "{policy}"
+            );
+        }
     }
 
     #[test]
@@ -1936,7 +2111,7 @@ mod tests {
         let result = single_result(true, true);
         let json = build_single_result_json(&result, VerificationMode::Offline);
         let verification = json.verification.expect("hash matched, so proofs reported");
-        assert_eq!(verification.entry_id, result.receipt.entry.id.to_string());
+        assert_eq!(verification.entry_id, result.receipt.entry().id.to_string());
         assert_eq!(
             verification.proofs_valid,
             result.proof_verdict().proofs_valid()

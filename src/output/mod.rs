@@ -74,7 +74,8 @@ mod tests {
     }
 
     fn create_test_receipt() -> atl_core::Receipt {
-        serde_json::from_str(include_str!(
+        // See the note in `crate::output::human`'s test module.
+        atl_core::Receipt::from_json(include_str!(
             "../../test_data/receipts/valid/document.pdf.atl"
         ))
         .expect("Failed to parse test receipt")
@@ -94,6 +95,7 @@ mod tests {
             receipt: create_test_receipt(),
             core_result: create_test_verification_result(),
             anchor_results: vec![],
+            anchor_facts: Vec::new(),
             policy: AnchorPolicy::AllAnchors,
         }
     }

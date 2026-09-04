@@ -94,21 +94,26 @@ fn bitcoin_anchor(json: &serde_json::Value) -> &serde_json::Value {
         .expect("the fixture carries a bitcoin_ots anchor")
 }
 
-/// **A height the receipt's own proof contradicts is a refutation, offline.**
+/// **A height the receipt's own proof contradicts refutes the ANCHOR,
+/// offline.**
 ///
-/// Not `untrusted`: nothing here was left unchecked. An `OpenTimestamps`
-/// Bitcoin attestation carries the block height in its own bytes, so the two
-/// assertions were compared with no network access and one of them is false.
+/// Not `untrusted` for the anchor: nothing about it was left unchecked. An
+/// `OpenTimestamps` Bitcoin attestation carries the block height in its own
+/// bytes, so the two assertions were compared with no network access and one
+/// of them is false.
+///
+/// The **receipt** is a separate question, and the answer is `untrusted`
+/// (exit 3), not `invalid`. Nothing signs or hashes a receipt's `anchors`
+/// array, so this whole anchor is something anybody who relayed the receipt
+/// could have attached; exit 1 would say the receipt was disproved, which
+/// this observation cannot support. What it does support is that no anchor
+/// was verified — which is what `untrusted` says.
 #[test]
-fn a_contradicted_block_height_is_invalid_offline() {
+fn a_contradicted_block_height_refutes_the_anchor_offline() {
     let (code, json) = verify_single(&fixture_path("bitcoin_height_contradicts_proof.atl"), &[]);
 
-    assert_eq!(code, 1, "{json}");
-    assert_eq!(json["status"], "invalid");
-    assert_eq!(
-        json["reason_code"],
-        "bitcoin_claimed_height_contradicts_proof"
-    );
+    assert_eq!(code, 3, "{json}");
+    assert_eq!(json["status"], "untrusted");
 
     let anchor = bitcoin_anchor(&json);
     assert_eq!(anchor["state"], "refuted", "{anchor}");
@@ -132,12 +137,14 @@ fn a_contradicted_block_height_is_invalid_offline() {
     );
 }
 
-/// **A refutation may never carry a trust-bearing axis beside it.**
+/// **No axis may claim trust for a receipt with no verified anchor, and the
+/// refuted one must be named.**
 ///
-/// `evidence.established`, `policy.satisfied` and `coverage.complete` all
-/// have to be `false`, and the refutation has to be named in `refuted_by` —
-/// a consumer reading only the axes must not be able to conclude anything
-/// was achieved.
+/// `evidence.established`, `policy.satisfied` and `coverage.complete` are all
+/// `false` — here because zero anchors verified, not because a refutation
+/// poisoned them — and the refuted anchor is named in `refuted_by` and listed
+/// in `coverage.refuted`. A consumer reading only the axes must be able to
+/// see both that nothing was achieved and that an anchor failed.
 #[test]
 fn the_axes_assert_no_trust_beside_a_contradicted_height() {
     let (_, json) = verify_single(&fixture_path("bitcoin_height_contradicts_proof.atl"), &[]);
@@ -149,8 +156,17 @@ fn the_axes_assert_no_trust_beside_a_contradicted_height() {
         "{assessment}"
     );
     assert_eq!(assessment["evidence"]["refuted_anchors"], 1, "{assessment}");
+    // `refuted_by` speaks for the RECEIPT, and nothing refuted it. Naming
+    // the anchor there would let a relay put a refutation's name on a
+    // receipt nothing had disproved.
+    assert!(
+        assessment["evidence"]["refuted_by"].is_null(),
+        "{assessment}"
+    );
+    // The anchor's own finding is in the coverage list, where it belongs.
     assert_eq!(
-        assessment["evidence"]["refuted_by"], "bitcoin_claimed_height_contradicts_proof",
+        assessment["coverage"]["refuted"][0]["reason_code"],
+        "bitcoin_claimed_height_contradicts_proof",
         "{assessment}"
     );
     assert_eq!(assessment["policy"]["satisfied"], false, "{assessment}");
@@ -165,45 +181,66 @@ fn the_axes_assert_no_trust_beside_a_contradicted_height() {
     );
 }
 
-/// **`--allow-single-anchor` relaxes a quorum, never a refutation.**
+/// **`--allow-single-anchor` relaxes a quorum, and a refuted anchor still
+/// meets no quorum.**
 ///
-/// The flag lets one verified anchor stand in for all of them. It cannot
-/// make a disproved anchor go away, and the exit code must not move.
+/// The flag lets one *verified* anchor stand in for all of them. A refuted
+/// anchor is not a verified one under any quorum, and this receipt has no
+/// other, so the outcome does not move: `untrusted`, exit 3, under both
+/// settings. The flag is exercised on both sides because a guard that only
+/// ever runs under the default has not been shown to hold anywhere else.
 #[test]
 fn allow_single_anchor_does_not_rescue_a_contradicted_height() {
+    let (default_code, default_json) =
+        verify_single(&fixture_path("bitcoin_height_contradicts_proof.atl"), &[]);
     let (code, json) = verify_single(
         &fixture_path("bitcoin_height_contradicts_proof.atl"),
         &["--allow-single-anchor"],
     );
 
-    assert_eq!(code, 1, "{json}");
-    assert_eq!(json["status"], "invalid", "{json}");
+    assert_eq!(code, 3, "{json}");
+    assert_eq!(json["status"], "untrusted", "{json}");
     assert_eq!(
-        json["reason_code"],
-        "bitcoin_claimed_height_contradicts_proof"
+        (code, &json["status"]),
+        (default_code, &default_json["status"]),
+        "the quorum setting must not move this outcome"
+    );
+    // The anchor's own outcome is unchanged by the flag too.
+    assert_eq!(bitcoin_anchor(&json)["state"], "refuted", "{json}");
+    assert_eq!(
+        bitcoin_anchor(&json)["reason_code"],
+        "bitcoin_claimed_height_contradicts_proof",
+        "{json}"
     );
 }
 
 /// **Batch mode gives the same answer as single mode.**
 ///
-/// The same receipt, the same source, the same refutation — the contract
-/// must not depend on whether the caller passed a file or a directory.
+/// The same receipt, the same source, the same finding — the contract must
+/// not depend on whether the caller passed a file or a directory.
 #[test]
-fn batch_mode_reports_the_same_refutation() {
-    let (single_code, _) =
+fn batch_mode_reports_the_same_finding() {
+    let (single_code, single_json) =
         verify_single(&fixture_path("bitcoin_height_contradicts_proof.atl"), &[]);
     let (batch_code, json) =
         verify_batch(&fixture_path("bitcoin_height_contradicts_proof.atl"), &[]);
 
     assert_eq!(batch_code, single_code, "{json}");
-    assert_eq!(batch_code, 1, "{json}");
-    assert_eq!(json["status"], "invalid", "{json}");
-    assert_eq!(json["reason_code"], "batch_items_invalid", "{json}");
+    assert_eq!(batch_code, 3, "{json}");
+    assert_eq!(json["status"], "untrusted", "{json}");
+    assert_eq!(json["reason_code"], "batch_items_untrusted", "{json}");
 
     let item = &json["items"].as_array().expect("batch items")[0];
-    assert_eq!(item["status"], "invalid", "{item}");
+    assert_eq!(item["status"], single_json["status"], "{item}");
+    assert_eq!(item["status"], "untrusted", "{item}");
+    // The refuted anchor reaches the batch item's own axes, unsummarised.
     assert_eq!(
-        item["reason_code"], "bitcoin_claimed_height_contradicts_proof",
+        item["assessment"]["evidence"]["refuted_anchors"], 1,
+        "{item}"
+    );
+    assert_eq!(
+        item["assessment"]["coverage"]["refuted"][0]["reason_code"],
+        "bitcoin_claimed_height_contradicts_proof",
         "{item}"
     );
     // The axes on the item itself must carry no trust either.
@@ -259,7 +296,7 @@ fn the_human_output_names_whose_claim_is_whose() {
             "--verbose",
         ])
         .assert()
-        .code(1)
+        .code(3)
         .get_output()
         .stdout
         .clone();

@@ -18,19 +18,27 @@ pub enum BatchItemResult {
     /// Verification succeeded: every anchor reached a configured trust root.
     Valid(SingleVerificationResult),
     /// Cryptographically sound but carrying no anchors at all
-    /// (Receipt-Lite), so it has zero verified anchors.
+    /// (Receipt-Lite) **as it reached this tool**, so it has zero verified
+    /// anchors.
     ///
     /// A sub-kind of untrusted, not of valid: ATL v2.0 §5.5 says a receipt
     /// without any verified anchors should be treated as untrustworthy, and
     /// the item's own status word is `untrusted` with reason
-    /// `receipt_unanchored`. The bucket is kept distinct only so the report
-    /// can explain the Receipt-Lite tier instead of sending the reader after
-    /// a certificate that would not help.
+    /// `receipt_unanchored` — the same code an item whose anchors all failed
+    /// reports, because those are the same fact and this tool cannot tell
+    /// them apart. The bucket is kept distinct only so the report can
+    /// explain the Receipt-Lite tier instead of sending the reader after a
+    /// certificate that would not help, and it feeds no aggregate reason: a
+    /// relay can move an item out of it by appending an anchor.
     Unanchored(SingleVerificationResult),
-    /// Nothing refuted, but the item's anchors did not reach a configured
-    /// trust root
+    /// The receipt was not refuted, and trust in it was not established:
+    /// its anchors reached no configured trust root, a check could not be
+    /// finished, or one of its anchors was checked and found false — which
+    /// refutes that anchor and not the receipt, since a receipt's `anchors`
+    /// array is signed and hashed by nothing.
     Untrusted(SingleVerificationResult),
-    /// Verification failed (cryptographic or hash)
+    /// The receipt itself was refuted (cryptographic or hash). Never reached
+    /// from an anchor — see [`Self::Untrusted`].
     Invalid(SingleVerificationResult),
     /// Error during verification
     Error {
@@ -54,10 +62,15 @@ pub struct BatchVerificationResult {
     pub consistency: Option<ConsistencyResult>,
     /// Count of valid files
     pub valid_count: usize,
-    /// Count of files whose receipts carry no anchors (Receipt-Lite). These
-    /// are untrusted items, counted separately only for reporting.
+    /// Count of files whose receipts **presented** no anchors
+    /// (Receipt-Lite). These are untrusted items, counted separately only
+    /// for reporting: the batch's own reason code does not depend on this
+    /// number, because an `anchors` array is authenticated by nothing and a
+    /// relay can move an item out of this bucket by appending to it.
     pub unanchored_count: usize,
-    /// Count of files whose anchors reached no configured trust root
+    /// Count of files that were not refuted and were not accepted: their
+    /// anchors reached no configured trust root, a check could not be
+    /// finished, or an anchor was checked and found false.
     pub untrusted_count: usize,
     /// Count of invalid files
     pub invalid_count: usize,
@@ -143,14 +156,25 @@ impl BatchVerificationResult {
         if self.unmatched_count > 0 {
             return ReceiptVerdict::untrusted(ReasonCode::BatchItemsUnmatched);
         }
-        // An item with no anchors at all is reported before one whose
-        // anchors merely fell short, mirroring the single-receipt order: the
-        // absence of any external attestation is the more fundamental gap,
-        // and it is the one a caller is least likely to have expected.
-        if self.unanchored_count > 0 {
-            return ReceiptVerdict::untrusted(ReasonCode::BatchItemsUnanchored);
-        }
-        if self.untrusted_count > 0 {
+        // One code for every item that reached a verdict and was not
+        // accepted, Receipt-Lite included.
+        //
+        // These used to be two: `batch_items_unanchored` was reported ahead
+        // of `batch_items_untrusted` whenever any item carried no anchors at
+        // all. But bucket membership is decided by the item's `anchors`
+        // array, which is authenticated by nothing -- so appending one
+        // rubbish anchor to one Receipt-Lite in the directory moved that
+        // item from `unanchored` to `untrusted` and changed the whole
+        // BATCH's reported reason. That is the single-receipt defect one
+        // storey up, and it is closed the same way: the aggregate reason is
+        // a function of what was *verified*, and both buckets verified
+        // nothing.
+        //
+        // The distinction survives where it belongs -- as `summary.unanchored`,
+        // a count of the items that presented no anchors, and as the
+        // per-item `Unanchored` bucket the report uses to explain the
+        // Receipt-Lite tier rather than send a reader after trust material.
+        if self.unanchored_count > 0 || self.untrusted_count > 0 {
             return ReceiptVerdict::untrusted(ReasonCode::BatchItemsUntrusted);
         }
 
@@ -257,11 +281,12 @@ impl BatchVerificationResult {
                             },
                         }
                     }
-                    // `receipt_unanchored` keeps its own bucket so the
-                    // report can name the Receipt-Lite tier; it is an
-                    // untrusted item either way, and exits 3 either way.
+                    // An item that presented no anchors keeps its own
+                    // bucket so the report can name the Receipt-Lite tier;
+                    // it is an untrusted item either way, exits 3 either
+                    // way, and reports the same reason code either way.
                     Status::Untrusted => {
-                        if result.is_lite() {
+                        if result.presents_no_anchors() {
                             unanchored_count += 1;
                             BatchItemResult::Unanchored(result)
                         } else {
@@ -608,7 +633,7 @@ pub fn verify_batch(
                     // Sound proofs and no anchors keeps its own bucket, so
                     // the report can name the Receipt-Lite tier rather than
                     // send the reader after trust material.
-                    if result.is_lite() {
+                    if result.presents_no_anchors() {
                         unanchored_count += 1;
                         items.push(BatchItemResult::Unanchored(result));
                     } else {
@@ -681,7 +706,7 @@ pub fn verify_batch(
     // inconsistent with. It is excluded from the check, not failed by it.
     let consistency_participants: Vec<SingleVerificationResult> = consistency_candidates
         .into_iter()
-        .filter(|r| r.receipt.super_proof.is_some())
+        .filter(|r| r.receipt.super_proof().is_some())
         .collect();
 
     let consistency = if consistency_participants.len() >= 2 {
@@ -1051,7 +1076,7 @@ mod tests {
 
         assert_eq!(verdict.status, Status::Untrusted);
         assert_ne!(verdict.status, Status::Valid);
-        assert_eq!(verdict.reason_code, Some(ReasonCode::BatchItemsUnanchored));
+        assert_eq!(verdict.reason_code, Some(ReasonCode::BatchItemsUntrusted));
         assert_eq!(verdict.exit_code().code(), 3);
         assert_eq!(result.total_count(), 3);
     }
@@ -1062,7 +1087,7 @@ mod tests {
     fn a_mixture_of_valid_and_unanchored_is_untrusted() {
         let verdict = counts(5, 1, 0, 0, 0, 0).verdict();
         assert_eq!(verdict.status, Status::Untrusted);
-        assert_eq!(verdict.reason_code, Some(ReasonCode::BatchItemsUnanchored));
+        assert_eq!(verdict.reason_code, Some(ReasonCode::BatchItemsUntrusted));
         assert_eq!(verdict.exit_code().code(), 3);
     }
 
@@ -1072,7 +1097,7 @@ mod tests {
     fn unanchored_items_are_not_nothing_verified() {
         assert_eq!(
             counts(0, 2, 0, 0, 0, 0).verdict().reason_code,
-            Some(ReasonCode::BatchItemsUnanchored)
+            Some(ReasonCode::BatchItemsUntrusted)
         );
         assert_eq!(
             counts(0, 0, 0, 0, 0, 2).verdict().reason_code,

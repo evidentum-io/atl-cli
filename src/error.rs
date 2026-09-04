@@ -3,13 +3,15 @@
 //! Exit codes:
 //! - 0 = VALID (accepted under the anchor policy in force -- the only
 //!   status that exits 0)
-//! - 1 = INVALID (the evidence was refuted)
+//! - 1 = INVALID (the receipt itself was refuted)
 //! - 2 = ERROR (runtime error)
-//! - 3 = UNTRUSTED (nothing refuted; the check could not be finished)
+//! - 3 = UNTRUSTED (the receipt was not refuted, and trust in it was not
+//!   established -- which includes a receipt one of whose anchors was
+//!   checked and found false)
 //!
 //! Codes 1 and 3 are deliberately distinct so a script can tell "this
-//! evidence is broken" from "I could not finish checking it" without parsing
-//! JSON. Code 2 is equally distinct: it means the tool failed to process an
+//! receipt is disproved" from "I could not establish trust in it" without
+//! parsing JSON. Code 2 is equally distinct: it means the tool failed to process an
 //! input and says nothing about the evidence.
 //!
 //! The same input must produce the same code whether it was passed as a file
@@ -25,20 +27,28 @@ use thiserror::Error;
 pub enum ExitCode {
     /// All verifications passed
     Valid = 0,
-    /// One or more verifications was refuted (cryptographic/hash failure)
+    /// One or more receipts was refuted (cryptographic/hash failure).
+    ///
+    /// About the receipt, never about one of its anchors: a receipt's
+    /// `anchors` array is signed and hashed by nothing, so an anchor that
+    /// fails verification is one anybody who relayed the receipt could have
+    /// attached, and it exits 3.
     Invalid = 1,
     /// Runtime error (file not found, parse error, network, etc.)
     Error = 2,
-    /// Nothing was refuted, and the check could not be finished. Three
-    /// shapes reach this code: an anchor that did not reach a trust root
-    /// this verifier was configured with, a fact that could not be evaluated
-    /// at all (cryptography this build does not implement), and — in batch
-    /// mode — a file the caller named that never paired up with its
-    /// counterpart and was therefore never checked.
+    /// The receipt was not refuted, and trust in it was not established.
+    /// Four shapes reach this code: an anchor that did not reach a trust
+    /// root this verifier was configured with; a fact that could not be
+    /// evaluated at all (cryptography this build does not implement); an
+    /// anchor that **was** checked and found false, which refutes that
+    /// anchor and not the receipt; and — in batch mode — a file the caller
+    /// named that never paired up with its counterpart and was therefore
+    /// never checked.
     ///
-    /// The evidence stands in every case. Read the reason code before
-    /// telling anyone what to supply: only the first shape is fixed by
-    /// supplying trust material.
+    /// The receipt stands in every case. Read the reason code before telling
+    /// anyone what to supply: only the first shape is fixed by supplying
+    /// trust material, and the third is a sign that somebody interfered with
+    /// the receipt on its way here.
     Untrusted = 3,
 }
 
@@ -155,16 +165,18 @@ pub enum CliError {
     // ========================================================================
     // Trust Material Missing (Exit Code 3: UNTRUSTED)
     // ========================================================================
-    /// Every checkable fact holds, but the check could not be finished. Three
-    /// shapes reach this variant: no anchor reached a trust root this verifier
-    /// was configured with; the certificate path could not be evaluated at
-    /// all; or, in a batch, a file the caller named had no counterpart to
-    /// check it against.
+    /// Trust in the receipt was not established, and the receipt was not
+    /// refuted. Four shapes reach this variant: no anchor reached a trust
+    /// root this verifier was configured with; the certificate path could
+    /// not be evaluated at all; an anchor was checked and found false, which
+    /// refutes that anchor and not the receipt; or, in a batch, a file the
+    /// caller named had no counterpart to check it against.
     ///
-    /// This is NOT a verification failure: nothing about the evidence was
-    /// refuted. It is a statement about *this verifier's* limits, and it
-    /// gets its own exit code so callers never have to guess which of the
-    /// two happened.
+    /// This is NOT a refutation of the receipt: nothing about the *receipt*
+    /// was disproved. It gets its own exit code so callers never have to
+    /// guess which of the two happened — and, in the third shape, so the
+    /// failed anchor is reported without an accusation being manufactured
+    /// out of it.
     #[error("{headline} ({reason_code}) -- {detail}")]
     TrustNotEstablished {
         /// Leading phrase. Two are possible, because "trust root
@@ -292,14 +304,14 @@ pub enum CliError {
     /// through `VerificationFailed` instead). That is the only reason its
     /// `ExitCode::Invalid` mapping does no harm today.
     ///
-    /// `atl-core` raises `NoTrustAnchor` when *zero anchors ended up valid*,
-    /// which is exactly the state
-    /// [`crate::verify::single::map_core_error`] deliberately refuses to
-    /// call a refutation: an RFC 3161 anchor whose cryptography is sound but
-    /// whose root nobody vouched for lands there, and that is `untrusted`
-    /// (exit 3), not `invalid` (exit 1). If this variant is ever put on a
-    /// live path, its exit code must be settled against
-    /// [`crate::verify::verdict`] first — not left at `Invalid`.
+    /// `atl-core` raises `NoTrustAnchor` when *fewer anchors verified than
+    /// the threshold requires*, which is exactly the state
+    /// [`crate::verify::single::classify_core_error`] answers `Deferred` to:
+    /// an RFC 3161 anchor whose cryptography is sound but whose root nobody
+    /// vouched for lands there, and that is `untrusted` (exit 3), not
+    /// `invalid` (exit 1). If this variant is ever put on a live path, its
+    /// exit code must be settled against [`crate::verify::verdict`] first —
+    /// not left at `Invalid`.
     #[error("No trust anchor available (no verified signature or valid external anchors)")]
     #[allow(dead_code)]
     NoTrustAnchor,
@@ -410,14 +422,6 @@ impl From<CoreVerificationError> for CliError {
             CoreVerificationError::TreeSizeMismatch => {
                 Self::VerificationFailed("Tree size mismatch".to_string())
             }
-            CoreVerificationError::AnchorFailed {
-                anchor_type,
-                reason,
-            } => match anchor_type.as_str() {
-                "rfc3161" => Self::TsaVerificationFailed(reason),
-                "bitcoin_ots" => Self::OtsVerificationFailed(reason),
-                _ => Self::VerificationFailed(format!("Anchor {anchor_type} failed: {reason}")),
-            },
             CoreVerificationError::SuperInclusionFailed { reason } => {
                 Self::SuperInclusionFailed { reason }
             }
@@ -441,7 +445,50 @@ impl From<CoreVerificationError> for CliError {
             CoreVerificationError::MetadataHashMismatch { expected, actual } => {
                 Self::MetadataHashMismatch { expected, actual }
             }
-            CoreVerificationError::NoTrustAnchor => Self::NoTrustAnchor,
+            CoreVerificationError::NoTrustAnchor { .. } => Self::NoTrustAnchor,
+
+            // Nothing was disproved and a check did not finish. There is no
+            // `CliError` for that state and there must not be one: every
+            // variant of this type carries an exit code, and the only honest
+            // one here is 3 (untrusted), which the verdict machinery in
+            // `crate::verify::verdict` already produces from the reason
+            // codes. Routing it through `VerificationFailed` (exit 1) would
+            // publish "this evidence is disproved" for a check that never
+            // ran, so it is reported as the runtime condition it is.
+            CoreVerificationError::MetadataNotCanonicalizable { path, reason } => {
+                Self::VerificationFailed(format!(
+                    "metadata at {path} has no RFC 8785 canonical form, so metadata_hash was \
+                     never computed and never compared: {reason}"
+                ))
+            }
+            CoreVerificationError::SourceTextNotChecked => Self::VerificationFailed(
+                "the receipt's bytes were never checked for duplicate property names".to_string(),
+            ),
+
+            // Findings about an anchor, not about the receipt. This
+            // conversion produces a `CliError`, which is a whole-run
+            // failure, and an anchor finding is never that: it is reported
+            // per anchor by `crate::verify::anchor`, and it does not decide
+            // the receipt's status. Nothing on a live path constructs one
+            // here -- see the note on `Self::NoTrustAnchor`.
+            CoreVerificationError::AnchorFinding {
+                index,
+                anchor_type,
+                finding,
+            } => Self::VerificationFailed(format!("anchor {index} ({anchor_type}): {finding:?}")),
+            CoreVerificationError::AnchorTargetInvalid { .. }
+            | CoreVerificationError::AnchorTargetHashMismatch { .. }
+            | CoreVerificationError::AnchorPayloadUndecodable { .. }
+            | CoreVerificationError::AnchorTypeUnsupported { .. }
+            | CoreVerificationError::BitcoinHeightContradictsProof { .. }
+            | CoreVerificationError::BitcoinBlockNotObtained
+            | CoreVerificationError::Rfc3161MessageImprint(_)
+            | CoreVerificationError::Rfc3161CmsSignature(_)
+            | CoreVerificationError::Rfc3161TimestampingEku(_)
+            | CoreVerificationError::Rfc3161CertificatePath { .. }
+            | CoreVerificationError::Rfc3161TerminalNotTrusted { .. } => {
+                Self::VerificationFailed(format!("anchor finding: {err:?}"))
+            }
         }
     }
 }
@@ -614,34 +661,47 @@ mod tests {
         assert!(matches!(cli_err, CliError::Io(_)));
     }
 
+    /// **An anchor finding may not become a whole-run failure.**
+    ///
+    /// `atl-core` 0.28 reported a failed anchor as an `AnchorFailed`
+    /// aggregate, which this conversion turned into `TsaVerificationFailed`
+    /// / `OtsVerificationFailed` — both exit 1, both saying the evidence was
+    /// disproved. 0.29 removed that variant: a receipt's `anchors` array is
+    /// authenticated by nothing, so a finding against one is a statement
+    /// about that anchor and never about the receipt.
+    ///
+    /// The per-anchor findings that replaced it must therefore not be
+    /// convertible into anything that claims a refuted receipt. They arrive
+    /// as `VerificationFailed`, which no live path constructs from them —
+    /// `crate::verify::anchor` reports every one of them per anchor instead.
     #[test]
-    fn test_from_core_anchor_failed_rfc3161() {
-        let core_err = CoreVerificationError::AnchorFailed {
-            anchor_type: "rfc3161".to_string(),
-            reason: "TSA cert expired".to_string(),
-        };
-        let cli_err: CliError = core_err.into();
-        assert!(matches!(cli_err, CliError::TsaVerificationFailed(_)));
-    }
-
-    #[test]
-    fn test_from_core_anchor_failed_bitcoin_ots() {
-        let core_err = CoreVerificationError::AnchorFailed {
-            anchor_type: "bitcoin_ots".to_string(),
-            reason: "OTS not confirmed".to_string(),
-        };
-        let cli_err: CliError = core_err.into();
-        assert!(matches!(cli_err, CliError::OtsVerificationFailed(_)));
-    }
-
-    #[test]
-    fn test_from_core_anchor_failed_unknown() {
-        let core_err = CoreVerificationError::AnchorFailed {
-            anchor_type: "unknown".to_string(),
-            reason: "test".to_string(),
-        };
-        let cli_err: CliError = core_err.into();
-        assert!(matches!(cli_err, CliError::VerificationFailed(_)));
+    fn an_anchor_finding_is_never_a_receipt_level_failure() {
+        for core_err in [
+            CoreVerificationError::AnchorPayloadUndecodable {
+                anchor_type: "rfc3161".to_string(),
+                reason: "not CMS SignedData".to_string(),
+            },
+            CoreVerificationError::AnchorPayloadUndecodable {
+                anchor_type: "bitcoin_ots".to_string(),
+                reason: "not an OTS proof".to_string(),
+            },
+            CoreVerificationError::BitcoinBlockNotObtained,
+            CoreVerificationError::AnchorFinding {
+                index: 0,
+                anchor_type: "rfc3161".to_string(),
+                finding: Box::new(CoreVerificationError::AnchorTargetInvalid {
+                    anchor_type: "rfc3161".to_string(),
+                    expected: "data_tree_root".to_string(),
+                    actual: "super_root".to_string(),
+                }),
+            },
+        ] {
+            let cli_err: CliError = core_err.into();
+            assert!(
+                matches!(cli_err, CliError::VerificationFailed(_)),
+                "an anchor finding must not be reported as a specific receipt failure: {cli_err:?}"
+            );
+        }
     }
 
     #[test]
@@ -702,9 +762,35 @@ mod tests {
 
     #[test]
     fn test_from_core_no_trust_anchor() {
-        let core_err = CoreVerificationError::NoTrustAnchor;
+        let core_err = CoreVerificationError::NoTrustAnchor {
+            required: 1,
+            verified: 0,
+        };
         let cli_err: CliError = core_err.into();
         assert!(matches!(cli_err, CliError::NoTrustAnchor));
+    }
+
+    /// The inability half of `atl-core`'s receipt-level errors reaches this
+    /// conversion as a message, never as a `CliError` that claims a specific
+    /// refuted check. Nothing live constructs one — `verify_single` routes
+    /// receipt-level errors through
+    /// `crate::verify::single::classify_core_error` instead, which reports
+    /// them as `receipt_check_incomplete` (untrusted, exit 3).
+    #[test]
+    fn receipt_level_inabilities_are_not_reported_as_refuted_checks() {
+        for core_err in [
+            CoreVerificationError::SourceTextNotChecked,
+            CoreVerificationError::MetadataNotCanonicalizable {
+                path: "/entry/metadata/x".to_string(),
+                reason: "non-finite number".to_string(),
+            },
+        ] {
+            let cli_err: CliError = core_err.into();
+            assert!(
+                matches!(cli_err, CliError::VerificationFailed(_)),
+                "{cli_err:?}"
+            );
+        }
     }
 
     #[test]

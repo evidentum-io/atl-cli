@@ -166,7 +166,14 @@ fn incomplete_chain_without_trust_material_is_untrusted_not_invalid() {
     let json = verify_json(&[], 3);
 
     assert_eq!(json["status"], "untrusted");
-    assert_eq!(json["reason_code"], "tsa_chain_incomplete");
+    // The receipt's own reason: no anchor was verified. It names no anchor
+    // -- a top-level code computed from the `anchors` array would be a
+    // relay's to choose. The actionable code is on the anchor.
+    assert_eq!(json["reason_code"], "receipt_unanchored");
+    assert_eq!(
+        json["anchor_verification"]["results"][0]["reason_code"],
+        "tsa_chain_incomplete"
+    );
 
     let anchor = &json["anchor_verification"]["results"][0];
     assert_eq!(anchor["type"], "rfc3161");
@@ -190,7 +197,14 @@ fn anchor_without_the_missing_issuer_is_still_untrusted() {
     let json = verify_json(&["--tsa-trust-store", anchor_path.to_str().unwrap()], 3);
 
     assert_eq!(json["status"], "untrusted");
-    assert_eq!(json["reason_code"], "tsa_chain_incomplete");
+    // The receipt's own reason: no anchor was verified. It names no anchor
+    // -- a top-level code computed from the `anchors` array would be a
+    // relay's to choose. The actionable code is on the anchor.
+    assert_eq!(json["reason_code"], "receipt_unanchored");
+    assert_eq!(
+        json["anchor_verification"]["results"][0]["reason_code"],
+        "tsa_chain_incomplete"
+    );
     assert_eq!(
         json["anchor_verification"]["results"][0]["trust_state"],
         "incomplete"
@@ -316,10 +330,13 @@ fn human_output_names_the_remedy_for_an_incomplete_chain() {
         .clone();
 
     let human = String::from_utf8(output).unwrap();
+    // The headline states the receipt-level fact, which no relay can move.
     assert!(
-        human.contains("NOT VERIFIED: trust root unavailable"),
+        human.contains("NOT VERIFIED: no anchor was verified"),
         "{human}"
     );
+    // The remedy is still named, in the advice block beneath, where
+    // per-anchor advice belongs.
     assert!(human.contains("--tsa-intermediates"), "{human}");
     assert!(
         !human.contains("INVALID"),
@@ -358,7 +375,11 @@ fn sha1_self_signed_root_as_an_intermediate_is_indeterminate_not_invalid() {
     let json = verify_json(&["--tsa-intermediates", both.to_str().unwrap()], 3);
 
     assert_eq!(json["status"], "untrusted");
-    assert_eq!(json["reason_code"], "tsa_chain_indeterminate");
+    assert_eq!(json["reason_code"], "receipt_unanchored");
+    assert_eq!(
+        json["anchor_verification"]["results"][0]["reason_code"],
+        "tsa_chain_indeterminate"
+    );
 
     let anchor = &json["anchor_verification"]["results"][0];
     assert_eq!(anchor["path_status"], "indeterminate");
