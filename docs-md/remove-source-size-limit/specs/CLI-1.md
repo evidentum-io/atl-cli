@@ -8,7 +8,13 @@
 - **Blocked By**: None
 - **Blocks**: None
 
-> **CONSTRAINT**: No implementation file may exceed 500 lines. Split into modules if needed.
+> **CONSTRAINT**: No file this task creates or changes may exceed 500 lines; split
+> into modules if needed. The crate already holds twelve files above that line under
+> `src/` (651 to 2135 lines) and three under `tests/` (514 to 1256), every one of
+> them already so before this task. This task changes two of them —
+> `src/cli/args.rs` (955 lines) and `src/verify/single.rs` (1244) — and splits
+> neither: the budget here is the minimal change for Required Behaviour 3, and
+> refactoring those two files is out of scope.
 
 ---
 
@@ -48,6 +54,15 @@ alone declines.
 - Correct the `hash_file` doc comment, which states that the function "enforces a
   1 GB file size limit" and lists "File exceeds size limit" among its errors.
 - Add the regression test named in Acceptance Criteria below.
+- Replace the source existence check in `hash_file` (`src/verify/file.rs:33`) so
+  that an absent path and a path whose existence cannot be determined are told
+  apart, per Required Behaviour 3.
+- Do the same for both checks in `VerifyArgs::validate`: the source
+  (`src/cli/args.rs:432`) and the receipt (`src/cli/args.rs:437`). `validate` is
+  called from `src/commands/verify.rs:23`; that call site itself is not edited.
+- Do the same for the receipt existence check in `load_receipt`
+  (`src/verify/single.rs:551`). The rest of the function is left alone.
+- Add the two tests named in AC6 and AC7.
 
 ### Out of Scope
 
@@ -70,11 +85,14 @@ alone declines.
 
 | File | Impact | Description |
 |------|--------|-------------|
-| `src/verify/file.rs` | PRIMARY | Remove constant, gate and its test; correct doc comment; add regression test |
+| `src/verify/file.rs` | PRIMARY | Remove constant, gate and its test; correct doc comment; add regression test; fix the source existence check (`:33`) |
 | `src/verify/mod.rs` | MINOR | Drop one name from the `pub use` list |
+| `src/cli/args.rs` | SECONDARY | Both existence checks in `validate` — source (`:432`) and receipt (`:437`): distinguish an absent path from one whose existence cannot be determined (RB3) |
+| `src/verify/single.rs` | SECONDARY | The same for the receipt existence check in `load_receipt` (`:551`); nothing else in the function changes |
 
-No other file references `MAX_SOURCE_FILE_SIZE`. Verified: the only other
-`std::fs::metadata` calls in the crate are the receipt bound
+The four checks named in Required Behaviour 3 are the only `Path::exists()` calls
+in the crate. No other file references `MAX_SOURCE_FILE_SIZE`. Verified: the only
+other `std::fs::metadata` calls in the crate are the receipt bound
 (`src/verify/single.rs:556`) and file-type classification in batch mode
 (`src/verify/batch.rs:385`), and the only whole-file reads are the receipt
 (`src/verify/single.rs:567`, after its own bound) and the trust store
@@ -88,11 +106,21 @@ No other file references `MAX_SOURCE_FILE_SIZE`. Verified: the only other
 1. `hash_file` streams the file through its existing 64 KiB buffer and returns the
    `SHA-256` digest, for a regular file of any size.
 2. A path that does not exist still returns `CliError::SourceNotFound`.
-3. A file that cannot be read still returns `CliError::FileReadError`, from the same
-   read path as before.
+3. `SourceNotFound` and `ReceiptNotFound` are raised only for a path determined not
+   to exist; any other failure to determine existence, or to open the file, returns
+   `CliError::FileReadError` carrying the underlying `io` error. Four checks decide
+   this, each on `Path::exists()`, which is `false` both for an absent path and for
+   one it could not stat: `src/verify/file.rs:33` (source, `hash_file`),
+   `src/cli/args.rs:432` (source) and `:437` (receipt) in `validate` — the first
+   barrier the user meets, from `src/commands/verify.rs:23` — and
+   `src/verify/single.rs:551` (receipt, `load_receipt`). All three variants are
+   already `ExitCode::Error` (`src/error.rs:362-365`), so exit 2 is unchanged and
+   only the diagnosis changes. `Path::try_exists` returns `io::Result<bool>` and
+   draws exactly this distinction (crate `rust-version` is 1.92.0).
 4. `hash_file` no longer returns `CliError::FileTooLarge` for any input. The variant
    remains reachable from `load_receipt` only.
-5. No behaviour of `load_receipt` changes.
+5. Nothing else in `load_receipt` changes: its 10 MiB bound, the JSON parse and the
+   `spec_version` check stay exactly as they are.
 
 ---
 
@@ -105,12 +133,22 @@ No other file references `MAX_SOURCE_FILE_SIZE`. Verified: the only other
   passes on the new one.
 - **AC2:** No test and no source file references `MAX_SOURCE_FILE_SIZE`; the crate
   compiles with the name gone.
-- **AC3:** The existing `hash_file` tests (small file, missing file, unreadable file)
-  still pass unchanged.
+- **AC3:** The existing `hash_file` tests still pass, unchanged: `test_hash_file`
+  (small file), `test_hash_empty_file`, `test_hash_file_large` (1 MiB) and
+  `test_hash_file_not_found` (absent path, `SourceNotFound`). `test_constants`
+  passes too, with only the deleted assertion gone from it. The crate has no
+  `hash_file` test for a file that exists but cannot be read.
 - **AC4:** `load_receipt` still rejects a receipt document above 10 MiB with
   `FileTooLarge` and exit code 2.
 - **AC5:** `cargo test -p atl-cli --no-fail-fast`, `cargo fmt --check` and
   `cargo clippy -p atl-cli` are clean for the changed crate.
+- **AC6:** With `F` a temporary regular file, `F/child` returns `FileReadError`, not
+  `SourceNotFound`, from `hash_file` and from `VerifyArgs::validate` as the source.
+  `Path::exists()` is `false` there while `try_exists()` fails with `NotADirectory`
+  (`ENOTDIR`, os error 20, observed on macOS) — deterministic for any user, root
+  included, with no permission setup and no platform guard.
+- **AC7:** `F/child` as the receipt returns `FileReadError`, not `ReceiptNotFound`,
+  from `VerifyArgs::validate` and from `load_receipt`.
 
 ---
 
