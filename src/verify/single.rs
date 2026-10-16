@@ -547,8 +547,12 @@ fn classify_core_error(error: &VerificationError) -> CoreFinding {
 /// - File cannot be parsed as JSON
 /// - `spec_version` is not the revision this build implements
 pub fn load_receipt(path: &Path) -> CliResult<Receipt> {
-    // Check file exists
-    if !path.exists() {
+    // Only a path determined not to exist is "not found"; any other failure
+    // to determine existence is a read error.
+    if !path
+        .try_exists()
+        .map_err(|e| CliError::file_read_error(path, e))?
+    {
         return Err(CliError::ReceiptNotFound(path.to_path_buf()));
     }
 
@@ -705,6 +709,13 @@ pub fn verify_single(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_load_receipt_path_through_regular_file_is_read_error() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let result = load_receipt(&file.path().join("child"));
+        assert!(matches!(result, Err(CliError::FileReadError { .. })));
+    }
 
     fn create_test_receipt() -> atl_core::Receipt {
         // Load a minimal valid receipt from test data, through the same
