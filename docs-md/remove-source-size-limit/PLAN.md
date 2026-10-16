@@ -26,18 +26,25 @@ Budget: up to 10 independent Codex code reviews. Spec reviews do not count.
 
 | Round | Verdict | Findings | Notes |
 |-------|---------|----------|-------|
-| — | — | — | not started |
+| 1 | NO | 2 BLOCKER, 0 QUESTION | Both were defects of the spec text, not of the code: a pasted 500-line constraint that bound twelve pre-existing files, and a Required Behaviour clause promising `FileReadError` for a file whose existence cannot be determined, which the crate has never done. `review/codex-round-1.md` |
 
 ---
 
 ## Definition of Done
 
-1. [ ] `MAX_SOURCE_FILE_SIZE` and its gate are gone; the name is referenced nowhere
-2. [ ] A file one byte above the former bound hashes successfully (AC1)
-3. [ ] `CliError::FileTooLarge`, its exit code and the 10 MiB receipt bound are unchanged
-4. [ ] `cargo test -p atl-cli --no-fail-fast`, `cargo fmt --check`, `cargo clippy -p atl-cli` clean
-5. [ ] Codex code review: APPROVE
-6. [ ] Full gate set green (after code approval), then CI
+1. [x] `MAX_SOURCE_FILE_SIZE` and its gate are gone; the name is referenced nowhere
+2. [x] A file one byte above the former bound hashes successfully (AC1)
+3. [x] `CliError::FileTooLarge`, its exit code and the 10 MiB receipt bound are unchanged
+4. [ ] A path whose existence cannot be determined reports `FileReadError`, not absence, at all four sites (AC6, AC7)
+5. [ ] `cargo test -p atl-cli --no-fail-fast`, `cargo fmt --check`, `cargo clippy -p atl-cli` clean
+6. [ ] Codex code review: APPROVE
+7. [ ] Full gate set green (after code approval), then CI
+
+Items 1–3 verified by the orchestrator on commit `18e53ba`: diff inspected, the name
+absent from `src`/`tests`/`benches`, `cargo fmt --check` and `cargo clippy -p atl-cli
+--all-targets` clean, `cargo test -p atl-cli --no-fail-fast` green with
+`verify::file::tests::test_hash_file_above_former_size_bound ... ok`. Item 4 is the
+scope the owner added on 2026-10-16 and is not implemented yet.
 
 ---
 
@@ -47,6 +54,10 @@ Progress reporting during hashing. The crate has none, so verifying a very large
 is silent until the verdict; on files of this size that becomes noticeable. Separate
 task, not this one.
 
+Splitting the two files this task edits that already exceed 500 lines
+(`src/cli/args.rs`, 955; `src/verify/single.rs`, 1244). The budget here is the minimal
+edit; that debt is older than this task.
+
 ---
 
 ## Revision History
@@ -54,3 +65,5 @@ task, not this one.
 | Date | Change |
 |------|--------|
 | 2026-10-16 | Initial draft; owner approved removing the bound outright |
+| 2026-10-16 | Code review round 1 returned NO on two defects of the spec text; spec amended |
+| 2026-10-16 | Owner widened the scope: the `Path::exists()` defect found during review is fixed in this task, not deferred. An existing path that cannot be reached is reported as a read failure instead of as absence, at all four sites — two for the source, two for the receipt |
