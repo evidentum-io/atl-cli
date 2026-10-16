@@ -7,9 +7,6 @@ use std::path::Path;
 
 use crate::error::{CliError, CliResult};
 
-/// Maximum source file size (1 GB)
-pub const MAX_SOURCE_FILE_SIZE: u64 = 1024 * 1024 * 1024;
-
 /// Maximum receipt file size (10 MB)
 pub const MAX_RECEIPT_SIZE: u64 = 10 * 1024 * 1024;
 
@@ -19,7 +16,8 @@ const HASH_BUFFER_SIZE: usize = 64 * 1024;
 /// Hash a file using SHA-256 with streaming
 ///
 /// This function streams the file in chunks to avoid loading large files
-/// entirely into memory. It enforces a 1 GB file size limit.
+/// entirely into memory, so memory use is constant and a regular file of any
+/// size is hashed.
 ///
 /// # Arguments
 ///
@@ -29,23 +27,11 @@ const HASH_BUFFER_SIZE: usize = 64 * 1024;
 ///
 /// Returns error if:
 /// - File does not exist
-/// - File exceeds size limit
 /// - File cannot be read
 pub fn hash_file(path: &Path) -> CliResult<[u8; 32]> {
     // Check file exists
     if !path.exists() {
         return Err(CliError::SourceNotFound(path.to_path_buf()));
-    }
-
-    // Check file size
-    let metadata = std::fs::metadata(path).map_err(|e| CliError::file_read_error(path, e))?;
-
-    if metadata.len() > MAX_SOURCE_FILE_SIZE {
-        return Err(CliError::FileTooLarge {
-            path: path.to_path_buf(),
-            size_bytes: metadata.len(),
-            max_bytes: MAX_SOURCE_FILE_SIZE,
-        });
     }
 
     // Stream-hash the file
@@ -165,7 +151,17 @@ mod tests {
         let data = vec![0u8; 1024 * 1024];
         file.write_all(&data).unwrap();
 
-        // Should succeed (under 1GB limit)
+        // Should succeed
+        let hash = hash_file(file.path());
+        assert!(hash.is_ok());
+    }
+
+    #[test]
+    fn test_hash_file_above_former_size_bound() {
+        let file = NamedTempFile::new().unwrap();
+        // Sparse file of 1 GiB + 1 bytes: no real disk space is used
+        file.as_file().set_len(1024 * 1024 * 1024 + 1).unwrap();
+
         let hash = hash_file(file.path());
         assert!(hash.is_ok());
     }
@@ -173,7 +169,6 @@ mod tests {
     #[test]
     fn test_constants() {
         // Verify constants are set to expected values
-        assert_eq!(MAX_SOURCE_FILE_SIZE, 1024 * 1024 * 1024);
         assert_eq!(MAX_RECEIPT_SIZE, 10 * 1024 * 1024);
         assert_eq!(HASH_BUFFER_SIZE, 64 * 1024);
     }

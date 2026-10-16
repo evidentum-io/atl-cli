@@ -21,7 +21,7 @@ pub use batch::{match_files_to_receipts, verify_batch, BatchItemResult, BatchVer
 #[allow(unused_imports)]
 pub use consistency::{verify_consistency, ConsistencyResult};
 #[allow(unused_imports)]
-pub use file::{compare_hash, format_hash, hash_file, MAX_RECEIPT_SIZE, MAX_SOURCE_FILE_SIZE};
+pub use file::{compare_hash, format_hash, hash_file, MAX_RECEIPT_SIZE};
 #[allow(unused_imports)]
 pub use policy::{AnchorPolicy, TrustAssessment, UnresolvedAnchor};
 #[allow(unused_imports)]
