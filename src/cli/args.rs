@@ -429,12 +429,20 @@ impl VerifyArgs {
     #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), CliError> {
         // Check source exists
-        if !self.source.exists() {
+        if !self
+            .source
+            .try_exists()
+            .map_err(|e| CliError::file_read_error(&self.source, e))?
+        {
             return Err(CliError::SourceNotFound(self.source.clone()));
         }
 
         // Check receipt exists
-        if !self.receipt.exists() {
+        if !self
+            .receipt
+            .try_exists()
+            .map_err(|e| CliError::file_read_error(&self.receipt, e))?
+        {
             return Err(CliError::ReceiptNotFound(self.receipt.clone()));
         }
 
@@ -465,6 +473,59 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    fn verify_args(source: PathBuf, receipt: PathBuf) -> VerifyArgs {
+        VerifyArgs {
+            source,
+            receipt,
+            offline: false,
+            online: false,
+            verbose: false,
+            allow_single_anchor: false,
+            tsa_trust_store: None,
+            tsa_intermediates: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_source_path_through_regular_file_is_read_error() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("f");
+        fs::write(&file, b"x").unwrap();
+        let args = verify_args(file.join("child"), file);
+        assert!(matches!(
+            args.validate(),
+            Err(CliError::FileReadError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_receipt_path_through_regular_file_is_read_error() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("f");
+        fs::write(&file, b"x").unwrap();
+        let args = verify_args(file.clone(), file.join("child"));
+        assert!(matches!(
+            args.validate(),
+            Err(CliError::FileReadError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_validate_absent_paths_still_not_found() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("f");
+        fs::write(&file, b"x").unwrap();
+        let absent = dir.path().join("absent");
+        assert!(matches!(
+            verify_args(absent.clone(), file.clone()).validate(),
+            Err(CliError::SourceNotFound(_))
+        ));
+        assert!(matches!(
+            verify_args(file, absent).validate(),
+            Err(CliError::ReceiptNotFound(_))
+        ));
+    }
 
     #[test]
     fn test_verification_mode_eq() {

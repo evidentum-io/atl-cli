@@ -29,8 +29,12 @@ const HASH_BUFFER_SIZE: usize = 64 * 1024;
 /// - File does not exist
 /// - File cannot be read
 pub fn hash_file(path: &Path) -> CliResult<[u8; 32]> {
-    // Check file exists
-    if !path.exists() {
+    // Only a path determined not to exist is "not found"; any other failure
+    // to determine existence is a read error.
+    if !path
+        .try_exists()
+        .map_err(|e| CliError::file_read_error(path, e))?
+    {
         return Err(CliError::SourceNotFound(path.to_path_buf()));
     }
 
@@ -106,6 +110,14 @@ mod tests {
     fn test_hash_file_not_found() {
         let result = hash_file(Path::new("/nonexistent/file"));
         assert!(matches!(result, Err(CliError::SourceNotFound(_))));
+    }
+
+    #[test]
+    fn test_hash_file_path_through_regular_file_is_read_error() {
+        let file = NamedTempFile::new().unwrap();
+        // `file/child`: existence cannot be determined (ENOTDIR), not absent
+        let result = hash_file(&file.path().join("child"));
+        assert!(matches!(result, Err(CliError::FileReadError { .. })));
     }
 
     #[test]
